@@ -51,6 +51,10 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>   // 显式的自身依赖：本文件用 std::string（MatrixFromAttachment 的
+                    // reason 出参）。此前只靠 <vector> → <stdexcept> → <string> 的
+                    // **传递包含**拿到，属未声明依赖 —— 换 SDK 或裁剪包含链即会
+                    // 报 "no type named 'string' in namespace 'std'"。故显式写出。
 #include <vector>
 
 #include "recon_platform/yuv_convert.h"

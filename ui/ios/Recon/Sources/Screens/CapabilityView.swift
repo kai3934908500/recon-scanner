@@ -89,7 +89,8 @@ public struct CapabilityView: View {
                     SpecText(s.name, spec: ReconFont.subhead, color: ReconColor.txtPrimary)
                     Spacer(minLength: ReconMetric.space2)
                     SpecText(s.available ? L10n.s("是") : L10n.s("否"), spec: ReconFont.subhead,
-                             color: s.available ? ReconColor.txtPrimary : ReconColor.txtSecondary)                    SpecText(s.detail, spec: ReconFont.subhead,
+                             color: s.available ? ReconColor.txtPrimary : ReconColor.txtSecondary)
+                    SpecText(s.detail, spec: ReconFont.subhead,
                              color: ReconColor.txtSecondary, mono: true)
                         .frame(minWidth: 96, alignment: .trailing)
                 }

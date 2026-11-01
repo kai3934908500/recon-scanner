@@ -12,6 +12,7 @@
 #import "PlatformCaptureBridge.h"
 
 #include <cstring>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -65,7 +66,18 @@ using recon::platform::ImuWindow;
 // ===========================================================================
 
 @interface ReconImuRingBuffer () {
-    ImuRingBuffer _buffer;
+    // ⚠️ 用 `std::optional` 承载而不是直接持有 `ImuRingBuffer`（2026-11-01 CI 实证）：
+    //    `ImuRingBuffer` 有一个 `const std::size_t capacity_` 成员，而 **const 成员
+    //    使类的拷贝/移动赋值运算符被隐式删除**，故 `_buffer = ImuRingBuffer(n)`
+    //    无法编译（CI 原文：object of type 'ImuRingBuffer' cannot be assigned
+    //    because its copy assignment operator is implicitly deleted）。
+    //    `optional::emplace` 是**就地构造**，不涉及赋值，是唯一既能自定义容量、
+    //    又**无需改动平台无关层**（改 `imu_window.h` 会牵动 Android 侧与单测，
+    //    属「同一逻辑两处改动」）的修法。
+    //    不选「裸指针 + new」：本类由 ARC 管理，裸指针要自己写析构，徒增泄漏面；
+    //    `optional` 随对象生命周期自动析构，语义最贴且零额外责任。
+    //    本机 Windows 无编译能力，该错误此前只有静态复核 —— 与 MSL 侧同类盲区。
+    std::optional<ImuRingBuffer> _buffer;
 }
 @end
 
@@ -74,7 +86,7 @@ using recon::platform::ImuWindow;
 - (instancetype)initWithCapacity:(NSUInteger)capacity {
     self = [super init];
     if (self) {
-        _buffer = ImuRingBuffer(static_cast<std::size_t>(capacity));
+        _buffer.emplace(static_cast<std::size_t>(capacity));
     }
     return self;
 }
@@ -87,28 +99,31 @@ using recon::platform::ImuWindow;
     s.timestamp_ns = tsNs;
     s.accel[0] = ax; s.accel[1] = ay; s.accel[2] = az;
     s.gyro[0] = gx;  s.gyro[1] = gy;  s.gyro[2] = gz;
-    _buffer.Append(s);
+    // `_buffer` 是 `std::optional`（理由见上），故经 `operator->` 触达内部对象。
+    // init 已 `emplace`，此处必然 engaged；不写 `if (_buffer)` 兜底是因为
+    // 兜底会**静默丢弃**采样（本项目明令禁止的失效模式），宁可崩在明确处。
+    _buffer->Append(s);
 }
 
 - (ReconImuWindow *)windowBeforeNs:(int64_t)tsNs {
-    ImuWindow win = _buffer.WindowBefore(tsNs);
+    ImuWindow win = _buffer->WindowBefore(tsNs);
     return [[ReconImuWindow alloc] initWithWindow:std::move(win)];
 }
 
 - (void)reset {
-    _buffer.Reset();
+    _buffer->Reset();
 }
 
 - (NSUInteger)count {
-    return static_cast<NSUInteger>(_buffer.Count());
+    return static_cast<NSUInteger>(_buffer->Count());
 }
 
 - (NSUInteger)droppedByCapacity {
-    return static_cast<NSUInteger>(_buffer.DroppedByCapacity());
+    return static_cast<NSUInteger>(_buffer->DroppedByCapacity());
 }
 
 - (NSUInteger)timestampRegressions {
-    return static_cast<NSUInteger>(_buffer.TimestampRegressions());
+    return static_cast<NSUInteger>(_buffer->TimestampRegressions());
 }
 
 @end

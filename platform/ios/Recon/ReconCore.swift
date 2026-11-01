@@ -214,6 +214,52 @@ final class ReconCore {
     /// 与 core 的 `RECON_ABI_VERSION` 对应。
     static let expectedAbiVersion: UInt32 = 1
 
+    // MARK: - C 枚举 ↔ Swift 枚举桥接（唯一转换点）
+
+    /// 把 C ABI 的 `recon_status` 转成 Swift `ReconStatus`。
+    ///
+    /// ── 为什么必须有这一层（2026-11-01 CI 首次真编暴露，系统性错误）──────────
+    ///
+    /// `recon_status` 是**普通 C enum**（既无 `NS_ENUM`、也无
+    /// `enum_extensibility` 标注），Clang importer 因此**不**把它导入成 Swift
+    /// enum，而是导入成一个 `RawRepresentable` **结构体**（每个成员降级为一个
+    /// 全局常量）。更关键的是其 `RawValue` 类型由**枚举成员的正负**决定：
+    /// `recon_status` 全部成员非负 → 导入为 `CUnsignedInt` 即 **`UInt32`**，
+    /// 且 `init(rawValue:)` **不是** failable 的。
+    /// 事实来源：Apple *How Swift Imports C APIs*（「enums with strictly
+    /// non-negative members are imported as CUnsignedInt, while those that have
+    /// negative members are imported as CInt」）。
+    ///
+    /// 因此以下两种写法都**无法编译**（本文件原先通篇如此）：
+    ///   · `ReconStatus(rawValue: st)` —— `UInt32` ≠ `Int32`；且因初始化器非
+    ///     failable，`??` 的左操作数非 Optional（在 `SWIFT_TREAT_WARNINGS_AS_ERRORS`
+    ///     下这个警告直接变错误）。
+    ///   · `st == ReconStatus.ok.rawValue` —— `recon_status` 与 `Int32` 不可比较。
+    ///
+    /// 本函数是三处（状态码 / 分支 / 深度源 / 导出格式）之外**唯一**的转换点：
+    /// 新增转换需求请复用此处，不要再写第二份位模式转换。
+    ///
+    /// 未知值**不静默吞掉**：映射到 `.internalError` 并打日志。出现未知值意味着
+    /// 头文件新增了错误码而 Swift 表没跟上 —— G11 闸门会拦，此处兜底保持可见。
+    static func status(_ s: recon_status) -> ReconStatus {
+        let raw = Int32(bitPattern: s.rawValue)
+        if let known = ReconStatus(rawValue: raw) { return known }
+        NSLog("recon: 未知 recon_status=\(raw)；头文件与 Swift 表可能已漂移（见 G11 闸门）")
+        return .internalError
+    }
+
+    /// C ABI 的 `recon_status` 是否表示成功（仅 `RECON_OK`）。
+    static func isOK(_ s: recon_status) -> Bool { status(s) == .ok }
+
+    /// C 枚举的 `rawValue`（`UInt32`）→ `Int32`。
+    ///
+    /// 用 `Int32(bitPattern:)` 而非 `Int32(_:)`：后者在 `rawValue > Int32.max`
+    /// 时会 **trap**（运行时崩溃），而 C 枚举的位模式不保证落在 `Int32` 域内
+    /// —— `recon_config.forced_branch` 正是一个例子（用 `0xFFFFFFFF` 当哨兵）。
+    /// 位模式转换与 C 侧 `static_cast<int32_t>` 的语义**逐位一致**，正是跨语言
+    /// 传递枚举时所期望的行为。
+    static func code(_ raw: UInt32) -> Int32 { Int32(bitPattern: raw) }
+
     private(set) var handle: UnsafeMutableRawPointer?
 
     // MARK: - 生命周期
@@ -221,7 +267,11 @@ final class ReconCore {
     init?(sessionDir: String, preset: Int32 = 1, maxThreads: UInt32 = 0) {
         var cfg = recon_config()
         cfg.abi_version = ReconCore.expectedAbiVersion
-        cfg.forced_branch = recon_pipeline_branch(rawValue: 0xFFFF_FFFF)  // 自动探测
+        // 哨兵 `0xFFFFFFFF`（= UINT32_MAX）表示「自动探测」。此处**必须**写位模式，
+        // 不能写 0xFFFF_FFFF 之外的字面量：`recon_pipeline_branch` 的 rawValue 是
+        // UInt32，而 core 侧判定（core/src/util/context.cpp §62-70）是
+        // 「越界/负值一律走自动探测」，故这个哨兵正是被设计成「越界」的。
+        cfg.forced_branch = recon_pipeline_branch(rawValue: 0xFFFF_FFFF)
         cfg.preset = preset
         cfg.max_threads = maxThreads
         cfg.enable_rgbd = 1
@@ -232,7 +282,7 @@ final class ReconCore {
             cfg.session_dir = cstr
             var ctx: UnsafeMutableRawPointer?
             let st = recon_create(&cfg, &ctx)
-            return st == ReconStatus.ok.rawValue ? ctx : nil
+            return ReconCore.isOK(st) ? ctx : nil
         }
         guard let context = created else { return nil }
         self.handle = context
@@ -253,11 +303,11 @@ final class ReconCore {
     func probeCapability() -> ReconCapability? {
         guard let h = handle else { return nil }
         var cap = recon_capability()
-        guard recon_probe_capability(h, &cap) == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(recon_probe_capability(h, &cap)) else { return nil }
         return ReconCapability(
-            branch: ReconBranch(rawValue: cap.branch) ?? .mono,
-            depthTier: cap.depth_tier,
-            depthSource: cap.depth_source,
+            branch: ReconBranch(rawValue: ReconCore.code(cap.branch.rawValue)) ?? .mono,
+            depthTier: ReconCore.code(cap.depth_tier.rawValue),
+            depthSource: ReconCore.code(cap.depth_source.rawValue),
             hasCamera: cap.has_camera != 0,
             hasImu: cap.has_imu != 0,
             hasLidar: cap.has_lidar != 0,
@@ -276,7 +326,7 @@ final class ReconCore {
     func setParam(_ key: String, int valueInt: Int32, double valueDouble: Double = 0) -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
         let st = key.withCString { recon_set_param(h, $0, valueInt, valueDouble) }
-        return ReconStatus(rawValue: st) ?? .internalError
+        return ReconCore.status(st)
     }
 
     /// 读取参数当前值。`nil` 表示句柄缺失或该键不存在（**不返回 0 冒充**）。
@@ -289,7 +339,7 @@ final class ReconCore {
         var vInt: Int32 = 0
         var vDouble: Double = 0
         let st = key.withCString { recon_get_param(h, $0, &vInt, &vDouble) }
-        guard st == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(st) else { return nil }
         return (vInt, vDouble)
     }
 
@@ -297,7 +347,7 @@ final class ReconCore {
     @discardableResult
     func applyPreset(_ preset: Int32) -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
-        return ReconStatus(rawValue: recon_apply_preset(h, preset)) ?? .internalError
+        return ReconCore.status(recon_apply_preset(h, preset))
     }
 
     /// 导出会话参数摘要 JSON（审计 / 复现用）。
@@ -309,7 +359,7 @@ final class ReconCore {
         guard let h = handle else { return nil }
         var out: UnsafeMutablePointer<CChar>?
         let st = recon_export_params(h, &out)
-        guard st == ReconStatus.ok.rawValue, let p = out else { return nil }
+        guard ReconCore.isOK(st), let p = out else { return nil }
         defer { recon_free_string(p) }
         return String(cString: p)
     }
@@ -320,7 +370,7 @@ final class ReconCore {
     func startSession(_ sessionId: String) -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
         let st = sessionId.withCString { recon_start_session(h, $0) }
-        return ReconStatus(rawValue: st) ?? .internalError
+        return ReconCore.status(st)
     }
 
     /// 推入一帧。所有缓冲在本调用期间有效（docs/01：核心不持有指针）。
@@ -344,7 +394,11 @@ final class ReconCore {
     ) -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
 
-        var intr = intrinsics
+        // `let`（不是 `var`）：下面传给 `withUnsafePointer(to:)` 的 **by-value**
+        // 重载，不取 `inout`，故无需可变绑定 —— 写成 `var` 会触发
+        // 「variable was never mutated」警告，而本工程开了
+        // `SWIFT_TREAT_WARNINGS_AS_ERRORS`（零警告标准），警告即错误。
+        let intr = intrinsics
         var pkt = recon_frame_packet()
         pkt.frame_id = frameId
         pkt.timestamp_ns = timestampNs
@@ -357,32 +411,48 @@ final class ReconCore {
         pkt.depth_height = depthHeight
         pkt.depth_stride = depthWidth * 2  // uint16
         pkt.depth_confidence = depthConfidence
-        pkt.depth_source = recon_depth_source(rawValue: depthSource) ?? .init(0)
+        pkt.depth_source = recon_depth_source(rawValue: UInt32(bitPattern: depthSource))
         pkt.has_depth = (depthMm != nil) ? 1 : 0
-        pkt.intrinsics = withUnsafePointer(to: &intr) { $0 }
         pkt.imu = imu
         pkt.imu_count = imuCount
         pkt.exposure_us = exposureUs
         pkt.iso = iso
 
-        if var p = pose {
-            pkt.pose = withUnsafePointer(to: &p) { $0 }
-            return ReconStatus(rawValue: recon_push_frame(h, &pkt)) ?? .internalError
+        // ⚠️ `intrinsics` / `pose` 是**指向本帧栈上局部量的指针**，仅在本次调用
+        //    期间有效（C ABI 明文：「核心不持有指针」）。因此两次
+        //    `recon_push_frame` 都必须在 `withUnsafePointer` 的**闭包内部**发起：
+        //    若照旧写成 `pkt.intrinsics = withUnsafePointer(to: &intr) { $0 }`
+        //    再在闭包外调用，指针在闭包返回后即失效（悬垂），属未定义行为 ——
+        //    悬垂时读到的是复用后的脏内存，表现为「位姿/内参偶发错乱」，
+        //    是最难查的一类。此处用嵌套闭包把「指针有效期」与「调用期」对齐。
+        //
+        // ⚠️ 两个闭包**都显式标注返回类型 `-> ReconStatus`**：多语句闭包的类型
+        //    推断在「外层闭包返回内层闭包结果」的嵌套场景下容易超时/失败
+        //    （"unable to type-check this expression in reasonable time"），
+        //    显式标注是零成本的消除手段。
+        return withUnsafePointer(to: intr) { (intrPtr) -> ReconStatus in
+            pkt.intrinsics = intrPtr
+            if let p = pose {
+                return withUnsafePointer(to: p) { (posePtr) -> ReconStatus in
+                    pkt.pose = posePtr
+                    return ReconCore.status(recon_push_frame(h, &pkt))
+                }
+            }
+            return ReconCore.status(recon_push_frame(h, &pkt))
         }
-        return ReconStatus(rawValue: recon_push_frame(h, &pkt)) ?? .internalError
     }
 
     @discardableResult
     func finishCapture() -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
-        return ReconStatus(rawValue: recon_finish_capture(h)) ?? .internalError
+        return ReconCore.status(recon_finish_capture(h))
     }
 
     /// 读取采集统计。`nil` 表示句柄缺失或调用失败（**不返回全 0 结构体冒充**）。
     func scanStats() -> ReconScanStats? {
         guard let h = handle else { return nil }
         var s = recon_scan_stats()
-        guard recon_get_scan_stats(h, &s) == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(recon_get_scan_stats(h, &s)) else { return nil }
         return ReconScanStats(
             framesCaptured: s.frames_captured,
             framesAccepted: s.frames_accepted,
@@ -419,12 +489,15 @@ final class ReconCore {
     ) -> ReconScaleResult? {
         guard let h = handle, detectedCorners.count >= 8 else { return nil }
         var out = recon_scale_result()
-        let st = detectedCorners.withUnsafeBufferPointer { buf -> Int32 in
+        // 闭包返回类型写成 `recon_status`（C 结构体），不是 `Int32` —— 见
+        // `ReconCore.status(_:)` 的说明：普通 C enum 被导入为 RawRepresentable
+        // 结构体，`Int32` 形参会导致 "cannot convert return expression" 报错。
+        let st = detectedCorners.withUnsafeBufferPointer { buf -> recon_status in
             var pkt = referenceFrame
             return recon_calibrate_scale(h, &pkt, buf.baseAddress,
                                          referenceType, refWidthMM, refHeightMM, &out)
         }
-        guard st == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(st) else { return nil }
         return ReconScaleResult(
             ok: out.ok != 0,
             scale: out.scale,
@@ -442,7 +515,7 @@ final class ReconCore {
         guard let h = handle else { return nil }
         var out = recon_scale_result()
         let st = recon_set_manual_scale(h, scale, &out)
-        guard st == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(st) else { return nil }
         return ReconScaleResult(
             ok: out.ok != 0,
             scale: out.scale,
@@ -475,13 +548,13 @@ final class ReconCore {
 
         let userPtr = box.map { UnsafeMutableRawPointer(Unmanaged.passUnretained($0).toOpaque()) }
         let st = recon_run_reconstruction(h, cb, nil, nil, userPtr)
-        return ReconStatus(rawValue: st) ?? .internalError
+        return ReconCore.status(st)
     }
 
     func meshInfo() -> ReconMeshInfo? {
         guard let h = handle else { return nil }
         var info = recon_mesh_info()
-        guard recon_get_mesh_info(h, &info) == ReconStatus.ok.rawValue else { return nil }
+        guard ReconCore.isOK(recon_get_mesh_info(h, &info)) else { return nil }
         return ReconMeshInfo(
             vertexCount: info.vertex_count,
             triangleCount: info.triangle_count,
@@ -505,21 +578,21 @@ final class ReconCore {
     func export(format: Int32, outPath: String, applyScale: Bool, embedTexture: Bool) -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
         var opt = recon_export_options()
-        opt.format = recon_export_format(rawValue: format) ?? .init(0)
+        opt.format = recon_export_format(rawValue: UInt32(bitPattern: format))
         opt.apply_scale = applyScale ? 1 : 0
         opt.embed_texture = embedTexture ? 1 : 0
         let st = outPath.withCString { cstr in
             opt.out_path = cstr
             return recon_export(h, &opt)
         }
-        return ReconStatus(rawValue: st) ?? .internalError
+        return ReconCore.status(st)
     }
 
     /// 线程安全，可在任意线程调用。
     @discardableResult
     func cancel() -> ReconStatus {
         guard let h = handle else { return .invalidArgument }
-        return ReconStatus(rawValue: recon_cancel(h)) ?? .internalError
+        return ReconCore.status(recon_cancel(h))
     }
 
     var isCancelled: Bool {
