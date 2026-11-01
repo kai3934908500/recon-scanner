@@ -316,29 +316,56 @@ jobs:
           echo "HEADERS IDENTICAL"
 
           echo "== C ABI 符号是否都在（防止 libtool 合并丢成员） =="
-          # 符号名必须取自 core/include/recon/recon_c_api.h 的**真实导出清单**
-          # （共 21 个）。此前这里写的是 recon_session_get_status —— 该函数在头文件里
-          # **根本不存在**（全仓库仅有本处提及），属「闸门引用了不存在的符号」，
-          # 同类还有 docs/12 §4.2 的 recon/types.h 与桥接头注释里的
-          # RECON_BUILD_XCFRAMEWORK。因为脚本是 set -e，循环在第一个符号
-          # （recon_create）就退出了，这个错误符号此前从未被执行到，故一直未暴露。
-          #
-          # Mach-O 的 C 符号是 `_recon_create`，`[ _]` 前缀兼容有/无下划线；
-          # `$` 锚定行尾，避免 recon_create 误配到 recon_create_xxx 之类前缀符号。
-          for sym in recon_create recon_destroy recon_abi_version \
-                     recon_probe_capability recon_push_frame recon_run_reconstruction \
-                     recon_finish_capture recon_export; do
-            if ! nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -q "[ _]${sym}$"; then
+          # 符号清单从**权威源** core/include/recon/recon_c_api.h **动态提取**，
+          # 不再硬编码。硬编码已出过两次事故：① 曾写成 `recon_session_get_status`，
+          # 该函数在头文件里根本不存在（全仓库唯一提及就是那行检查本身）；
+          # ② 改成 8 个「代表符号」后仍是人工清单，头文件一增删导出就会漂移。
+          # 现在 `RECON_API <返回类型> <名字>(` 即注册，与声明处同源，改不了两遍。
+          SYMS=$(awk '/^RECON_API/ { for (i = 1; i <= NF; i++) {
+                        p = index($i, "(")
+                        if (p > 1 && substr($i, 1, 6) == "recon_") {
+                          print substr($i, 1, p - 1); break
+                        }
+                      } }' core/include/recon/recon_c_api.h | sort -u)
+          n_syms=$(echo "$SYMS" | grep -c . || true)
+          if [ "$n_syms" -lt 20 ]; then
+            echo "::error::从头文件只解析出 ${n_syms} 个导出符号，解析式可能已失效"
+            exit 1
+          fi
+          echo "头文件声明导出 ${n_syms} 个 C ABI 符号"
+
+          # ⚠️ 绝不可写回 `nm ... | grep -q`：在 `set -o pipefail` 下**必然误判**
+          # （一次真实事故，已本机复现）。机理：grep -q 命中即退出并关闭读端 →
+          # 写端 nm 收到 SIGPIPE 退出 141 → pipefail 令**整条管道**非零 →
+          # `if !` 成立 → 报告「缺少符号」，即使该符号就在输出的第一行。
+          # 归档 external 符号有数万行（远超 64 KB 管道缓冲），必然触发。
+          # 正确做法：先把 nm 输出**落到文件**（无读端提前关闭，nm 正常写完全部），
+          # 再对文件 grep —— grep 读普通文件不会产生 SIGPIPE。
+          # trap 里的 rm 必须 `|| true`：EXIT trap 的最后一条命令状态会成为
+          # 脚本退出码，rm 一旦失败就会把成功的运行污染成非零（本机已实测到）。
+          NM_LIST=$(mktemp)
+          trap 'rm -f "$NM_LIST" || true' EXIT
+          nm -g "$XCF/ios-arm64/libReconCore.a" > "$NM_LIST" 2>/dev/null || true
+          echo "归档 external 符号共 $(grep -c . "$NM_LIST" || true) 行"
+
+          # Mach-O 的 C 符号是 `_recon_create`：`[ _]` 兼容有/无下划线；
+          # `$` 锚定行尾，避免 recon_create 误配到 recon_create_xxx 这类前缀符号。
+          missing=0
+          for sym in $SYMS; do
+            if ! grep -q "[ _]${sym}\$" "$NM_LIST"; then
               echo "::error::合并后的归档缺少 C ABI 符号 ${sym}"
-              echo "--- 归档实际 external 符号（前 60 行，供定位）---"
-              nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | head -60 || true
-              echo "--- 归档全部符号中 recon_ 开头的 ---"
-              nm "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -i "recon_" | head -40 || true
-              exit 1
+              missing=$((missing + 1))
             fi
-            echo "  ✓ ${sym}"
           done
-          echo "OK: C ABI 符号存在"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::共缺 ${missing} 个符号（清单取自头文件，n=${n_syms}）"
+            echo "--- external 符号中 recon_ 开头的（全部，供定位）---"
+            grep -oE "_*recon_[A-Za-z0-9_]+\$" "$NM_LIST" | sort -u || true
+            echo "--- 归档全部符号中 recon_ 开头的（前 40 行）---"
+            nm "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep "recon_" | head -40 || true
+            exit 1
+          fi
+          echo "OK: 头文件声明的 ${n_syms} 个 C ABI 符号在归档中全部存在"
 
           echo "== 零网络：不得引用网络框架（docs/12 §4.3） =="
           if otool -L "$XCF/ios-arm64/libReconCore.a" \
@@ -360,16 +387,39 @@ jobs:
           fi
           echo "== metallib 大小 =="
           wc -c < "$MB"
-          echo "== 算法函数覆盖（8 个，来自 shaders/common/gpu_algo.h） =="
-          for fn in recon_mvs_seed recon_mvs_patchmatch recon_mvs_subpixel \
-                    recon_mvs_consistency recon_mvs_fuse_voxel recon_mvs_reduce \
-                    recon_tsdf_fuse recon_yuv_to_bgra; do
-            if ! strings "$MB" | grep -qx "$fn"; then
+          # 清单同样从**权威源** shaders/common/gpu_algo.h 动态提取（该文件是
+          # 「机器可解析的单一来源」：`RECON_GPU_ALGO(名字)` 声明即注册），
+          # 不再硬编码 —— 漏一个函数在这里是**静默通过**，属最坏一类闸门缺陷。
+          FNS=$(sed -n 's/^[[:space:]]*RECON_GPU_ALGO(\(recon_[A-Za-z0-9_]*\)).*/\1/p' \
+                  shaders/common/gpu_algo.h | sort -u)
+          n_fns=$(echo "$FNS" | grep -c . || true)
+          if [ "$n_fns" -eq 0 ]; then
+            echo "::error::未能从 shaders/common/gpu_algo.h 解析出任何算法函数"
+            exit 1
+          fi
+          echo "== 算法函数覆盖（${n_fns} 个，来自 shaders/common/gpu_algo.h） =="
+
+          # 与上面 C ABI 检查同理：strings 输出虽比 nm 小，但**不得**用
+          # `strings | grep -qx`（pipefail + SIGPIPE 会误判）；且此处还要判**每一个**
+          # 函数，先用一次 strings 落盘，再逐名对文件 grep。
+          STR_LIST=$(mktemp)
+          trap 'rm -f "$STR_LIST" || true' EXIT
+          strings "$MB" > "$STR_LIST" 2>/dev/null || true
+
+          missing=0
+          for fn in $FNS; do
+            if ! grep -qx "$fn" "$STR_LIST"; then
               echo "::error::metallib 缺少算法函数 $fn"
-              exit 1
+              missing=$((missing + 1))
             fi
-            echo "  ✓ $fn"
           done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::metallib 共缺 ${missing} 个算法函数（声明 ${n_fns} 个）"
+            echo "--- 产物中 recon_ 开头的字符串（供定位）---"
+            grep -oE "recon_[A-Za-z0-9_]+" "$STR_LIST" | sort -u || true
+            exit 1
+          fi
+          echo "OK: 声明的 ${n_fns} 个算法函数在 metallib 中全部存在"
 
       - name: 上传 xcframework
         uses: actions/upload-artifact@v4
