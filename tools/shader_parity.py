@@ -55,6 +55,12 @@ docs/12 §4.4 的契约是「**算法同源、两端分别编译**」：
   P9  缺口反向：两端出现的 `SOURCE-TODO-*` 编号都必须在 common 登记
       （防止"补完了但忘了删标注"或"凭感觉编号"）。
   P10 平台差异标注：common 的每个 `RECON_GPU_DIFF(n)` 在**两端**都可见。
+  P11 两端 helper 集合对称（公共头层面）。
+  P12 CMakeLists.txt 的 metal 清单 ↔ 磁盘 .metal 一致。
+  P13 定点累加协议两端同构：量化 / 饱和 / 反量化三段数学式逐字对齐，
+      且两端都不得出现浮点原子（`atomic_float` 是 Metal 3.0 / iOS 16 起
+      才有，本项目部署下限 iOS 15.0；GLSL 侧无该扩展）。
+      ⚠️ 本判据每面都带**反空**约束：匹配数为 0 即报「假判据」失败。
 
 退出码
 ------
@@ -771,6 +777,163 @@ def gate_cmake_metal_list(rep: Report, metal_files: list[str]) -> None:
 
 
 # ===========================================================================
+# P13 定点累加协议同构（Metal ↔ Vulkan）
+# ===========================================================================
+# 为什么需要这条判据（本判据的诞生背景 = 一次**假通过**被 CI 揭穿）：
+#
+#   第 39 轮之前，Metal 侧的 `recon_mvs_fuse_voxel` 用 `atomic_float` 做
+#   S/W 累加，Vulkan 侧用定点 `int` 原子。CI 首次真编译（run 9）报了 8 个
+#   错误：`atomic_float` 是 **Metal 3.0 / iOS 16 起**才有的类型别名，
+#   而本项目部署下限是 **iOS 15.0** → 在契约允许的最低平台上该类型不存在。
+#
+#   修复方式是把 Metal 也改为定点整数原子（与 Vulkan 统一）。
+#   但这带来一个**新的跨端不变量**：
+#
+#       两端的「量化 / 饱和 / 反量化」三段数学式必须逐字同构。
+#
+#   为什么这是硬要求而非风格问题：定点方案下两端的结果要能**逐位对拍**
+#   （这是 docs/14 的跨端一致性验收基础）。任何一端少做一次饱和修正、
+#   或把 `round` 换成截断、或把 scale 写成别的数，都会产生**无法归因**的
+#   数值偏差 —— 而这类偏差在两端各自的单元测试里**都是绿的**。
+#
+#   这与 P7 的关系（**不重复**）：P7 比的是**常量的值**
+#   （`#define RECON_GPU_FIXED_SCALE` 两端相等），它管不到**表达式**。
+#   常量相等而表达式不同（例如一端 `round` 一端 `trunc`、
+#   一端做饱和回写一端不做）恰恰是本判据要拦的形态。
+#
+# ── 判据分解（每一面都落在**具体可解析对象**上）─────────────────────────
+#   P13a 量化式：`clamp(round(<v> * SCALE), ±MAX)` 的**操作数序列**两端相等。
+#   P13b 饱和式：条件 `old_<x> > MAX - d<x>` 与回写 `MAX - (old_<x> + d<x>)`
+#        两端**集合相等**（要求 x 在条件与回写中同名，即 s↔s、w↔w）。
+#   P13c 反量化式：`float(<buf>[idx]) * SCALE_INV` 的**被读缓冲名集合**相等。
+#   P13d 禁浮点原子：MVS 两端**都不得**出现 `atomic_float` /
+#        `atomic<float>`（防未来改动把它悄悄加回来 —— 那要等一次 macOS CI
+#        才能发现，代价是一整轮 CI）。
+#
+# ── 反空判据（**关键**）────────────────────────────────────────────────
+#   每一面都强制「匹配数 >= 1」并且「两端计数相等」。
+#   若某次重构把表达式换个写法导致正则匹配为 0，本判据**必须报错**而非静默
+#   通过 —— 一条匹配不到任何东西的判据是**假判据**，"绿"毫无信息量。
+#   这正是 MEMORY.md「判据必须落在目标对象上」与「每条闸门判据必须负向注入
+#   证伪」的直接应用：负向注入时若连目标串都匹配不到，注入自然"失败"，
+#   说明判据已失效。
+#
+# ── 语法差异的归一化（受控且最小）──────────────────────────────────────
+#   两端语法确有差异，本判据只归一化**已确认为纯语法**的三处，不做语义揣测：
+#     ① MSL 的 `float(RECON_GPU_FIXED_MAX)` ↔ GLSL 的 `RECON_GPU_FIXED_MAX`
+#        —— MSL 的 `clamp` 要求三实参同型，故必须显式转 float（见 mvs.metal）。
+#     ② MSL 的 `float(x[idx])` ↔ GLSL 的 `float(x[idx])` —— 两侧写法本就相同，
+#        归一化后便于统一比对。
+#     ③ 原子调用拼写（`atomic_fetch_add_explicit(&b[i], v, memory_order_relaxed)`
+#        ↔ `atomicAdd(b[i], v)`）—— **本判据不比对调用拼写**，只比对**被加
+#        的算术表达式**。故归一化时直接绕开调用外壳。
+_CAST_STRIP_RE = re.compile(
+    r"\bfloat\s*\(\s*(RECON_GPU_FIXED_MAX|RECON_GPU_FIXED_SCALE"
+    r"|[A-Za-z_]\w*\s*\[\s*[^\]]+\s*\])\s*\)")
+
+
+def _norm_expr(s: str) -> str:
+    """把表达式归一化为「无空白 + 去纯语法 cast」的紧凑形式。
+
+    只做空白与 cast 归一化 —— **不做**变量改名、不做等价变换。
+    任何超出"纯语法"的改写都会让判据失去区分力（把真差异一起抹平）。
+    """
+    s = _CAST_STRIP_RE.sub(r"\1", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+# 量化式：`clamp(round(<v> * RECON_GPU_FIXED_SCALE), -MAX, MAX)`
+#   捕获组 = 被量化的操作数名（`sum_contrib` / `w_contrib`）。
+#   `-?` 与 `MAX` 的 cast 由 `_norm_expr` 归一化后比对。
+_QUANT_RE = re.compile(
+    r"clamp\s*\(\s*round\s*\(\s*(\w+)\s*\*\s*RECON_GPU_FIXED_SCALE\s*\)\s*,"
+    r"\s*-(?:float\s*\(\s*)?RECON_GPU_FIXED_MAX(?:\s*\))?\s*,"
+    r"\s*(?:float\s*\(\s*)?RECON_GPU_FIXED_MAX(?:\s*\))?\s*\)", re.S)
+
+# 饱和条件：`old_<x> > RECON_GPU_FIXED_MAX - d<x>`
+_SAT_COND_RE = re.compile(
+    r"old_(\w+)\s*>\s*RECON_GPU_FIXED_MAX\s*-\s*d(\w+)")
+
+# 饱和回写：`RECON_GPU_FIXED_MAX - (old_<x> + d<x>)`
+_SAT_WRITE_RE = re.compile(
+    r"RECON_GPU_FIXED_MAX\s*-\s*\(\s*old_(\w+)\s*\+\s*d(\w+)\s*\)")
+
+# 反量化：`float(<buf>[idx]) * RECON_GPU_FIXED_SCALE_INV`
+_DEQUANT_RE = re.compile(
+    r"float\s*\(\s*(\w+)\s*\[[^\]]*\]\s*\)\s*\*\s*RECON_GPU_FIXED_SCALE_INV")
+
+# 禁浮点原子：MSL 的 `atomic_float` 与 MSL/GLSL 共同的 `atomic<float>`。
+_FLOAT_ATOMIC_RE = re.compile(r"atomic_float\b|atomic\s*<\s*float\s*>|"
+                              r"atomic_float32_t\b")
+
+
+def gate_fixed_point_atomics(rep: Report, metal_all: str,
+                             vulkan_all: str) -> None:
+    """P13 —— 定点累加协议两端同构（量化 / 饱和 / 反量化 / 禁浮点原子）。"""
+    m_code = strip_comments(metal_all)
+    v_code = strip_comments(vulkan_all)
+
+    # ---- P13d 禁浮点原子（先查：若一端用了浮点原子，后三面的比对已无意义）----
+    m_fa = sorted(set(_FLOAT_ATOMIC_RE.findall(m_code)))
+    v_fa = sorted(set(_FLOAT_ATOMIC_RE.findall(v_code)))
+    if m_fa:
+        rep.fail("P13d Metal 侧出现浮点原子（" + ", ".join(m_fa) + "）—— "
+                 "`atomic_float` 是 Metal 3.0 / iOS 16 起才有，本项目部署下限 "
+                 "iOS 15.0（docs/12 §4.6）。必须用 `atomic_int` + 定点量化。")
+    if v_fa:
+        rep.fail("P13d Vulkan 侧出现浮点原子（" + ", ".join(v_fa) + "）—— "
+                 "GLSL 无浮点原子支持（除非启用 "
+                 "GL_EXT_shader_atomic_float_add，本项目已放弃该扩展）。")
+
+    # ---- 三个「同构」面：逐一(两端计数>=1 且 两端集合相等) ----
+    def pair(name: str, pat: re.Pattern, capture: bool = True) -> None:
+        m_hits = pat.findall(m_code)
+        v_hits = pat.findall(v_code)
+        if not m_hits or not v_hits:
+            rep.fail(f"P13 「{name}」在一端匹配为 0（Metal {len(m_hits)} / "
+                     f"Vulkan {len(v_hits)}）—— 判据已失效（假判据），"
+                     f"请检查正则是否还匹配当前写法")
+            return
+        if len(m_hits) != len(v_hits):
+            rep.fail(f"P13 「{name}」两端出现次数不等"
+                     f"（Metal {len(m_hits)} / Vulkan {len(v_hits)}）")
+        ms = sorted(_norm_expr("".join(h) if isinstance(h, tuple) else h)
+                    for h in m_hits)
+        vs = sorted(_norm_expr("".join(h) if isinstance(h, tuple) else h)
+                    for h in v_hits)
+        if ms != vs:
+            rep.fail(f"P13 「{name}」两端表达式不一致："
+                     f"Metal={ms} Vulkan={vs}")
+
+    pair("量化式 clamp(round(v * SCALE), ±MAX)", _QUANT_RE)
+    pair("饱和条件 old_x > MAX - d_x", _SAT_COND_RE)
+    pair("饱和回写 MAX - (old_x + d_x)", _SAT_WRITE_RE)
+    pair("反量化 float(buf[idx]) * SCALE_INV", _DEQUANT_RE)
+
+    # ---- 饱和式额外约束：条件与回写中的 `old_/d_` 后缀必须同名同集合 ----
+    #   否则会出现「条件判 s、回写改 w」这类**跨缓冲写错**，
+    #   而上面 pair() 只比对两端是否同构、不管内部自洽。
+    for tag, code in (("Metal", m_code), ("Vulkan", v_code)):
+        c = set(_SAT_COND_RE.findall(code))
+        w = set(_SAT_WRITE_RE.findall(code))
+        bad = {p for p in (c | w) if p[0] != p[1]}
+        if bad:
+            rep.fail(f"P13 {tag} 侧饱和式后缀不自洽（条件与回写不是同一累加器）："
+                     + ", ".join(f"old_{a}/d_{b}" for a, b in sorted(bad)))
+        if c != w:
+            rep.fail(f"P13 {tag} 侧饱和条件集合与回写集合不等："
+                     f"cond={sorted(c)} write={sorted(w)}")
+
+    if not rep.failures:
+        n_q = len(_QUANT_RE.findall(m_code))
+        n_d = len(_DEQUANT_RE.findall(m_code))
+        rep.note(f"P13 定点累加协议两端同构：量化 {n_q} 式 / "
+                 f"饱和 {len(_SAT_COND_RE.findall(m_code))} 式 / "
+                 f"反量化 {n_d} 式；两端均无浮点原子")
+
+
+# ===========================================================================
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--verbose", action="store_true",
@@ -851,6 +1014,7 @@ def main() -> int:
                          parse_metal_helpers(metal_common_text),
                          parse_vulkan_helpers(vulkan_common_text))
     gate_cmake_metal_list(rep, metal_files)
+    gate_fixed_point_atomics(rep, metal_all, vulkan_all)
 
     print(f"[shader-parity] common 算法 {len(common_algos)} / "
           f"Metal kernel {len(set(metal_kernels))} / "
@@ -864,7 +1028,7 @@ def main() -> int:
         print(f"[shader-parity] FAIL：{len(rep.failures)} 项不一致")
         return 3
 
-    print("[shader-parity] PASS：着色器两端一致（P1..P12 全部通过）")
+    print("[shader-parity] PASS：着色器两端一致（P1..P13 全部通过）")
     return 0
 
 

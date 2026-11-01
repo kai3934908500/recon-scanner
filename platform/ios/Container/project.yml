@@ -124,6 +124,17 @@ targets:
           # 脚本内 `xcrun -sdk "$SDK" metal` 会按此选 SDK；写死 iphoneos 会让
           # 模拟器构建拿到错的 SDK（表现为链接/加载期问题，而非编译期报错）。
           export RECON_IOS_SDK="${PLATFORM_NAME}"
+          # 部署目标：它决定 `-target` 三元组，进而决定 `__METAL_VERSION__`
+          # （见 tools/build_metal_shaders.sh 的长论证）。**必须传** ——
+          # 不传则脚本回落默认值，而默认值与 target 的 Build Settings 是
+          # 两处事实来源，迟早漂移（MEMORY.md）。
+          # ⚠️ 刻意**读 Xcode 注入的构建设置**而不是在此再写一遍 "15.0"：
+          #    该变量与 target 的 IPHONEOS_DEPLOYMENT_TARGET 同源，
+          #    改一处即全链路生效。为空时**不覆盖**（让脚本用自带默认值，
+          #    并由脚本内的 `>= 15` 断言把关 —— fail-closed 而非静默降级）。
+          if [ -n "${IPHONEOS_DEPLOYMENT_TARGET:-}" ]; then
+            export RECON_IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET}"
+          fi
           export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"
           export RECON_METAL_AIR_DIR="${DERIVED_FILE_DIR}/metal-air"
           bash "${SRCROOT}/tools/build_metal_shaders.sh"

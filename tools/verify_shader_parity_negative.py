@@ -51,6 +51,8 @@ VULKAN_COMMON = os.path.join(ROOT, "shaders", "vulkan", "gpu_common.glsl")
 VULKAN_SEED = os.path.join(ROOT, "shaders", "vulkan", "recon_mvs_seed.comp")
 VULKAN_TSDF = os.path.join(ROOT, "shaders", "vulkan", "recon_tsdf_fuse.comp")
 VULKAN_PM = os.path.join(ROOT, "shaders", "vulkan", "recon_mvs_patchmatch.comp")
+VULKAN_MVS_FUSE = os.path.join(ROOT, "shaders", "vulkan", "recon_mvs_fuse_voxel.comp")
+VULKAN_MVS_REDUCE = os.path.join(ROOT, "shaders", "vulkan", "recon_mvs_reduce.comp")
 CMAKE_LISTS = os.path.join(ROOT, "CMakeLists.txt")
 
 
@@ -217,6 +219,66 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           '      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/yuv.metal"\n',
           "")],
     ),
+    # --------------------------------------------------------------------
+    # P13 定点累加协议同构（Metal ↔ Vulkan）
+    #   现实原型：CI run 9 的 build-app 报了 8 个 `atomic_float` 错误 ——
+    #   `atomic_float` 是 Metal 3.0 / iOS 16 起才有，本项目部署下限是
+    #   iOS 15.0。修复 = Metal 也改定点整数原子，于是新增跨端不变量：
+    #   量化 / 饱和 / 反量化三段数学式必须逐字同构。
+    #   下面五项分别证伪这四个面 + 反空判据。
+    # --------------------------------------------------------------------
+    (
+        # 与 P7 的关系：P7 比**常量值**，它管不到**表达式**。
+        # 本注入把 Vulkan 的 scale 常量值改成 2048（P7 也会顺带报常量不一致），
+        # 故这条**改注入到表达式**以隔离 P13：把 `round` 换成 `trunc`
+        # （常量不动 → P7 仍绿 → 只有 P13 能拦）。
+        "P13a-quant-trunc",
+        "Vulkan 量化式把 round 换成 trunc（两端表达式不再同构，常量未变）",
+        "两端表达式不一致",
+        [(VULKAN_MVS_FUSE,
+          "    int ds = int(clamp(round(sum_contrib * RECON_GPU_FIXED_SCALE),",
+          "    int ds = int(clamp(trunc(sum_contrib * RECON_GPU_FIXED_SCALE),")],
+    ),
+    (
+        "P13b-sat-dropped",
+        "Metal 侧删掉一条饱和回写（两端饱和式数量不等）",
+        "两端出现次数不等",
+        [(METAL_MVS,
+          "    if (old_s > RECON_GPU_FIXED_MAX - ds)\n"
+          "        atomic_fetch_add_explicit(&sum[idx], RECON_GPU_FIXED_MAX - (old_s + ds),\n"
+          "                                  memory_order_relaxed);\n",
+          "")],
+    ),
+    (
+        "P13c-dequant-mismatch",
+        "Vulkan 反量化少乘 SCALE_INV（两端反量化式数量不等）",
+        "两端出现次数不等",
+        [(VULKAN_MVS_REDUCE,
+          "    w = float(voxel_w[idx])   * RECON_GPU_FIXED_SCALE_INV;\n",
+          "")],
+    ),
+    (
+        "P13d-float-atomic-msl",
+        "Metal 侧把定点累加改回 atomic_float（iOS 15 上不存在的类型）",
+        "Metal 侧出现浮点原子",
+        [(METAL_MVS,
+          "static inline void recon_voxel_accumulate(device atomic_int* sum,",
+          "static inline void recon_voxel_accumulate(device atomic_float* sum,")],
+    ),
+    (
+        # 反空判据：把一端的量化式整个改名（`round` → `recon_rnd`），
+        # 使正则**匹配为 0**。若判据只比"两端集合相等"，0 vs 0 会绿 ——
+        # 那就成了假判据。本项要求 P13 明确报「匹配为 0 / 判据已失效」。
+        "P13-zero-match",
+        "一端的量化式写成判据认不出的形式（匹配数为 0 → 必须报假判据）",
+        "判据已失效",
+        [(VULKAN_MVS_FUSE,
+          "    int ds = int(clamp(round(sum_contrib * RECON_GPU_FIXED_SCALE),",
+          "    int ds = int(clamp(RECON_VK_LOCAL_RND(sum_contrib * RECON_GPU_FIXED_SCALE),"),
+         (VULKAN_MVS_FUSE,
+          "    int dw = int(clamp(round(w_contrib * RECON_GPU_FIXED_SCALE),",
+          "    int dw = int(clamp(RECON_VK_LOCAL_RND(w_contrib * RECON_GPU_FIXED_SCALE),")],
+    ),
 ]
 
 
@@ -302,7 +364,7 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 P1..P12 均有效）")
+          f"（闸门 P1..P13 均有效）")
     return 0
 
 

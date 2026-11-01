@@ -13,43 +13,45 @@
 // 不需要原子。两者不可混用，这是 docs/04 §4.6.2 与 docs/05 §5.7 的分野。
 //
 // ══════════════════════════════════════════════════════════════════════════
-// VK-DIFF-1 — 浮点原子的**真实跨端差异**（本文件的核心，必须读懂）
+// VK-DIFF-1 — 浮点原子在**两端都不可依赖** → 统一走定点整数原子
 // ══════════════════════════════════════════════════════════════════════════
 //  docs/05 §5.9.1 的映射表把两端原子写成
 //      「`atomic_fetch_min_explicit`（Metal） ↔ `atomicMin`（Vulkan）」
 //  但那是针对**投票**（整型）的映射。本 pass 需要的是 **atomicAdd，且对象是
-//  float** —— 而：
+//  浮点量** —— 而浮点原子在两端都靠不住：
 //
-//    Metal ：`device atomic_float*` + `atomic_fetch_add_explicit`
-//            是 **Metal 核心特性**，无需任何扩展。
-//    Vulkan：`atomicAdd` 对 **float** 需要扩展 `VK_EXT_shader_atomic_float`
+//    Metal ：`atomic_float` 仅 **Metal 3.0 / iOS 16** 起才有（MSL 规范 §2.6）。
+//            本项目部署下限是 **iOS 15.0**（docs/12 §4.6）→ **不可用**。
+//            （2026-11-01 由 CI 首次真编译证伪旧结论；旧写法在设备 SDK 下
+//             能编过只是因为没传 `-target`、取了 SDK 默认高语言版本，
+//             属"假通过" —— 真机抛 `language version 3.0 … incompatible`。）
+//    Vulkan：`atomicAdd` 对 float 需要扩展 `VK_EXT_shader_atomic_float`
 //            （GLSL 侧为 `GL_EXT_shader_atomic_float_add`），**不是核心特性**。
 //
-//  两端因此**无法用同一种语句写同一个算法**。这是真实的平台能力差异，
-//  不是实现偷懒。本项目**不接受静默降级**（docs/14 CT-9），故提供两条
-//  **显式可选**路径，由 C++ 侧按运行期能力探测二选一并记录选择结果：
+//  故本 pass 在**两端**都用**定点整数原子**（`int` 的 `atomicAdd` 是两端核心
+//  特性：Metal `atomic_int` = Metal 1.0+，Vulkan 核心）。量化方案：
 //
-//    ┌─ 路径 A：`RECON_VK_FLOAT_ATOMIC` 已定义
-//    │     需 C++ 侧确认 `VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
-//    │     .shaderBufferFloat32AtomicAdd == VK_TRUE`，并启用该扩展。
-//    │     与 Metal 侧**完全同构**（同一数学式、同一累加语义）。
-//    │
-//    └─ 路径 B：未定义（**默认**）
-//          定点整数原子（scale = RECON_VK_FIXED_SCALE = 2^12），
-//          `atomicAdd` 作用于 `int`（核心特性，无需扩展）。
-//          与路径 A 存在**量化差异**（相对误差 ≤ 1/4096 ≈ 2.4e-4）。
-//          ⚠️ 该差异**是真实的**：两条路径的体素和值不保证逐位相同。
-//          已登记为缺口，待真机阶段用同一输入跑两条路径对比。
+//      value → round(value × RECON_GPU_FIXED_SCALE)，饱和于 ±RECON_GPU_FIXED_MAX
 //
-//  **为什么选定点而不是「改用非原子两遍法」**：两遍法（先计数、再按槽位写）
-//  需要为每个体素预留"最大命中数"的槽位，内存开销 = 体素数 × 平均命中数 × 8 B，
+//  尺度与上界的**完整论证**（为何 2^12 / 2^30、上界充裕性）登记在
+//  `shaders/common/gpu_algo.h` 的 `RECON_GPU_FIXED_*` 段 —— 那是**单一事实
+//  来源**；本文件只做实现，不重复论证（重复必然漂移）。
+//
+//  ⚠️ **量化差异是真实的**：定点累加与"无限精度浮点累加"不逐位相同
+//     （相对误差 ≤ 1/4096 ≈ 2.4e-4）。但该差异**两端完全相同** —— 这正是
+//     统一方案的价值：跨端对拍不再有"两条路径量化不同"的额外变量。
+//     与 CPU 版对拍时仍须以"可接受误差"而非"逐位相等"为准
+//     （docs/13 的项目口径：统计等价须登记）。
+//
+//  **为什么不用「非原子两遍法」**：两遍法（先计数、再按槽位写）需要为每个
+//  体素预留"最大命中数"的槽位，内存开销 = 体素数 × 平均命中数 × 8 B，
 //  在体素 0.5 mm 级时远超声预算（docs/05 §5.9.3），不可行。
 //  定点原子内存开销与浮点原子**完全相同**（同样两个 4 B 累加器），只是精度略降。
 //
-// ⚠️ 饱和而非回绕：`atomicAdd` 到 `RECON_VK_FIXED_MAX`（2^30）后不再增长。
-//   回绕会把大数变负（等价于静默数据损坏）；饱和是**可观测**的
-//   （`recon_mvs_reduce` 会产出异常大的值）。上界充裕性论证见
-//   `shaders/vulkan/gpu_common.glsl` 的 `RECON_VK_FIXED_SCALE` 段。
+//  ⚠️ 饱和而非回绕：`atomicAdd` 到 `RECON_GPU_FIXED_MAX`（2^30）后不再增长。
+//    回绕会把大数变负（等价于静默数据损坏）；饱和是**可观测**的
+//     （`recon_mvs_reduce` 会产出异常大的值）。上界充裕性论证见
+//     `shaders/common/gpu_algo.h` 的 `RECON_GPU_FIXED_*` 段。
 //
 // ── 调度 ──────────────────────────────────────────────────────────────────
 // 全部 tile 完成后 dispatch 一次（docs/05 §5.9.2 层次 5）。
@@ -85,13 +87,6 @@ layout(local_size_x = RECON_VK_WORKGROUP_X,
 
 #include "gpu_common.glsl"
 
-// ---------------------------------------------------------------------------
-// 路径 A：需要 GL_EXT_shader_atomic_float_add（Vulkan 侧非核心特性）
-// ---------------------------------------------------------------------------
-#ifdef RECON_VK_FLOAT_ATOMIC
-#extension GL_EXT_shader_atomic_float_add : require
-#endif
-
 layout(set = 0, binding = 0, std140) uniform ParamsBlock {
     ReconMvsGpuParams p;
 };
@@ -107,48 +102,42 @@ layout(r32f, set = 0, binding = 2) uniform readonly image2D depth;
 layout(r32f, set = 0, binding = 3) uniform readonly image2D conf;
 
 // ---------------------------------------------------------------------------
-// 累加器：两条路径的**元素类型不同**，故用条件编译整块声明。
-// 两者的**元素个数相同**、**索引公式相同**、**语义相同**（加权和 / 权重和）。
-// ---------------------------------------------------------------------------
-#ifdef RECON_VK_FLOAT_ATOMIC
-// 路径 A：float 原子（需扩展）。布局与 Metal 侧 `device atomic_float*` 一致。
-layout(std430, set = 0, binding = 4) buffer VoxelSumBlock { float voxel_sum[]; };
-layout(std430, set = 0, binding = 5) buffer VoxelWBlock   { float voxel_w[];   };
-#else
-// 路径 B（默认）：定点整数原子（核心特性，无需扩展）。
+// 累加器：**32 位有符号整数**（定点量化），两端同构，无需任何扩展。
+//
+// 为什么不是 float：浮点原子在两端都不可依赖 —— Metal 侧的 `atomic_float`
+// 需 Metal 3.0 / iOS 16+（本项目部署下限 iOS 15.0）；Vulkan 侧需扩展
+// `VK_EXT_shader_atomic_float` 且**不是核心特性**。完整论证见文件头 VK-DIFF-1 段。
+//
 // `int` 而非 `uint`：饱和下界为负值侧也需要（虽然本 pass 只加非负数，
-// 但用 int 让两条路径的语义更容易对齐 —— 负数即"异常"，便于观测）。
+// 但用 int 让"负数即异常"更易观测 —— 负值只可能来自饱和逻辑出错）。
+// ---------------------------------------------------------------------------
 layout(std430, set = 0, binding = 4) buffer VoxelSumBlock { int voxel_sum[]; };
 layout(std430, set = 0, binding = 5) buffer VoxelWBlock   { int voxel_w[];   };
-#endif
 
 // ---------------------------------------------------------------------------
-// 定点饱和加法的统一封装：两条路径**共用同一调用点**，
-// 差异只在此函数内部与累加器类型上 —— 这样算法主体的代码是**唯一一份**，
-// 不会出现「路径 A 改了、路径 B 忘了改」的漂移。
+// 定点饱和加法
+//
+// 唯一调用点，故算法主体只有一份（不会出现"改了一处忘了另一处"）。
+// 尺度/上界的完整论证在 `shaders/common/gpu_algo.h` 的 RECON_GPU_FIXED_* 段
+// —— 那是单一事实来源，此处不重复论证（重复必然漂移）。
 // ---------------------------------------------------------------------------
-#ifdef RECON_VK_FLOAT_ATOMIC
-void recon_vk_local_voxel_accumulate(int idx, float sum_contrib, float w_contrib) {
-    atomicAdd(voxel_sum[idx], sum_contrib);
-    atomicAdd(voxel_w[idx],   w_contrib);
-}
-#else
 void recon_vk_local_voxel_accumulate(int idx, float sum_contrib, float w_contrib) {
     // 量化：value → round(value × 2^12)，饱和于 ±2^30。
-    int ds = int(clamp(round(sum_contrib * RECON_VK_FIXED_SCALE),
-                       -RECON_VK_FIXED_MAX, RECON_VK_FIXED_MAX));
-    int dw = int(clamp(round(w_contrib * RECON_VK_FIXED_SCALE),
-                       -RECON_VK_FIXED_MAX, RECON_VK_FIXED_MAX));
+    int ds = int(clamp(round(sum_contrib * RECON_GPU_FIXED_SCALE),
+                       -RECON_GPU_FIXED_MAX, RECON_GPU_FIXED_MAX));
+    int dw = int(clamp(round(w_contrib * RECON_GPU_FIXED_SCALE),
+                       -RECON_GPU_FIXED_MAX, RECON_GPU_FIXED_MAX));
     int old_s = atomicAdd(voxel_sum[idx], ds);
     int old_w = atomicAdd(voxel_w[idx],   dw);
     // 饱和回写：若越过上界，把超出部分减回去。
     // 用「一次修正」而非循环：并发下多次饱和可能相互追逐，故允许**轻微**超出
     // 上界（不是严格饱和）。这是**已知的近似**，如实登记：
     //   真实严格饱和需 CAS 循环；此处用单次修正以保持无锁且低成本。
-    if (old_s > RECON_VK_FIXED_MAX - ds) atomicAdd(voxel_sum[idx], RECON_VK_FIXED_MAX - (old_s + ds));
-    if (old_w > RECON_VK_FIXED_MAX - dw) atomicAdd(voxel_w[idx],   RECON_VK_FIXED_MAX - (old_w + dw));
+    //   ⚠️ 该近似**两端必须逐字同式**（Metal 侧同构），否则跨端对拍会出现
+    //      无法归因的差异。
+    if (old_s > RECON_GPU_FIXED_MAX - ds) atomicAdd(voxel_sum[idx], RECON_GPU_FIXED_MAX - (old_s + ds));
+    if (old_w > RECON_GPU_FIXED_MAX - dw) atomicAdd(voxel_w[idx],   RECON_GPU_FIXED_MAX - (old_w + dw));
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // 算法本体：与 MSL 侧 `kernel void recon_mvs_fuse_voxel(...)` 逐条对应

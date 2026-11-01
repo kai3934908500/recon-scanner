@@ -14,12 +14,17 @@
 // ⚠️ **单位与坐标**：`D_r` 沿光轴 z（与 docs/02 §5.5 F-1 深度语义一致）；
 //    融合点云为 **Y-up 右手系、米**（docs/05 §5.10「坐标系统一」）。
 //
-// ── 与 CB-5 的**路径耦合**（必须一起读）────────────────────────────────────
-// CB-5 的定点回退路径把累加器写成 `int`（scale = 2^12），本 pass 必须
-// **按同一条件编译读回并反量化**。若两端选择不一致（如 CB-5 用 A、CB-6 用 B），
-// 累加器会被按错误的类型解释 —— 这是**静默失效**，且不会编译报错。
-// 故两个文件的 `#ifdef RECON_VK_FLOAT_ATOMIC` **必须由同一个 CMake 定义控制**
-// （见 CMakeLists 的 `recon_shaders_vulkan` target 说明）。
+// ── 与 CB-5 的**累加器类型耦合**（必须一起读）──────────────────────────────
+// CB-5 把累加器写成 `int`（定点量化，scale = 2^12），本 pass 必须**按同一
+// 类型读回并反量化**。两者是同一个缓冲的两端，类型一旦不一致，累加器会被
+// 按错误类型解释 —— 这是**静默失效**，且不会编译报错。
+// 故两处的 `int` 声明与 `RECON_GPU_FIXED_SCALE_INV` 反量化**必须同源**
+// （尺度常量登记在 `shaders/common/gpu_algo.h`，由闸门 P7 逐条比对数值）。
+//
+// ⚠️ 2026-11-01 起**不再有** `RECON_VK_FLOAT_ATOMIC` 条件编译：浮点原子在
+//    两端都不可依赖（Metal 侧 `atomic_float` 需 Metal 3.0 / iOS 16+，而本项目
+//    部署下限是 iOS 15.0），故两端统一走定点整数原子。旧的双路径设计已删除
+//    —— 「同一逻辑不写两遍」：两条路径意味着两套读回逻辑，必然漂移。
 //
 // ── 输入/输出 ─────────────────────────────────────────────────────────────
 // set 0 binding 0  → UBO   ReconMvsGpuParams
@@ -51,35 +56,25 @@ layout(set = 0, binding = 0, std140) uniform ParamsBlock {
     ReconMvsGpuParams p;
 };
 
-// 累加器类型必须与 CB-5 的**同一条件编译**保持一致（见文件头「路径耦合」）。
-#ifdef RECON_VK_FLOAT_ATOMIC
-layout(std430, set = 0, binding = 1) readonly buffer VoxelSumBlock { float voxel_sum[]; };
-layout(std430, set = 0, binding = 2) readonly buffer VoxelWBlock   { float voxel_w[];   };
-#else
+// 累加器类型必须与 CB-5 **逐字一致**（见文件头「累加器类型耦合」）。
+// 定点量化累加器：`int`，scale = RECON_GPU_FIXED_SCALE（登记在 common）。
 layout(std430, set = 0, binding = 1) readonly buffer VoxelSumBlock { int voxel_sum[]; };
 layout(std430, set = 0, binding = 2) readonly buffer VoxelWBlock   { int voxel_w[];   };
-#endif
 
 layout(r32f, set = 0, binding = 3) uniform writeonly image2D out_depth;
 layout(r32f, set = 0, binding = 4) uniform writeonly image2D out_conf;
 layout(r32f, set = 0, binding = 5) uniform writeonly image2D out_support;
 
 // ---------------------------------------------------------------------------
-// 读回累加器：两条路径的**唯一差异点**，封装成函数使算法主体只有一份。
-// 定点路径在此**反量化**（× 1/2^12），调用方拿到的永远是 float，
-// 与路径 A 语义一致。
+// 读回累加器并**反量化**（× 1/2^12），调用方拿到的永远是 float。
+//
+// 反量化后与"无限精度浮点累加"仍不逐位相同（相对误差 ≤ 1/4096）——
+// 该差异是定点方案的固有代价，已在 common 的 VK-DIFF-1 段登记。
 // ---------------------------------------------------------------------------
-#ifdef RECON_VK_FLOAT_ATOMIC
 void recon_vk_local_voxel_load(int idx, out float s, out float w) {
-    s = voxel_sum[idx];
-    w = voxel_w[idx];
+    s = float(voxel_sum[idx]) * RECON_GPU_FIXED_SCALE_INV;
+    w = float(voxel_w[idx])   * RECON_GPU_FIXED_SCALE_INV;
 }
-#else
-void recon_vk_local_voxel_load(int idx, out float s, out float w) {
-    s = float(voxel_sum[idx]) * RECON_VK_FIXED_SCALE_INV;
-    w = float(voxel_w[idx])   * RECON_VK_FIXED_SCALE_INV;
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // 算法本体：与 MSL 侧 `kernel void recon_mvs_reduce(...)` 逐条对应

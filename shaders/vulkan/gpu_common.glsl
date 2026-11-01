@@ -78,19 +78,30 @@
 // ⚠️ 五、与 Metal 侧的**能力差异**（如实登记，不是"已解决"）
 // ══════════════════════════════════════════════════════════════════════════
 // VK-DIFF-1  **浮点原子**。docs/05 §5.9.1 映射表把两端原子写成
-//            「`atomic_fetch_min_explicit` ↔ `atomicMin`」，但 `recon_mvs_fuse_voxel`
-//            用的是 **atomicAdd**（像素中心式散射，docs/05 §5.7），而：
-//              - Metal：`atomic_float` + `atomic_fetch_add_explicit`，**核心特性**；
+//            「`atomic_fetch_min_explicit` ↔ `atomicMin`」（那行是**投票**用的
+//            整型原子），但 `recon_mvs_fuse_voxel` 用的是 **atomicAdd**
+//            （像素中心式散射，docs/05 §5.7）。而浮点原子在**两端都不可依赖**：
+//              - Metal：`atomic_float` 仅 **Metal 3.0 / iOS 16** 起才有
+//                （MSL 规范 §2.6），本项目部署下限是 **iOS 15.0**（docs/12 §4.6）
+//                → 在契约允许的最低平台上该类型**不存在**；
 //              - Vulkan：`atomicAdd` 对 float **需要扩展** `VK_EXT_shader_atomic_float`
 //                （GLSL 侧 `GL_EXT_shader_atomic_float_add`），不是核心特性。
-//            处置（**双路径 + 显式选择**，不静默降级）：
-//              - `RECON_VK_FLOAT_ATOMIC` 已定义 → 与 Metal 完全同构的 float 原子；
-//              - 未定义 → **定点整数原子**回退（scale = 2^12，带饱和），
-//                与 float 路径存在**量化差异**（≤ 1/4096 相对误差），
-//                由 C++ 侧按运行期能力探测结果二选一，并把选择结果记入
-//                `degradation_summary`（docs/14 CT-9「无静默降级」）。
-//            ⚠️ 残余风险：两条路径的**数值结果不完全相同**，属真实差异；
-//            已登记为缺口，待真机阶段用同一输入对比两条路径的体素和值。
+//            处置（2026-11-01 D-42 修订）：**两端统一走定点整数原子**。
+//              value → round(value × RECON_GPU_FIXED_SCALE)，饱和于
+//              ±RECON_GPU_FIXED_MAX；反量化 × RECON_GPU_FIXED_SCALE_INV。
+//              常量与尺度论证的单一事实来源是 `shaders/common/gpu_algo.h`
+//              的 `RECON_GPU_FIXED_*` 段（**此处不重复论证** —— 重复必然漂移）。
+//            ⚠️ 本次修订**撤回了旧的"双路径 + 运行期二选一"方案**：
+//              · 旧登记说「Metal 侧 `atomic_float` 是核心特性，故本端无分支」——
+//                **该结论是错的**，由 CI run 9 首次真编译的 8 个错误证伪；
+//              · 旧的 `RECON_VK_FLOAT_ATOMIC` 分支与
+//                `GL_EXT_shader_atomic_float_add` 扩展**已删除**：
+//                它会让两端在**不同路径**上跑，而 metal 端那条路根本编不过。
+//            ⚠️ 残余差异（如实登记，不是"已解决"）：定点方案本身引入
+//              ≤ 1/4096 的相对量化误差。这是**方案固有的**，两端**完全一致**
+//              （同一组常量、同一套数学式，由闸门 P13 逐字校验），
+//              故不再构成"两端结果不同"的风险 —— 它只是与"纯 float 累加"
+//              这一**理想参照**的差异，属可接受近似。
 //
 // VK-DIFF-2  **threadgroup / shared 内存**。docs/05 §5.9.1 映射表给出
 //            「`threadgroup` ↔ `shared`」。本工程**两端都尚未启用**共享内存缓存
@@ -164,22 +175,23 @@
 #define RECON_GPU_PIXEL_CENTER  0.5
 
 // ---------------------------------------------------------------------------
-// 定点原子回退的量化尺度（仅 RECON_VK_FLOAT_ATOMIC 未定义时使用）
+// 定点原子累加的量化尺度（**跨端共享**，登记在 shaders/common/gpu_algo.h）
 // ---------------------------------------------------------------------------
 //
-// scale = 2^12：权重量化步长 1/4096 ≈ 2.44e-4，对「融合权重归一化的和」而言
-// 远小于体素离散化本身的误差（docs/05 §6.1.2 第 7 级，h_vox/√12）。
+// 名字从 `RECON_VK_FIXED_*` 改为 `RECON_GPU_FIXED_*`：这两个量是**两端共用
+// 的算法参数**，不是 Vulkan 单侧专用量。2026-11-01 之前只有 Vulkan 用定点
+// 回退（Metal 走 `atomic_float`），故按"单侧专用"用 `RECON_VK_` 前缀；
+// 现在 Metal 也必须走定点（`atomic_float` 是 Metal 3.0 / iOS 16+ 才有，
+// 而本项目部署下限是 iOS 15.0 —— 见 common 头的 `VK-DIFF-1` 段），
+// 于是它们变成共享量 → 必须在 common 登记、两端同名同值。
 //
-// 溢出上界：32 位有符号累加，饱和于 2^30（在 scale=2^12 下 = 未缩放值 262144）。
-//   权重累加：单样本 w ≤ 1 → 缩放后 4096 → 可容纳 262144 个满权样本；
-//   加权深度：单样本 z·w，z ≤ depth_max_m（默认 10 m 量级）→ 缩放后 ≤ 40960
-//             → 可容纳约 6400 个满量程样本。
-// 真实体素（0.5 mm 级）被上千像素命中已属极端，故上界充裕；**但仍饱和而非
-// 回绕**（回绕会把大数变成负数，等价于静默数据损坏）。饱和会在
-// `recon_mvs_reduce` 处表现为异常大的值，是**可观测**的，不是静默的。
-#define RECON_VK_FIXED_SCALE      4096.0
-#define RECON_VK_FIXED_SCALE_INV  (1.0 / 4096.0)
-#define RECON_VK_FIXED_MAX        1073741824   // 2^30
+// ⚠️ 数值必须与 common / Metal 侧**逐位相同**，由 `tools/shader_parity.py`
+//    的 P7 判据逐条比对。这里写 `4096.0` 与 `0.000244140625` 而非
+//    `(1.0 / 4096.0)`：后者会让 P7 的数值解析失败（判据只认单 token），
+//    等于把该常量从"值必须一致"的检查里摘出去。
+#define RECON_GPU_FIXED_SCALE      4096.0
+#define RECON_GPU_FIXED_SCALE_INV  0.000244140625   // = 1/4096 = 2^-12（二进制精确）
+#define RECON_GPU_FIXED_MAX        1073741824        // 2^30
 
 // ---------------------------------------------------------------------------
 // 参数块：MVS（字段与 shaders/common/gpu_algo.h 的 ReconMvsGpuParams 一致）

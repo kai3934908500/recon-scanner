@@ -45,6 +45,20 @@ using namespace metal;
 #define RECON_GPU_PERCENT_SCALE 100.0f
 #define RECON_GPU_PIXEL_CENTER  0.5f
 
+// 体素累加器的定点化尺度（跨端共享，见 common 头的 RECON_GPU_FIXED_* 段）。
+//
+// 为什么 Metal 侧也需要它（2026-11-01 CI 实证）：本端**不能**用 `atomic_float`
+// —— 那是 Metal 3.0 / iOS 16+ 才有的别名，而本项目部署下限是 iOS 15.0
+// （docs/12 §4.6）。故 `recon_mvs_fuse_voxel` 与 Vulkan 侧一样走
+// `atomic_int` + 定点量化，尺度必须与 Vulkan 侧**逐位相同**（闸门 P7 比对）。
+//
+// ⚠️ `RECON_GPU_FIXED_SCALE_INV` 写字面量而非 `(1.0f / 4096.0f)`：
+//    1/4096 = 2^-12 二进制精确，字面量无精度损失；而表达式会让闸门 P7 的
+//    数值解析失败（只认单 token），等于把该常量从"值必须一致"的判据里摘出去。
+#define RECON_GPU_FIXED_SCALE      4096.0f
+#define RECON_GPU_FIXED_SCALE_INV  0.000244140625f   // = 1/4096 = 2^-12（二进制精确）
+#define RECON_GPU_FIXED_MAX        1073741824        // 2^30
+
 // ---------------------------------------------------------------------------
 // 平台差异（有意的、平台能力使然的不对称 —— 见 common 头的 RECON_GPU_DIFF 段）
 // ---------------------------------------------------------------------------
@@ -53,12 +67,21 @@ using namespace metal;
 // 每个 `RECON_GPU_DIFF(n)` 在**两端**都能找到 `DIFF-n` 的说明 ——
 // 避免某端的说明被悄悄删掉，使差异变成"看不出是漏写还是有意的"。
 //
-//   VK-DIFF-1 / MSL-DIFF-1  浮点原子：Metal 侧 `atomic_float` 是**核心特性**
-//        （`atomic_fetch_add_explicit` 直接可用），故本端**无**该差异的代码分支；
-//        Vulkan 侧需要扩展，无扩展时退为定点整数原子。
-//        本端在此登记"我是差异的另一端"，以免闸门以为 Metal 侧忘了写。
-//        ⚠️ 后果：两条路径的**数值**不保证逐位相同（相对误差 ≤ 1/4096）。
-//        跨端对拍时须以"可接受误差"而非"逐位相等"为准。
+//   VK-DIFF-1 / MSL-DIFF-1  浮点原子在**两端都不可依赖** → 统一走定点整数原子。
+//        本端（Metal）早先的登记「`atomic_float` 是核心特性，故无分支」**是错的**：
+//        `atomic_float` 是 **Metal 3.0 / iOS 16** 起才有的别名（MSL 规范 §2.6），
+//        而本项目部署下限是 **iOS 15.0**（docs/12 §4.6）→ 在契约允许的最低平台上
+//        该类型**根本不存在**。旧写法在设备 SDK 下能编过，只是因为编译命令没传
+//        `-target`、编译器取了 SDK 默认的高语言版本 —— 属"假通过"：产物语言版本
+//        高于部署目标，真机运行期抛
+//        `Function is using language version 3.0 which is incompatible with this OS`。
+//        现状：`voxel_sum` / `voxel_w` 声明为 `device atomic_int*`
+//        （`atomic_int` = Metal 1.0+，覆盖 iOS 15），量化尺度/饱和阈值用
+//        `RECON_GPU_FIXED_*`（本文件下方定义，值与 common 逐位相同）。
+//        本端在此登记"我是该差异的另一端"，以免闸门以为 Metal 侧忘了写。
+//        ⚠️ 后果：定点累加与"无限精度浮点累加"不逐位相同（相对误差 ≤ 1/4096）。
+//        跨端对拍时该差异**两端完全相同**（同一量化式），故不再有"两条路径
+//        量化不同"的额外变量；与 CPU 版对拍仍须以"可接受误差"为准。
 //
 //   VK-DIFF-4 / MSL-DIFF-4  深度采样用最近邻而非线性过滤（以 docs/04 §4.6.1
 //        的硬要求为准）。本端用 `access::read` + `read(uint2)` 实现最近邻；

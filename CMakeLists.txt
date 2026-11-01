@@ -346,10 +346,28 @@ if(RECON_COMPILE_SHADERS AND RECON_PLATFORM_IOS)
   #    而这里的 CMAKE_BINARY_DIR 在 CI 里是 `build/ios/device` —— 两者不一致时，
   #    本命令声明的 OUTPUT 永远不会被生成，`ninja`/`make` 会以
   #    "missing output" 或反复重跑收场（只有真在 macOS 上配置才会暴露）。
+  #
+  # ⚠️ 同样必须把 **SDK 与部署目标**显式传给脚本（2026-11-01 CI 实证，两个真 bug）：
+  #    ① `RECON_IOS_SDK`：脚本默认 `iphoneos`。模拟器 slice（RECON_IOS_SIMULATOR=ON）
+  #       若吃默认值，会**用真机 SDK 编出模拟器目录里的产物** —— CI 首次暴露即此：
+  #       `build/ios/simulator/**/default.metallib` 的前一行日志写着 `sdk : iphoneos`。
+  #       后果是模拟器 slice 的着色器**从未被真正用 iphonesimulator 编过**，
+  #       `build-xcframework` 的 16/16 全绿里有一半是假的。
+  #    ② `RECON_IOS_DEPLOYMENT_TARGET`：`-target` 三元组由它推出，进而决定
+  #       `__METAL_VERSION__`。不给则脚本回落 15.0（与工具链文件同值），
+  #       但还是显式传更稳 —— 一旦有人改了 RECON_IOS_DEPLOYMENT_TARGET，
+  #       这里不传就会静默用旧值编着色器（配置与产物不一致）。
+  if(RECON_IOS_SIMULATOR)
+    set(RECON_METALLIB_SDK "iphonesimulator")
+  else()
+    set(RECON_METALLIB_SDK "iphoneos")
+  endif()
   add_custom_command(
     OUTPUT "${RECON_METALLIB_OUT}"
     COMMAND "${CMAKE_COMMAND}" -E env
             RECON_REQUIRE_METAL=1
+            "RECON_IOS_SDK=${RECON_METALLIB_SDK}"
+            "RECON_IOS_DEPLOYMENT_TARGET=${RECON_IOS_DEPLOYMENT_TARGET}"
             "RECON_METALLIB_OUT_DIR=${RECON_METALLIB_OUT_DIR}"
             "RECON_METAL_AIR_DIR=${RECON_METALLIB_AIR_DIR}"
             bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_metal_shaders.sh"

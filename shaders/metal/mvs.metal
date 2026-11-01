@@ -309,18 +309,62 @@ kernel void recon_mvs_consistency(texture2d<float, access::read>  in_invz  [[tex
 }
 
 // ---------------------------------------------------------------------------
-// CB-5 体素融合：点云散射到体素（atomicAdd）
+// CB-5 体素融合：点云散射到体素（定点整数原子累加）
 // docs/05 §5.7
 // ---------------------------------------------------------------------------
 //
-// 逐参考帧深度像素散射到体素网格。此处用 `atomic_fetch_add_explicit` 做
-// 累加 —— 与 TSDF 不同，MVS 的融合是**像素中心式**（多个像素可能落到同一
-// 体素），因此**必须**用原子。Metal 的 `atomic_fetch_add_explicit` 支持
-// `float` 类型（device 地址空间），这一点与 Vulkan 不同（见 vulkan 侧说明）。
+// 逐参考帧深度像素散射到体素网格。与 TSDF 不同，MVS 的融合是**像素中心式**
+// （多个像素可能落到同一体素）→ `voxel_sum` / `voxel_w` 的累加**必须原子**。
+//
+// ⚠️ **为什么是 `atomic_int` 而不是 `atomic_float`**（2026-11-01 CI 实证）：
+//    `atomic_float` 是 **Metal 3.0 / iOS 16** 起才有的类型别名（MSL 规范 §2.6），
+//    而本项目部署下限是 **iOS 15.0**（docs/12 §4.6）→ 在契约允许的最低平台上
+//    该类型**根本不存在**，用它会直接编译失败（CI 首次真编译即 8 个错误）。
+//    旧写法「Metal 有浮点原子，是核心特性」**是错的**，已由 CI 证伪并撤回；
+//    旧写法之所以在设备 SDK 下"编过"，只是因为编译命令没传 `-target`、
+//    编译器取了 SDK 默认的高语言版本 —— 属**假通过**：产物语言版本高于
+//    部署目标，真机运行期抛
+//    `Function is using language version 3.0 which is incompatible with this OS`。
+//
+//    故本端与 Vulkan 侧**统一走定点整数原子**（`int` 的原子加是 Metal 1.0+，
+//    覆盖 iOS 15）：`value → round(value × 2^12)`，饱和于 ±2^30。
+//    尺度与上界的完整论证登记在 `shaders/common/gpu_algo.h` 的
+//    `RECON_GPU_FIXED_*` 段（**单一事实来源**；两端同名同值，闸门 P7 比对）。
+//
+// ⚠️ 饱和修正（`if (old_s > MAX - ds) …`）与 Vulkan 侧
+//    `recon_vk_local_voxel_accumulate` **必须是同一套数学**：定点方案下两端
+//    结果要能对拍，任何一侧少做/多做饱和修正都会引入无法归因的差异。
+//    语言不同（MSL / GLSL）无法共享函数体，故这是**受控的重复**，
+//    由闸门 P13 在两份实现上校验同一组表达式（见 tools/shader_parity.py）。
+static inline void recon_voxel_accumulate(device atomic_int* sum,
+                                         device atomic_int* w,
+                                         int idx,
+                                         float sum_contrib,
+                                         float w_contrib) {
+    // 量化：value → round(value × 2^12)，饱和于 ±2^30。
+    // `float(RECON_GPU_FIXED_MAX)` 显式转 float：MSL 的 `clamp` 要求三个实参
+    // 同型，混用 int 会命中重载解析失败（用宏直接写会因宏是整数字面量而报错）。
+    int ds = int(clamp(round(sum_contrib * RECON_GPU_FIXED_SCALE),
+                       -float(RECON_GPU_FIXED_MAX), float(RECON_GPU_FIXED_MAX)));
+    int dw = int(clamp(round(w_contrib * RECON_GPU_FIXED_SCALE),
+                       -float(RECON_GPU_FIXED_MAX), float(RECON_GPU_FIXED_MAX)));
+    int old_s = atomic_fetch_add_explicit(&sum[idx], ds, memory_order_relaxed);
+    int old_w = atomic_fetch_add_explicit(&w[idx],   dw, memory_order_relaxed);
+    // 饱和回写：若越过上界，把超出部分减回去。用「一次修正」而非循环 ——
+    // 并发下多次饱和可能相互追逐，故允许**轻微**超出上界（不是严格饱和）。
+    // 这是**已知的近似**，如实登记（严格饱和需 CAS 循环，代价不值得）。
+    if (old_s > RECON_GPU_FIXED_MAX - ds)
+        atomic_fetch_add_explicit(&sum[idx], RECON_GPU_FIXED_MAX - (old_s + ds),
+                                  memory_order_relaxed);
+    if (old_w > RECON_GPU_FIXED_MAX - dw)
+        atomic_fetch_add_explicit(&w[idx],   RECON_GPU_FIXED_MAX - (old_w + dw),
+                                  memory_order_relaxed);
+}
+
 kernel void recon_mvs_fuse_voxel(texture2d<float, access::read>  depth     [[texture(0)]],
                                  texture2d<float, access::read>  conf      [[texture(1)]],
-                                 device   atomic_float*          voxel_sum [[buffer(0)]],
-                                 device   atomic_float*          voxel_w   [[buffer(1)]],
+                                 device   atomic_int*            voxel_sum [[buffer(0)]],
+                                 device   atomic_int*            voxel_w   [[buffer(1)]],
                                  constant ReconMvsGpuParams&     p         [[buffer(2)]],
                                  constant ReconViewParams&       view      [[buffer(3)]],
                                  uint2 gid [[thread_position_in_grid]])
@@ -356,8 +400,8 @@ kernel void recon_mvs_fuse_voxel(texture2d<float, access::read>  depth     [[tex
     if (vi < 0 || vj < 0 || vk < 0) return;
     int idx = (vk * dim + vj) * dim + vi;
 
-    atomic_fetch_add_explicit(&voxel_sum[idx], z * c, memory_order_relaxed);
-    atomic_fetch_add_explicit(&voxel_w[idx],   c,      memory_order_relaxed);
+    // 定点量化 + 原子累加（与 Vulkan 侧同一套数学，见函数定义处的说明）。
+    recon_voxel_accumulate(voxel_sum, voxel_w, idx, z * c, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -365,13 +409,22 @@ kernel void recon_mvs_fuse_voxel(texture2d<float, access::read>  depth     [[tex
 // docs/05 §5.10 输出契约
 // ---------------------------------------------------------------------------
 //
-// ⚠️ 两个体素缓冲声明为 **非 const** `device atomic_float*`（而非
-//    `device const atomic_float*`）：`atomic_load_explicit` 在不同 MSL 版本里的
-//    形参 const 限定不一致，非 const 实参对两种签名都能绑定，是唯一稳妥的写法。
-//    （Vulkan 侧对应声明为 `readonly buffer`，那是 GLSL 的描述符限定；
-//     MSL 与 GLSL 在这一点的写法差异**不构成语义差异** —— 两者都只读不写。）
-kernel void recon_mvs_reduce(device   atomic_float* voxel_sum [[buffer(0)]],
-                             device   atomic_float* voxel_w   [[buffer(1)]],
+// ⚠️ 两个体素缓冲在此声明为 **`device const int*`（普通只读指针，非原子）**：
+//    CB-5 已结束（dispatch 顺序保证无并发写者），本 pass 只读 → 无需原子读。
+//    这与 Vulkan 侧的 `readonly buffer { int voxel_sum[]; }` **语义与写法
+//    一一对应**（GLSL 的 `readonly` 就是本处的 `const`）。
+//
+//    早先这里写的是 `device atomic_float*` + `atomic_load_explicit`，并在注释里
+//    论证「非 const 才能绑定两种签名」—— 那套论证随 `atomic_float` 一起作废
+//    （该类型是 Metal 3.0 / iOS 16+，本项目部署下限 iOS 15.0）。改回普通指针
+//    顺带消掉了那个「不同 MSL 版本 const 限定不一致」的坑，是与 Vulkan 侧
+//    对齐的更简写法。
+//
+//    定点累加器**必须反量化**后再参与后续计算（× 1/2^12），否则 `z = s / w`
+//    仍成立（分子分母同尺度会约掉），但 `out_support` 写出的是**缩放过的** w、
+//    `out_conf` 的 `w / min_view_consistency` 会被放大 4096 倍 → 全错。
+kernel void recon_mvs_reduce(device   const int* voxel_sum [[buffer(0)]],
+                             device   const int* voxel_w   [[buffer(1)]],
                              texture2d<float, access::write> out_depth [[texture(0)]],
                              texture2d<float, access::write> out_conf  [[texture(1)]],
                              texture2d<float, access::write> out_support [[texture(2)]],
@@ -382,17 +435,10 @@ kernel void recon_mvs_reduce(device   atomic_float* voxel_sum [[buffer(0)]],
     if (gid.x >= uint(size.x) || gid.y >= uint(size.y)) return;
 
     int idx = int(gid.y) * p.ref_width + int(gid.x);
-    // ⚠️ `atomic_float` **不能**隐式或显式转换到 `float`（没有 conversion
-    //    operator），必须走显式的原子读：`atomic_load_explicit`。
-    //    原先写的 `float(voxel_w[idx])` 在 MSL 下报
-    //    "cannot convert 'const device metal::atomic_float' to 'float'
-    //     without a conversion operator"。
-    //    `memory_order_relaxed` 与此前的写入口径一致（仅需原子性、无需顺序），
-    //    与 Vulkan 侧「读回累加结果」的语义对应。
-    //    （平台差异的登记只在 `shaders/common/gpu_algo.h` 与两端公共头各一处 ——
-    //      **不得**在实现文件里再写一遍编号，否则会削弱 P10 判据的负向注入。）
-    float w = atomic_load_explicit(&voxel_w[idx], memory_order_relaxed);
-    float s = atomic_load_explicit(&voxel_sum[idx], memory_order_relaxed);
+    // 反量化：定点整数 → float。与 Vulkan 侧
+    // `float(voxel_sum[idx]) * RECON_GPU_FIXED_SCALE_INV` 逐项等价。
+    float w = float(voxel_w[idx])   * RECON_GPU_FIXED_SCALE_INV;
+    float s = float(voxel_sum[idx]) * RECON_GPU_FIXED_SCALE_INV;
     if (w <= 0.0f) {
         out_depth.write(float4(0, 0, 0, 1), gid);
         out_conf.write(float4(0, 0, 0, 1), gid);
