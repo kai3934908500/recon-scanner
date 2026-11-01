@@ -3,15 +3,29 @@
 # 为什么需要 macOS runner：Xcode 仅 macOS（见 tools/check_ios_contract.py 文件头
 # 的背景说明）。Windows / Linux 上无法编译 iOS 二进制，也无法生成 xcframework。
 #
-# 本工作流分两个 job：
+# 本工作流分四个 job：
 #   static-contract  —— **跑在 ubuntu 上**，零成本。它运行全部**不需要编译器**的
 #       契约闸门：iOS 静态契约（G1..G14）、双端功能对等、着色器两端一致性、
 #       C ABI 漂移、参数漂移、许可扫描、以及三份闸门的负向注入自检。
 #       这些检查与编译器无关，故不必耗 macOS 分钟数。
+#       （闸门 → 命令的映射集中在 tools/ci_run_gates.sh，可用 workflow_dispatch
+#        的 `gates` 输入收窄；见该脚本文件头。）
 #   build-xcframework —— 跑在 macos-15 上，真正编译三个静态库并打包 xcframework。
+#   shaders-vulkan   —— 跑在 ubuntu 上，用 glslangValidator 把 8 个 `.comp`
+#       **真编译**为 SPIR-V。补的是"8 个 Vulkan 着色器从未过编译器"的盲区：
+#       shader_parity.py 只做两端源码层比对，查不出 GLSL 自身的语法错误。
+#       （Metal 侧相反，只能靠 `xcrun metal`，故在 macOS job 内。）
+#   build-app        —— 跑在 macos-15 上，编整机 App。手工触发时可关
+#       （`run_build_app=false`），push/PR 恒定执行。
 #
 # 触发器：仅在 iOS / 着色器 / 契约相关路径变化时运行
 # （避免每次改 core/ 的无关文件都烧 macOS 分钟数）。
+#
+# ⚠️ push 与 pull_request 两段 paths 白名单必须**逐条一致**（两段间有注释说明）。
+#   白名单是手工清单、必然漂移；本项目已因它踩过两次：`platform/common/**`
+#   与 `core/**` 曾是 iOS 构建的直接依赖却不在其中（改动不触发 CI），
+#   以及 pull_request 段缺 gen_ios_project.py 等闸门脚本自身。
+#   改任一段时请对照另一段。
 #
 # ⚠️ 关于 Xcode 版本（本 workflow 的一个关键决策，留档以免被"顺手升级"破坏）
 #   · macos-15 镜像预装 Xcode 16.0–16.4 **与** 26.0.1–26.3，默认 16.4。
@@ -46,7 +60,14 @@ on:
       - "tools/gen_ios_project.py"
       - "tools/build_metal_shaders.sh"
       - "tools/build_vulkan_shaders.sh"
+      - "tools/ci_run_gates.sh"
       - ".github/workflows/ios.yml"
+  # ⚠️ pull_request 的白名单必须与 push **逐条一致**（含 tools/*.py 那一串）。
+  #   先前它只有 8 条，缺了 gen_ios_project.py / verify_*_negative.py /
+  #   check_metallib_symbols.py / build_*_shaders.sh —— 于是"改一条闸门脚本"
+  #   本身不触发 CI，而 CI 正是唯一能证明该闸门未被改坏的机器。
+  #   （与本文件别的白名单缺口属同一类：白名单是**手工清单**，必然漂移；
+  #    这里保持两段逐条对齐，diff 时一眼能看出谁漏了。）
   pull_request:
     paths:
       - "platform/**"
@@ -54,12 +75,37 @@ on:
       - "core/**"
       - "shaders/**"
       - "cmake/toolchains/ios.cmake"
+      - "cmake/ThirdParty.cmake"
       - "CMakeLists.txt"
       - "tools/check_ios_contract.py"
+      - "tools/verify_ios_contract_negative.py"
       - "tools/check_platform_parity.py"
+      - "tools/verify_platform_parity_negative.py"
       - "tools/shader_parity.py"
+      - "tools/verify_shader_parity_negative.py"
+      - "tools/gen_ios_project.py"
+      - "tools/build_metal_shaders.sh"
+      - "tools/build_vulkan_shaders.sh"
+      - "tools/ci_run_gates.sh"
       - ".github/workflows/ios.yml"
   workflow_dispatch:
+    inputs:
+      # ── 主动收窄本次运行的范围（只为缩短反馈周期，不改判据强弱）──────────
+      # 默认 `all`：不传参时行为与手工触发引入这些开关之前**逐条一致**。
+      gates:
+        description: >
+          static-contract 要跑的闸门（逗号分隔）。all / generate / ios / parity /
+          shaders / abi / params / license / xcodegen / negative。
+          例如 "generate,ios" 只跑 iOS 那两条，约省 8 条闸门的等待。
+        type: string
+        default: all
+      run_build_app:
+        description: >
+          是否跑 build-app（Swift/ObjC++ 真编译，macOS 最慢的一步）。
+          只改 C++ 头或 CMake 时设为 false，可省约 5–8 分钟。
+          ⚠️ 它**不会**改变 build-xcframework 的行为 —— 静态库仍照常编译。
+        type: boolean
+        default: true
 
 env:
   # docs/12 §1.1：确定性构建
@@ -79,61 +125,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 生成器必须先跑：它产出 platform/ios/*.xcconfig / Package.swift /
-      # Container/project.yml，而下面的 G 闸门会校验这些文件的**内容与磁盘一致**。
-      # 漏这一步 → 闸门对着陈旧/缺失的生成物判，属"判据落在错误对象上"。
-      - name: 生成 iOS 工程描述
-        run: python tools/gen_ios_project.py
+      # 全部闸门收敛到 tools/ci_run_gates.sh（**单一实现**）。
+      # 原先是 11 个 YAML step 各写一行命令；改为脚本后，workflow_dispatch 传入的
+      # `gates` 选择器可以在**同一份映射**上收窄范围 —— 若把选择逻辑写进 YAML 的
+      # if 条件里，"闸门→名字"与"闸门→命令"就成了两处事实来源，新增一条闸门时
+      # 只改一处会导致它**在手选模式下永远不跑且日志看不出异常**。
+      # 缺省（未传 gates / 传 all）时执行顺序与覆盖范围与原 11 个 step 逐条一致。
+      - name: 静态契约闸门（选择器见 tools/ci_run_gates.sh）
+        env:
+          # push / pull_request 触发时 inputs.* 为空 → 落到 all（与历史一致）
+          RECON_CI_GATES: ${{ github.event.inputs.gates || 'all' }}
+        run: bash tools/ci_run_gates.sh "${RECON_CI_GATES}"
 
-      - name: iOS 静态契约闸门（G1..G14）
-        run: python tools/check_ios_contract.py
-
-      - name: iOS 静态契约负向注入（证明 G 判据非假闸门）
-        run: python tools/verify_ios_contract_negative.py
-
-      - name: 双端功能对等闸门（1..9）
-        run: python tools/check_platform_parity.py
-
-      - name: 双端对等负向注入
-        run: python tools/verify_platform_parity_negative.py
-
-      - name: 着色器两端一致性闸门（P1..P13）
-        run: python tools/shader_parity.py
-
-      - name: 着色器一致性负向注入
-        run: python tools/verify_shader_parity_negative.py
-
-      - name: C ABI 漂移闸门
-        run: python tools/abi_drift_check.py
-
-      - name: 参数契约漂移闸门
-        run: python tools/check_params.py
-
-      - name: 第三方许可扫描（GPL 家族硬阻断）
-        run: python tools/license_scan.py --third-party third_party
-
-      # XcodeGen 的 --project-root 是"少一个参数就整个构建找不到源码、且报错
-      # 信息与根因距离很远"的那类陷阱（见 project.yml 文件头）。这里静态确认
-      # 本 workflow 与生成器产出的说明都带上了它 —— 防止将来有人"简化"掉。
-      - name: 确认 xcodegen 调用带 --project-root（防回归）
-        run: |
-          set -euo pipefail
-          if ! grep -q -- '--project-root' .github/workflows/ios.yml; then
-            echo "::error::ios.yml 的 xcodegen 调用缺少 --project-root"
-            exit 1
-          fi
-          if ! grep -q -- '--project-root' tools/gen_ios_project.py; then
-            echo "::error::gen_ios_project.py 的说明里缺少 --project-root"
-            exit 1
-          fi
-          echo "OK: --project-root 在两处都有"
-          # project.yml 必须显式声明 scheme，否则 build-app job 的
-          # `xcodebuild -scheme Recon` 会依赖 XcodeGen 的自动命名（版本相关）。
-          if ! grep -q '^schemes:' platform/ios/Container/project.yml; then
-            echo "::error::project.yml 缺少显式 schemes 段"
-            exit 1
-          fi
-          echo "OK: project.yml 有显式 scheme"
+      # ── 静态自检：tools/ci_run_gates.sh 的选择器语义本身必须成立 ─────────
+      # 只在**手工触发**时跑（它只读不写工作区，但没必要每 push 都做）。
+      # 为什么需要（本项目已吃过一次同类亏）：负向注入闸门曾经"注入失效"却报
+      # 通过 —— 锚点找不到时它直接跳过而非拒绝，判据就退化成常真。选择器同理：
+      # 把 `ios` 解析成空集，本该跑的闸门一条不跑、日志还一片绿。
+      # `--self-test` 用三条断言把这件事证伪：
+      #   ① 每个已知选择器都能解析出**非空**的闸门集合，且与 all 的集合
+      #      满足包含关系（窄选择器 ⊆ all —— 否则省的不是时间，是覆盖面）；
+      #   ② 故意错拼的选择器必须**非零退出**（证明不静默忽略）；
+      #   ③ all 的集合大小 == 各能力点的并集（证明没有能力点被漏挂）。
+      - name: 静态契约闸门选择器自检（手工触发时）
+        if: github.event_name == 'workflow_dispatch'
+        run: bash tools/ci_run_gates.sh --self-test
 
       # 上传生成物给 build job 复用，避免 macOS 上再跑一次生成器
       # （两处生成同一文件 = 第二事实来源的温床；下游只消费这里的一份）。
@@ -378,6 +394,42 @@ jobs:
           fi
           echo "OK: 无网络框架"
 
+          echo "== 部署目标一致性（docs/12 §4.6「与静态库切片的关系」）=="
+          # 判据落在**切片产物**上。为什么必须有这一关（第 5 轮 CI 的真实事故）：
+          #   工具链只设了 CMAKE_SYSTEM_VERSION，没设 CMAKE_OSX_DEPLOYMENT_TARGET
+          #   → CMake 的 Xcode generator 把它留空 → 交给 SDK 默认值（当时 18.5）。
+          #   于是归档里每个 `.o` 的 min-version 都是 18.5，而 App 按 15.0 链接：
+          #     ld: warning: object file (...png_encoder.o) was built for newer
+          #                 'iOS-simulator' version (18.5) than being linked (15.0)
+          #   ⚠️ 这只是 **warning** —— 构建照样"成功"。也就是说：**没有本关，
+          #      这个漂移可以一路通过 CI 并且在日志里只表现为噪声**。故必须用
+          #      断言把它钉死，而不是指望人去看那上百行 warning。
+          #   `vtool -show-build` 读的是 Mach-O 的 LC_BUILD_VERSION，是产物的
+          #   真实属性，不是"我传了什么参数"的自述。
+          for slice in ios-arm64/libReconCore.a ios-arm64_x86_64-simulator/libReconCore.a; do
+            echo "--- ${slice} ---"
+            vtool -show-build "$XCF/${slice}" > /tmp/mv.txt 2>&1 || true
+            cat /tmp/mv.txt
+            # 逐个架构检查（fat 归档上 vtool 会打印多段）
+            bad=0
+            while read -r v; do
+              if [ "${v}" != "15.0" ]; then
+                echo "::error::${slice} 有 minos=${v}，契约要求 15.0（docs/12 §4.6）"
+                bad=$((bad + 1))
+              fi
+            done < <(sed -n 's/^ *minos *//p' /tmp/mv.txt)
+            if [ "${bad}" -ne 0 ]; then
+              echo "::error::${slice} 的部署目标与 App 不一致，会引入「更高系统版本的弱符号」"
+              exit 1
+            fi
+          done
+          n_minos=$(sed -n 's/^ *minos *//p' /tmp/mv.txt | wc -l | tr -d ' ')
+          if [ "${n_minos}" -eq 0 ]; then
+            echo "::error::未能从 vtool 输出解析出任何 minos —— 判据可能已失效"
+            exit 1
+          fi
+          echo "OK: 两个切片的 minos 均为 15.0（与 docs/12 §4.6 一致）"
+
       # --- 产物层验证 default.metallib（此前从未真正编过）------------------
       - name: 校验 default.metallib
         run: |
@@ -418,14 +470,122 @@ jobs:
           retention-days: 14
 
   # ===========================================================================
+  # Vulkan 着色器：把 shaders/vulkan/*.comp 真编译为 SPIR-V
+  # ===========================================================================
+  # ⚠️ 本 job 补的是一个**真实存在过的盲区**（如实登记）：
+  #   `shaders/vulkan/` 下的 8 个 `.comp` 从未被任何编译器看过一眼。
+  #   `tools/shader_parity.py`（P1..P13）只做**两端源码层一致性**比对 ——
+  #   它用正则读 GLSL 与 Metal 源码，不做词法/语法分析，因此
+  #   「少个分号」「声明了没定义」「gpu_common.glsl 的 include 路径写错」
+  #   这类错误它**结构上就查不出来**。而 `tools/build_vulkan_shaders.sh`
+  #   虽然存在却从未被任何 workflow 调用 —— 于是"设计意图未落实"
+  #   （MEMORY.md 明列的一类问题）。
+  #
+  # 为什么放 ubuntu（而不是 macos）：glslangValidator 是跨平台工具，
+  #   `glslang-tools` 包在 Ubuntu 上一行 apt 就有；Vulkan 侧的编译**不需要**
+  #   Xcode。放这里既省 macOS 分钟数，又让这个 job 只依赖最轻的镜像。
+  #   （Metal 侧相反 —— 只能靠 `xcrun metal`，故必须在 macOS job 里。）
+  #
+  # 判据全部落在**产物**上，不落脚本的自述：
+  #   ① 8 个 `.comp` 各自产出非空 `.spv`；
+  #   ② 每个 `.spv` 的 SPIR-V 魔数 = 0x07230203（脚本内校验）；
+  #   ③ 内联头里的模块数 == 源码 `.comp` 数（防"少编了一个还报成功"）；
+  #   ④ 工具链缺失时脚本**必须硬失败**（RECON_REQUIRE_SPIRV=1），
+  #      不生成空产物 —— 空着色器模块在运行期是"模块在但入口点找不到"，
+  #      比"没编译"更难定位（docs/14 CT-9 无静默降级）。
+  shaders-vulkan:
+    name: Vulkan 着色器编译（glslangValidator → SPIR-V，8 个 .comp）
+    runs-on: ubuntu-latest
+    needs: static-contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 glslang 工具链
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends glslang-tools
+          glslangValidator --version | head -3
+
+      # 先做负向注入自检：证明"缺工具链即失败"这条纪律真的生效。
+      # 手法：把 glslangValidator 从 PATH 里藏掉，断言脚本**非零退出**。
+      # 不这么测的话，`RECON_REQUIRE_SPIRV=1` 是死代码 —— 一旦哪天被
+      # 改成 0，日志里也只会多一行 SKIP，看不出覆盖已经归零。
+      - name: 自检 —— 无工具链时必须硬失败（不静默降级）
+        run: |
+          set -euo pipefail
+          if env PATH="/usr/bin:/bin" bash -c 'command -v glslangValidator' >/dev/null 2>&1; then
+            echo "::error::glslangValidator 意外落在 /usr/bin —— 自检前提不成立"
+            exit 1
+          fi
+          if env PATH="/nonexistent" RECON_REQUIRE_SPIRV=1 \
+               bash tools/build_vulkan_shaders.sh > /tmp/nospirv.log 2>&1; then
+            echo "::error::无工具链时脚本竟然返回 0（违反 RECON_REQUIRE_SPIRV=1）"
+            cat /tmp/nospirv.log
+            exit 1
+          fi
+          echo "OK: 无工具链时脚本按约定失败"
+          grep -E "SKIP|FAIL" /tmp/nospirv.log | head -5
+
+      - name: 编译全部 .comp → SPIR-V 并内联为 C 数组
+        run: |
+          set -euo pipefail
+          RECON_REQUIRE_SPIRV=1 bash tools/build_vulkan_shaders.sh
+          echo "--- 产物 ---"
+          ls -l build/vulkan/spirv/
+          ls -l build/vulkan/recon_shaders_vulkan_spv.h
+
+      # 产物层覆盖判据：模块数必须与源码数**逐一对齐**（脚本自己已验证
+      # 产物内容，这里验证"数量"这一维度，两者互补）。
+      - name: 校验 SPIR-V 覆盖（源码数 == 模块数）
+        run: |
+          set -euo pipefail
+          n_src=$(ls shaders/vulkan/*.comp | wc -l | tr -d ' ')
+          n_spv=$(ls build/vulkan/spirv/*.spv | wc -l | tr -d ' ')
+          n_hdr=$(grep -c '^static const unsigned char recon_spv_' \
+                    build/vulkan/recon_shaders_vulkan_spv.h | tr -d ' ')
+          echo "源码 .comp = ${n_src}，.spv = ${n_spv}，内联模块 = ${n_hdr}"
+          if [ "${n_src}" -lt 8 ]; then
+            echo "::error::shaders/vulkan 下只有 ${n_src} 个 .comp，疑似被删（应为 8）"
+            exit 1
+          fi
+          if [ "${n_src}" != "${n_spv}" ] || [ "${n_src}" != "${n_hdr}" ]; then
+            echo "::error::覆盖不一致：源码 ${n_src} / spv ${n_spv} / 内联 ${n_hdr}"
+            exit 1
+          fi
+          echo "OK: ${n_src} 个着色器的源码、SPIR-V、内联数组三者一一对应"
+
+          echo "== 内联数组与源码文件名逐一对齐（防张冠李戴）=="
+          ls shaders/vulkan/*.comp | xargs -n1 basename | sed 's/\.comp$//' | sort > /tmp/src_names
+          grep -oE 'recon_spv_[A-Za-z0-9_]+\[\]' \
+            build/vulkan/recon_shaders_vulkan_spv.h \
+            | sed 's/^recon_spv_//; s/\[\]$//' | sort > /tmp/hdr_names
+          if ! diff -u /tmp/src_names /tmp/hdr_names; then
+            echo "::error::内联头里的模块名与源码文件名不一致"
+            exit 1
+          fi
+          echo "OK: 模块名与源码名逐字对应"
+
+  # ===========================================================================
   # 编译整机 App（XcodeGen 容器 + xcframework，不签名）
   # ===========================================================================
   # 这一步是"iOS 侧语言层首次真编译"——此前所有 Swift/ObjC++ 代码
   # 只有静态闸门保障，从未过编译器。它的价值在于把"能不能编过"变成事实。
+  #
+  # ⚠️ 手工触发时可关（`run_build_app=false`），但**默认开着**：
+  #   关掉它不会影响本 workflow 的判定力（push/PR 恒定执行），只是让"只改了
+  #   C++ 头/CMake 变量"这类迭代不必等这一步（约 5–8 分钟）。
+  #   注意它**不改变 build-xcframework** —— 静态库与 xcframework 永远照常编，
+  #   所以"关掉它 = 少验证一层"这件事在日志里是显式的（该 job 显示 skipped）。
   build-app:
     name: 编译 Recon.app（不签名，验证 Swift/ObjC++ 可编译）
     runs-on: macos-15
     needs: build-xcframework
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_build_app }}
     steps:
       - uses: actions/checkout@v4
 
@@ -506,3 +666,81 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
+
+      # ── 判据落在**最终二进制**上，而不是"project.yml 里写了 libz.tbd" ──────
+      # 为什么需要（第 5 轮 CI 的真实事故）：静态库归档是 CMake 产出的，其中
+      # `png_encoder.o` 对 zlib 的 `compress2` / `compressBound` 是**未解析外部
+      # 符号**；Xcode 链接 App 时若拿不到 libz，报的是
+      #     Undefined symbols ... "_compress2", referenced from png_encoder.o
+      # 这条报错与 PNG 代码的距离很远，且只在真正链过 App 之后才出现。
+      # `tools/gen_ios_project.py` 里的 `- sdk: libz.tbd` 是修法；本步骤**验证
+      # 修法生效** —— 将来谁把那一行删了、或 XcodeGen 换了写法，这里立即失败。
+      #
+      # ⚠️ 判据为什么是 `nm -m -u` 而不是 `nm -u`（**极易写反，故写明**）：
+      #   在 Mach-O 上，链接成功的可执行文件里，**从动态库导入的符号仍然是
+      #   "undefined"** —— 它们由 dyld 在加载期绑定。也就是说 libz 正确链上时
+      #   `nm -u` 依然会列出 `_compress2`。若按"nm -u 里不得出现 _compress2"
+      #   来判，就会在**一切正常**时报失败（方向反了）。
+      #   能区分「已由 libz 解析」与「根本没解」的证据只有绑定信息：
+      #   `nm -m -u` 把 dylib 导入标注为 `(from <lib>)`。
+      #   而"根本没解"的情形**根本走不到这里**（上一步 xcodebuild 已失败）。
+      #   所以本步骤实际要防的是：**PNG 压缩被悄悄降级成存储型 deflate**
+      #   （`RECON_HAVE_ZLIB` 没生效）—— 那样 `png_encoder.o` 压根不引用 zlib，
+      #   链接会"成功"，只是产物体积显著变大，属静默降级（见 docs/12 §1.1）。
+      #   故断言方向是**正向**的：必须证明 libz 被链上、且 zlib 符号来自 libz。
+      - name: 校验 zlib 确已链入最终二进制（防 `-lz` 被删 / PNG 静默降级）
+        run: |
+          set -euo pipefail
+          APP=build/app/Build/Products/Release-iphonesimulator/Recon.app/Recon
+          if [ ! -f "$APP" ]; then
+            echo "::error::未找到构建产物 $APP"
+            find build/app/Build/Products -maxdepth 3 -name "Recon*" | head -20 || true
+            exit 1
+          fi
+          echo "== 产物 =="
+          ls -l "$APP"
+          file "$APP"
+
+          # ⚠️ 一律把命令输出**落文件**再判，不写成 `cmd | grep -q`：
+          #    `set -o pipefail` 下 grep -q 命中即关闭读端 → 上游收 SIGPIPE
+          #    退出 141 → 整条管道判非零 → `if !` 成立 → 误报。
+          #    （本项目在 check_metallib_symbols 上已吃过一次，见该脚本注释。）
+          OTOOL=$(mktemp); NMU=$(mktemp); NMG=$(mktemp)
+          trap 'rm -f "$OTOOL" "$NMU" "$NMG" || true' EXIT
+
+          otool -L "$APP" > "$OTOOL" 2>/dev/null || true
+          nm -m -u "$APP" > "$NMU" 2>/dev/null || true
+          nm -g  "$APP" > "$NMG" 2>/dev/null || true
+
+          echo "== 1) libz 必须是显式链接进来的动态库 =="
+          if grep -qE '/libz(\.1)?\.(tbd)?dylib' "$OTOOL"; then
+            grep -E '/libz' "$OTOOL"
+            echo "OK: 最终二进制链接了系统 libz"
+          else
+            echo "::error::最终二进制未链接 libz —— project.yml 的 libz.tbd 未生效"
+            echo "--- otool -L 全部依赖（供定位）---"
+            cat "$OTOOL"
+            grep -n "libz" platform/ios/Container/project.yml || \
+              echo "::error::project.yml 里根本没有 libz 依赖（gen_ios_project.py 被改回？）"
+            exit 1
+          fi
+
+          echo "== 2) PNG 压缩必须走 zlib（不得静默降级为存储型 deflate）=="
+          n_from_zlib=$(grep -c 'from libz' "$NMU" || true)
+          echo "来自 libz 的导入符号：${n_from_zlib} 个"
+          if [ "${n_from_zlib}" -lt 1 ]; then
+            echo "::error::没有任何符号是从 libz 解析的 —— 可能未定义 RECON_HAVE_ZLIB"
+            echo "--- 与 zlib 相关的行（供定位）---"
+            grep -E "_compress|_deflate|_inflate|_crc32|_adler32" "$NMU" "$NMG" || true
+            exit 1
+          fi
+          for sym in _compress2 _compressBound; do
+            if grep -q "${sym} (from libz)" "$NMU"; then
+              echo "  ✓ ${sym} ← libz"
+            else
+              echo "::error::PNG 编码器的 ${sym} 未由 libz 提供 —— 疑退到存储型 deflate（静默降级）"
+              grep -E "${sym}" "$NMU" "$NMG" || true
+              exit 1
+            fi
+          done
+          echo "OK: zlib 已链入且 PNG 压缩未降级"

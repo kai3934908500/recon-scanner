@@ -33,7 +33,6 @@ if(NOT DEFINED RECON_IOS_DEPLOYMENT_TARGET)
   set(RECON_IOS_DEPLOYMENT_TARGET "15.0")
 endif()
 set(CMAKE_SYSTEM_VERSION ${RECON_IOS_DEPLOYMENT_TARGET})
-
 # 部署目标下限硬断言：低于 15.0 直接拒绝。
 # 原因：15.0 之前 sceneDepth 支持面不完整、ARSession 回调频率不稳定，会直接
 # 破坏 02 文档的时间同步精度预算（τ_pipeline）。若放宽会静默降低内核精度。
@@ -89,6 +88,60 @@ if(RECON_IOS_SIMULATOR)
 else()
   set(CMAKE_OSX_SYSROOT iphoneos CACHE STRING "" FORCE)
   set(RECON_IOS_SLICE_NAME "ios-arm64" CACHE STRING "" FORCE)
+endif()
+
+# ---------------------------------------------------------------------------
+# ⚠️ CMAKE_OSX_DEPLOYMENT_TARGET：**必须**与 RECON_IOS_DEPLOYMENT_TARGET 同源
+# ---------------------------------------------------------------------------
+# 背景（第四十一轮 CI 的实测事故，勿删）：
+#   build-app 第一次推进到链接阶段时刷出上百条
+#     ld: warning: object file (...png_encoder.o) was built for newer
+#                 'iOS-simulator' version (18.5) than being linked (15.0)
+#   —— App 侧（XcodeGen 容器）的 IPHONEOS_DEPLOYMENT_TARGET = 15.0（docs/12 §4.6），
+#   而静态库切片里的每个 `.o` 都按 **SDK 默认部署目标 18.5** 编出来。
+#
+# 机理：`CMAKE_SYSTEM_VERSION` 只描述"目标系统版本"，用于 CMake 的平台判定；
+#   真正进编译命令行的是 **`CMAKE_OSX_DEPLOYMENT_TARGET`**（clang 的
+#   `-target arm64-apple-ios15.0` / `-mios-version-min`）。只设前者、不设后者时，
+#   CMake 的 Xcode generator 会把后者留空 → Xcode 交出一个 SDK 默认值。
+#   CI 日志里能直接看到这个漏配：编译命令是 `-target arm64-apple-ios18.5`
+#   （18.5 正是 iPhoneOS18.5.sdk 的默认），而 App 链接命令是
+#   `-target arm64-apple-ios15.0-simulator`。
+#
+# 后果不只是噪声：某个 `.o` 的 min-version 高于链接目标时，Apple 链接器**允许**
+#   它通过，但可能带出只在更高系统版本可用的弱符号绑定 —— 即"本机编得过、
+#   装到 iOS 15/16 真机上才炸"的那类问题。故必须与部署目标同源。
+#
+# ⚠️ 取值方式：**只在调用方未给时兜底**，与上面 RECON_IOS_SIMULATOR /
+#   CMAKE_OSX_SYSROOT 的写法逐字对称。刻意**不用** `CACHE ... FORCE`：
+#   docs/12 §4.3 的正式命令行本身就传
+#   `-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0`，FORCE 会把它**静默覆盖** ——
+#   那等于"判据可被工具覆盖"，与 shader_parity.py 拒绝收参是同一类问题
+#   （见 §6.2 任务 3 的说明）。
+#
+#   为什么兜底放在 `if(NOT DEFINED ...)` 而不是"干脆删掉兜底、只信调用方"：
+#   `-DCMAKE_OSX_DEPLOYMENT_TARGET` 会被**转发进 try_compile 子工程**（见上方
+#   判定源说明），而 CI 的 configure 命令没有传它 —— 子工程便会退回空值并按
+#   SDK 默认编 ABI 探测程序，于是同一个 CMake 配置里出现两种 ABI 假设。
+#   兜底一次、全链路同源才是正确的收敛点。
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR
+   CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "${RECON_IOS_DEPLOYMENT_TARGET}" CACHE STRING
+      "iOS 最低部署版本（docs/12 §4.6；未显式指定时跟随 RECON_IOS_DEPLOYMENT_TARGET）")
+  message(STATUS "recon: CMAKE_OSX_DEPLOYMENT_TARGET 未显式指定，"
+                 "按 RECON_IOS_DEPLOYMENT_TARGET 兜底为 ${RECON_IOS_DEPLOYMENT_TARGET}")
+elseif(NOT CMAKE_OSX_DEPLOYMENT_TARGET VERSION_EQUAL RECON_IOS_DEPLOYMENT_TARGET)
+  # 显式值与部署目标打架 → 硬失败，不静默取其一。
+  # 这正是上面那条 `ld: warning` 的成因（两处事实来源各说各话），故在此挡住。
+  message(FATAL_ERROR
+    "CMAKE_OSX_DEPLOYMENT_TARGET='${CMAKE_OSX_DEPLOYMENT_TARGET}' 与 "
+    "RECON_IOS_DEPLOYMENT_TARGET='${RECON_IOS_DEPLOYMENT_TARGET}' 不一致。\n"
+    "静态库切片的 min-version 与 App 的 IPHONEOS_DEPLOYMENT_TARGET 必须是同一个值，"
+    "否则链接期会出现\n"
+    "  ld: warning: object file ... was built for newer 'iOS-simulator' version "
+    "(X) than being linked (Y)\n"
+    "并把「只在更高系统版本可用的弱符号」带进按更低版本链接的产物里。\n"
+    "见 docs/12_构建与打包.md §4.6「与静态库切片的关系」。")
 endif()
 
 # 架构白名单（docs/12 §4.7）：真机 arm64 only；模拟器允许 arm64 + x86_64。

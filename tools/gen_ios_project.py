@@ -274,6 +274,29 @@ targets:
       - sdk: CoreMotion.framework
       - sdk: ARKit.framework
       - sdk: Photos.framework
+      # ── zlib（iOS 系统自带 libz.tbd）──────────────────────────────────
+      # ⚠️ 少了这一条，App 链接期**必然**报：
+      #     Undefined symbols: "_compress2" / "_compressBound"
+      #       referenced from recon::EncodePngRgb8(...) in ...png_encoder.o
+      #   （build-app 第 5 轮 CI 的真实报错，勿删。）
+      #
+      # 机理必须写清楚，否则下次还会被"顺手清理"掉：
+      #   CMake 在 macOS 上 `find_package(ZLIB)` **命中系统 zlib 1.2.12**
+      #   （CI 日志：`-- recon: 使用系统 zlib 1.2.12（PNG 压缩）`），因此
+      #   `recon_core` 只是把 `ZLIB::ZLIB` 记成 **PUBLIC 依赖**，`png_encoder.o`
+      #   里的 `compress2` / `compressBound` 是**未解析的外部符号**，指望链接
+      #   最终可执行文件的一方去解。
+      #   而本项目的交付链是：CMake 静态库 → `libtool -static` 合并 →
+      #   `xcodebuild -create-xcframework` → XcodeGen 容器。静态归档**不携带**
+      #   "我依赖 libz" 这条元信息给 Xcode，容器里若没有 libz.tbd，符号就无处
+      #   解析 —— 报错发生在 App 链接期，与 PNG 代码本身的距离很远。
+      #   （也因此**不能**靠"把 recon_zlib 编进归档"绕过：那条分支只有在
+      #     find_package 失败时才走，CI 上不会触发。）
+      #
+      # 用系统 libz.tbd 而不是 vendor 的 `third_party/.../ZLIB`：系统库随 SDK
+      # 提供、免维护、且与 CMake 侧命中的是**同一份** 1.2.12（单一事实来源；
+      # 若改用 vendor 源码，两边版本就会分叉）。
+      - sdk: libz.tbd
     # 「Compile Metal Shaders」Build Phase（docs/12 §4.4 的挂载表）。
     # 用 preBuildScripts → 位于「Compile Sources」之前，符合该表要求。
     # 脚本自己按 OUT_DIR(=BUILT_PRODUCTS_DIR/Contents/Resources) 定位产物，
