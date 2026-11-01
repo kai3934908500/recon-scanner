@@ -106,14 +106,19 @@ public struct MonoNumber: View {
     /// 「call to main actor-isolated static method 'group' in a synchronous
     /// nonisolated context」。标记 `nonisolated` 是**语义正确**的修法
     /// （它本就不需要 actor 隔离），而非为了让编译通过而放宽调用点。
-    /// `formatter` 也随之 `nonisolated(unsafe)` —— `NumberFormatter` 的
-    /// `string(from:)` 在 Apple 文档中标注为线程安全；此处只在静态初始化时
-    /// 配置一次、之后只读，故该标注是准确的（不是"为过编译而撒谎"）。
+    /// `formatter` 是 `static let` 且类型 `NumberFormatter` 已符合 `Sendable`
+    /// （Foundation 在 Swift 6 下为其标注），故**不加** `nonisolated(unsafe)` ——
+    /// 加了会被当作「不必要的 unsafe 标注」而**在零警告标准下直接报错**
+    /// （`SWIFT_TREAT_WARNINGS_AS_ERRORS=YES`）：
+    ///   "'nonisolated(unsafe)' is unnecessary for a constant with 'Sendable'
+    ///    type 'NumberFormatter', consider removing it"
+    ///   （CI run 41275447507）。`static let` 本身即不可变全局，
+    /// 无需额外的隔离豁免。
     nonisolated public static func group(_ n: Int) -> String {
         Self.formatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
-    nonisolated(unsafe) private static let formatter: NumberFormatter = {
+    private static let formatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.groupingSeparator = ","

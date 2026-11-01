@@ -110,10 +110,14 @@ public final class IMURingBuffer {
     public func append(_ sample: IMUSample) {
         let a = sample.accelIncludingGravity
         let g = sample.gyro
-        // ⚠️ ObjC 选择子 `appendTimestampNs:accelX:accelY:accelZ:gyroX:gyroY:gyroZ:`
-        //    导入 Swift 后**首个参数标签保留完整名 `timestampNs`**（ObjC 不区分
-        //    方法基名与首参标签，Swift 把选择子首段整体作为首参标签）。
-        //    故不能写 `impl.append(...)`（那是把 `append` 当无标签基名）。
+        // ⚠️ 本文件**不再自行推断** ObjC 选择子的 Swift 名字：`PlatformCaptureBridge.h`
+        //    已用显式 `NS_SWIFT_NAME` 钉死为 `append(timestampNs:…)` 与
+        //    `window(beforeNs:)`。理由（一次真实教训）：本机无 Swift 编译器，
+        //    靠 Clang importer 猜命名无法本地验证 —— 曾据此写下
+        //    `windowBeforeNs(_:)` 与 `append(timestampNs:…)` 两处推断，前者恰好
+        //    正确、后者错误（`append` 后无介词，不触发「动词+介词短语」拆分），
+        //    CI run 41275447507 报 "has no member 'append'"。
+        //    显式命名 = 纯类型检查、零推断（与 L10n 类型化重载同一方针）。
         impl.append(timestampNs: Int64(sample.timestamp * 1_000_000_000),
                     accelX: a.x, accelY: a.y, accelZ: a.z,
                     gyroX: g.x, gyroY: g.y, gyroZ: g.z)
@@ -132,8 +136,8 @@ public final class IMURingBuffer {
     /// 第 300 帧的窗口将携带全部历史样本 —— 内核的预积分是**增量式**的
     /// （docs/02 §3.5），重复预积分已算过的区间会**双重计数**。
     public func window(before timestamp: TimeInterval) -> ReconImuWindow {
-        // ⚠️ ObjC `- (ReconImuWindow *)windowBeforeNs:` 导入 Swift 后为
-        //    `window(beforeNs:)`（Swift 的 API 改写把 `Ns` 从基名拆出）。
+        // 名字由 `PlatformCaptureBridge.h` 的 `NS_SWIFT_NAME(window(beforeNs:))`
+        // 显式钉死（该处注释说明了为什么不靠 importer 推断）。
         impl.window(beforeNs: Int64(timestamp * 1_000_000_000))
     }
 

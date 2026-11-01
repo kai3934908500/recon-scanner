@@ -62,12 +62,31 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)initWithCapacity:(NSUInteger)capacity;
 
 /// 追加一个采样。`accel` 必须是**比力（含重力）**m/s² —— 见 recon_c_api.h。
+///
+/// ── 为什么显式 `NS_SWIFT_NAME`（不靠 importer 推断）────────────────────
+///
+/// 本机（Windows）无 Swift 编译器，**任何「靠 Clang importer 猜命名」的写法
+/// 都无法本地验证**。此类推断的结论已出过一次错：
+///   · `- windowBeforeNs:` → Swift 的「动词 + 介词短语」拆分生效 →
+///     `window(beforeNs:)`（CI 实证成立）；
+///   · 但 `- appendTimestampNs:accelX:…` 的基名 `append` 后**没有介词**，
+///     不触发该拆分 → 实际是 `appendTimestampNs(_:accelX:…)`，而非
+///     想当然的 `append(timestampNs:…)`（CI run 41275447507 报
+///     "has no member 'append'"）。
+/// 与其继续猜规则、把不确定性留给下一次 CI，这里**显式命名**：命名一旦写下，
+/// 就是纯类型检查、零推断（与本项目 L10n 类型化重载同一方针）。
 - (void)appendTimestampNs:(int64_t)tsNs
                    accelX:(double)ax accelY:(double)ay accelZ:(double)az
-                    gyroX:(double)gx gyroY:(double)gy gyroZ:(double)gz;
+                    gyroX:(double)gx gyroY:(double)gy gyroZ:(double)gz
+    NS_SWIFT_NAME(append(timestampNs:accelX:accelY:accelZ:gyroX:gyroY:gyroZ:));
 
 /// 取「`tsNs` 之前（含等于）」的窗口，并把已消费样本移出缓冲。
-- (ReconImuWindow *)windowBeforeNs:(int64_t)tsNs;
+///
+/// `NS_SWIFT_NAME` 与上一条同理：显式钉死 `window(beforeNs:)`，
+/// 不再依赖 importer 对 `Before` 的介词识别（该识别目前恰好正确，
+/// 但它是**工具链行为**而非本项目契约，版本升级即可能变）。
+- (ReconImuWindow *)windowBeforeNs:(int64_t)tsNs
+    NS_SWIFT_NAME(window(beforeNs:));
 
 /// 清空缓冲并归零诊断计数。
 - (void)reset;
