@@ -83,6 +83,25 @@ struct DepthFrameMM {
   }
 };
 
+/// 换算结果。
+///
+/// ⚠️ 文档位置说明（防回归，一次真实构建失败）：本文件下方那个函数的文档
+/// 块（其中含参数命令与返回命令）必须放在**函数声明正上方**。Clang 的
+/// 注释附着规则是「紧邻其后的那个声明」—— 曾把函数文档误放在本 `struct`
+/// 上方，于是 Clang 认为那些参数命令附着在结构体上，报
+/// `-Wdocumentation`：「参数命令 used in a comment that is not attached to
+/// a function declaration」。而工程 `GCC_TREAT_WARNINGS_AS_ERRORS=YES`
+/// → **直接构建失败**（CI run 41276337679，编 PlatformCaptureBridge.mm 时引爆）。
+///
+/// ⚠️ 本条注释**刻意不写出参数命令的字面形式**（不写 at-param / at-return）：
+/// 只要这些标记出现在紧邻 `struct` 的注释块里，无论语义是「说明」还是
+/// 「示例」，Clang 一视同仁地判定附着错误 —— 即注释本身会重复引爆同一个 bug。
+struct DepthConvertResult {
+  bool ok = false;
+  /// `ok == true` 时有效。
+  DepthFrameMM frame;
+};
+
 /// 把「单平面 Float32、单位米、沿光轴 z」的深度缓冲换算为 uint16 毫米。
 ///
 /// @param src          源缓冲首地址（Float32）。非空。
@@ -111,12 +130,6 @@ struct DepthFrameMM {
 /// 内核内部按 `width * 4`（RGB）／`width * 2`（深度）紧排消费；平台层若需要
 /// 行填充，应在**投递时**按 C ABI 的 `depth_stride` 字段声明，而不是在这里
 /// 产出带填充的缓冲 —— 那会让「本结构体的尺寸即唯一事实来源」失效。
-struct DepthConvertResult {
-  bool ok = false;
-  /// `ok == true` 时有效。
-  DepthFrameMM frame;
-};
-
 DepthConvertResult ConvertDepthFloat32MetersToMM16(
     const float* src, std::uint32_t width, std::uint32_t height,
     std::size_t src_stride_bytes);
