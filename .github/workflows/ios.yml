@@ -30,8 +30,9 @@ on:
   push:
     branches: [main, master, develop]
     paths:
-      - "platform/ios/**"
+      - "platform/**"
       - "ui/ios/**"
+      - "core/**"
       - "shaders/**"
       - "cmake/toolchains/ios.cmake"
       - "cmake/ThirdParty.cmake"
@@ -44,11 +45,13 @@ on:
       - "tools/verify_shader_parity_negative.py"
       - "tools/gen_ios_project.py"
       - "tools/build_metal_shaders.sh"
+      - "tools/build_vulkan_shaders.sh"
       - ".github/workflows/ios.yml"
   pull_request:
     paths:
-      - "platform/ios/**"
+      - "platform/**"
       - "ui/ios/**"
+      - "core/**"
       - "shaders/**"
       - "cmake/toolchains/ios.cmake"
       - "CMakeLists.txt"
