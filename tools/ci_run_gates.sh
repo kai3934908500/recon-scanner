@@ -30,7 +30,7 @@
 #
 # 选择器（= 能力点，每个对应恰好一条命令）：
 #   generate  生成 iOS 工程描述（其余 iOS 类闸门的**前置**）
-#   ios       iOS 静态契约 G1..G16
+#   ios       iOS 静态契约 G1..G18
 #   neg-ios   上条的负向注入
 #   ipa       未签名 IPA 打包器的判据本体自检（stage_ios_ipa.py 的 P-1..P-9）
 #             —— 合成产物 + 逐条证伪，**不需要 macOS 与任何 Apple 工具**
@@ -259,7 +259,7 @@ if wants generate; then
 fi
 
 if wants ios; then
-  step "iOS 静态契约闸门（G1..G17）" "${PY}" tools/check_ios_contract.py
+  step "iOS 静态契约闸门（G1..G18）" "${PY}" tools/check_ios_contract.py
 fi
 if wants neg-ios; then
   step "iOS 静态契约负向注入（证明 G 判据非假闸门）" \

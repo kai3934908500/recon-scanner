@@ -31,6 +31,9 @@
   G14 平台平面缓冲纪律
       · 对平面格式缓冲（capturedImage）用 `GetBaseAddress` → 闸门须报「静默丢弃全部帧」
       · 深度换算不校验 `kCVPixelFormatType_DepthFloat32`         → 闸门须报「未调用」
+  G18 iOS 系统 API 幻觉清单
+      · 把 imuMaxRate 的诚实写 0 改回不存在的 maximumGyroUpdateInterval
+        → 闸门须报「不存在」（**复现 CI #20 的真实失败**）
 
 ⚠️ 本脚本会**临时修改** `platform/ios/Recon/ReconCore.swift`、
    `ui/ios/Recon/Sources/State/ReconStageMap.swift`、
@@ -93,6 +96,9 @@ GEN_IOS_PROJECT = os.path.join(ROOT, "tools", "gen_ios_project.py")
 LICENSES_CMAKE = os.path.join(ROOT, "cmake", "Licenses.cmake")
 # G16 的目标对象：未签名 IPA 打包链所在的 workflow，以及其判据实现本体。
 IOS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios.yml")
+# G18 的目标对象：装配 recon_probe_data 的地方（幻觉 API 的实际发生地）。
+CAMERA_CAPTURE = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Platform",
+                              "CameraCapture.swift")
 
 
 def slurp(path: str) -> str:
@@ -415,6 +421,30 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "        type: folder\n"
           "        excludes:\n")],
     ),
+    # --- G18：iOS 系统 API 幻觉清单（回归防线）-----------------------------
+    #   注入「当初真实犯过的那个错」：把诚实写 0 改回幻觉 API 调用。
+    #   这条注入的价值就是**复现 CI #20 的原始失败**。
+    (
+        "G18-a-hallucinated-motion-member",
+        "把 imuMaxRate 的诚实写 0 改回使用不存在的 "
+        "CMMotionManager.maximumGyroUpdateInterval（复现 CI #20 的真实错误）",
+        "不存在",
+        [(CAMERA_CAPTURE,
+          "        let imuMaxRate: Int32 = 0\n",
+          "        let motion = CMMotionManager()\n"
+          "        let imuMaxRate: Int32 = "
+          "Int32(1.0 / motion.maximumGyroUpdateInterval)\n")],
+    ),
+    (
+        "G18-b-hallucinated-devicemotion-member",
+        "使用另一个不存在的成员 maximumDeviceMotionUpdateInterval",
+        "不存在",
+        [(CAMERA_CAPTURE,
+          "        let imuMaxRate: Int32 = 0\n",
+          "        let motion = CMMotionManager()\n"
+          "        let imuMaxRate: Int32 = "
+          "Int32(1.0 / motion.maximumDeviceMotionUpdateInterval)\n")],
+    ),
 ]
 
 
@@ -501,7 +531,8 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 均有效）")
+          f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 / "
+          f"G18 均有效）")
     return 0
 
 

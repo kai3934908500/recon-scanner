@@ -2200,6 +2200,80 @@ def gate_locale_resource_layout(rep: Report) -> None:
                  f"且 platform/ios/Recon 保持 group（PrivacyInfo 落包根）✓")
 
 
+# ---------------------------------------------------------------------------
+# G18 iOS 系统 API 幻觉清单
+# ---------------------------------------------------------------------------
+#
+# ── 为什么需要这条（2026-11-01 CI #20 的真实事故）────────────────────────
+#
+# `CameraCapture.swift` 写了 `motion.maximumGyroUpdateInterval` 去算 IMU 硬件
+# 上限。该成员**不存在**（`CMMotionManager` 只有 `gyroUpdateInterval`，且它是
+# 调用方写入的期望间隔，不是硬件上限）。结果：
+#
+#     error: value of type 'CMMotionManager' has no member 'maximumGyroUpdateInterval'
+#     ** BUILD FAILED **   （退出码 65，Swift 编译）
+#
+# 而**同时** G1..G17 全部通过、build-xcframework 与 Vulkan 两个 job 全绿 ——
+# （G18 正是为这条事故补的回归防线，见下方 gate_system_api_denylist）
+# 因为它不是「契约不一致」，是「调用了一个不存在的 API」。**只有类型检查器
+# 能发现**，而本机无 macOS/Swift，故这类错误此前零覆盖（与 #111 Swift 调用
+# 图闸门缺失同属检测盲区）。
+#
+# ── 本闸门能做什么 / 不能做什么（**边界必须如实说明，不得夸大**）────────
+#
+#   能：拦住「**已被记录的**幻觉成员」—— 即下方 DENYLIST 里逐条列出的名字，
+#       每一条都有明确的「正确替代」。
+#   不能：拦住**未知**的幻觉 API。它不是类型检查器，没有 SDK 符号表。
+#
+#   所以本闸门的定位是**回归防线**（防同一个错再犯），不是**完备性证明**。
+#   真正的完备防线仍是 macOS CI 上的 xcodebuild 真编译 —— 本闸门只把一部分
+#   低级错误提前到 ubuntu 静态 job 上，让它失败得更快、更好归因。
+#
+#   反过来说：本闸门**不替代** G16/build-app 的真编译。若哪天有人以为
+#   「G18 绿了就说明 iOS 能编」，那是误读 —— 故在此显式写明。
+#
+# ── 为什么用「逐条列出」而不是「模糊匹配 maximum* 前缀」──────────────────
+#   模糊匹配会误伤**真实存在**的 API（如 `CMMotionManager.deviceMotionUpdateInterval`、
+#   `maximumNumberOfLines` 一类 UIKit 属性），造成假阳性。宁可窄而准。
+_SYSTEM_API_DENYLIST: list[tuple[str, str, str]] = [
+    # (幻觉成员名, 所在类型, 正确替代/说明)
+    ("maximumGyroUpdateInterval", "CMMotionManager",
+     "该成员不存在。CMMotionManager 无任何查询硬件最大采样率的接口；"
+     "gyroUpdateInterval 是**调用方写入**的期望值。iOS 侧该字段应写 0（未知）"),
+    ("maximumDeviceMotionUpdateInterval", "CMMotionManager",
+     "该成员不存在（同上）。docs/11 §3.1.5 曾引用此名，已一并修正"),
+    ("maximumAccelerometerUpdateInterval", "CMMotionManager",
+     "该成员不存在（同上）"),
+]
+
+
+def gate_system_api_denylist(rep: Report) -> None:
+    gate = "G18/system-api-denylist"
+    files = iter_swift_files() + iter_ios_platform_impl_files()
+    hits = 0
+    for path in files:
+        raw = read_text(path)
+        # 剥注释与字符串：注释里会**刻意**提到这些错名字（说明"这里曾写错"），
+        # 那不是违规 —— 与 G3 的处置一致。
+        code = strip_comments_and_strings(raw)
+        for member, owner, advice in _SYSTEM_API_DENYLIST:
+            if member not in code:
+                continue
+            # 取出现处的行号（在**原文**里找，便于人看）
+            for i, ln in enumerate(raw.splitlines(), 1):
+                if member in ln and not ln.lstrip().startswith("//") \
+                        and not ln.lstrip().startswith("*"):
+                    rep.err(gate,
+                            f"{rel(path)}:{i} 使用了**不存在**的系统 API "
+                            f"`{owner}.{member}`。{advice}。"
+                            f"（真实 CI 会在这里以 `has no member` 编译失败）")
+                    hits += 1
+    if hits == 0:
+        rep.note(f"系统 API 幻觉清单：{len(files)} 个 iOS 源文件已扫，"
+                 f"未出现 {len(_SYSTEM_API_DENYLIST)} 个已登记幻觉成员 ✓"
+                 f"（注意：本闸门只覆盖**已登记**的名字，不是类型检查器）")
+
+
 def main() -> int:
     rep = Report()
     if not os.path.isdir(UI_IOS):
@@ -2223,6 +2297,7 @@ def main() -> int:
     gate_bundle_layout(rep)
     gate_ipa_pipeline(rep)
     gate_locale_resource_layout(rep)
+    gate_system_api_denylist(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -2246,7 +2321,7 @@ def main() -> int:
           "G10 ABI 边界 / G11 错误码逐值对等 / G12 阶段映射自洽 / "
           "G13 错误码映射穷举 / G14 平台平面缓冲纪律 / "
           "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
-          "G17 locale 资源落位纪律 全部通过。")
+          "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 全部通过。")
     return 0
 
 
