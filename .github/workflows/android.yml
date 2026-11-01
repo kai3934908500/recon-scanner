@@ -1,0 +1,394 @@
+# Android 构建 CI（docs/12 §3）
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 为什么需要这个工作流（本仓库一个长期盲区，第四十二/四十三轮暴露）
+# ─────────────────────────────────────────────────────────────────────────────
+# 在它出现之前，仓库只有 `ios.yml` —— **Android 这条链从未被任何编译器验证过**。
+# 后果不是"少跑了几条检查"，而是下列真实漂移长期潜伏、且在"桌面 ctest 28/28
+# 全绿 + iOS 四 job 全绿"的掩护下看起来一切正常：
+#
+#   · `targets` 漏列 JNI 薄壳 target      → `librecon_core.so` 内零 JNI 符号
+#   · CMake target 全是 STATIC            → 根本没有 `.so` 可 `loadLibrary`
+#   · `recon_shaders_vulkan` 是孤儿 target → SPIR-V 产物永不生成
+#   · Kotlin 用了未声明依赖的包            → Kotlin 编译期 `Unresolved reference`
+#   · 仓库缺 gradle wrapper 三件           → `./gradlew` 在任何机器上跑不起来
+#   · `AndroidManifest` 引用不存在的资源    → AAPT 资源链接期失败
+#
+# 前三条**静态闸门结构上查不出**：静态库照样编译、照样链接，CMake 不报错；
+# 只有在**真编译器 + 真 NDK** 下才会暴露（其中 STATIC/`.so` 那条更要到运行期
+# `UnsatisfiedLinkError` 才现形）。所以本工作流不是"锦上添花的 CI"，
+# 而是这几类缺口唯一的自动化检出手段。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 三个 job 的分工
+# ─────────────────────────────────────────────────────────────────────────────
+#   static-contract —— **跑在 ubuntu 上**，零额外成本。复用 `tools/ci_run_gates.sh`
+#       的 `android,toolchain,elf` 选择器（与 ios.yml 的 static-contract job
+#       共用**同一份**闸门映射 —— 单一实现，勿在此处另抄一遍命令）。
+#       覆盖：G-AND-1..5 Android 静态契约、工具链版本五处一致性、
+#       ELF 对齐解析器自检；并跑两组负向注入证明判据非假闸门。
+#
+#   build —— 跑在 ubuntu 上，装 JDK 17 + Android SDK + NDK + CMake，
+#       跑 `./gradlew :app:assembleDebug` 与 `:app:assembleRelease`。
+#       **这是本工作流的核心**：它让"Android 能不能编"第一次有机器答案。
+#
+#   verify-16kb —— 依赖 build 的产物，跑 `tools/check_16kb.sh`：
+#       ELF `PT_LOAD.p_align ≥ 0x4000`（64 位 ABI）+ `zipalign -c -P 16`。
+#       Play Console 对 16 KB 页对齐是**硬门禁**（不过则拒绝上架），
+#       而它对"工具缺失时静默通过"毫无防护 —— 故脚本内做了反空约束，
+#       且无产物时**硬失败**（不静默降级）。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ 与 ios.yml 的 paths 白名单必须**逐条对齐**（除 iOS 专属项）
+# ─────────────────────────────────────────────────────────────────────────────
+# 白名单是手工清单、必然漂移（本仓库已因它踩过两次：`platform/common/**`
+# 与 `core/**` 曾是 iOS 构建的直接依赖却不在其中）。两段的平台项相同，
+# 因为 `core/**`、`platform/common/**`、`shaders/**`、`CMakeLists.txt`
+# 同时是两端构建的输入 —— 改动它们必须触发**双方**的 CI。
+# 改任一段时请对照另一段。
+
+name: Android
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "platform/**"
+      - "core/**"
+      - "shaders/**"
+      - "cmake/toolchains/android.cmake"
+      - "cmake/ThirdParty.cmake"
+      - "CMakeLists.txt"
+      - "tools/check_android_contract.py"
+      - "tools/verify_android_contract_negative.py"
+      - "tools/check_toolchain.py"
+      - "tools/verify_toolchain_negative.py"
+      - "tools/check_16kb.sh"
+      - "tools/elf_load_align.py"
+      - "tools/check_platform_parity.py"
+      - "tools/verify_platform_parity_negative.py"
+      - "tools/shader_parity.py"
+      - "tools/build_vulkan_shaders.sh"
+      - "tools/ci_run_gates.sh"
+      - ".github/workflows/android.yml"
+  # ⚠️ 本段必须与上面的 push 段**逐条一致**（含 tools/*.py 那一串）。
+  pull_request:
+    paths:
+      - "platform/**"
+      - "core/**"
+      - "shaders/**"
+      - "cmake/toolchains/android.cmake"
+      - "cmake/ThirdParty.cmake"
+      - "CMakeLists.txt"
+      - "tools/check_android_contract.py"
+      - "tools/verify_android_contract_negative.py"
+      - "tools/check_toolchain.py"
+      - "tools/verify_toolchain_negative.py"
+      - "tools/check_16kb.sh"
+      - "tools/elf_load_align.py"
+      - "tools/check_platform_parity.py"
+      - "tools/verify_platform_parity_negative.py"
+      - "tools/shader_parity.py"
+      - "tools/build_vulkan_shaders.sh"
+      - "tools/ci_run_gates.sh"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+    inputs:
+      gates:
+        description: >
+          static-contract 要跑的闸门（逗号分隔）。默认 android,toolchain,elf。
+          见 tools/ci_run_gates.sh 的选择器表。
+        type: string
+        default: android,toolchain,elf
+      run_16kb:
+        description: >
+          是否跑 verify-16kb（需要 build job 产出的 APK）。
+          只改 Kotlin/资源时设为 false 可省约 3 分钟。
+          ⚠️ 它**不会**改变 build job 的行为 —— APK 仍照常构建。
+        type: boolean
+        default: true
+
+env:
+  # docs/12 §1.1：确定性构建
+  SOURCE_DATE_EPOCH: 1700000000
+  # ── 工具链版本：必须与 docs/12 §3.1 的锁定值、以及
+  #    platform/android/**/*.gradle 的声明**三处一致**。
+  #    由 tools/check_toolchain.py（static-contract job）与负向注入共同守住 ——
+  #    这里改一个数字而忘了改 gradle，闸门会立刻报错，不会静默漂移。
+  RECON_NDK_VERSION: "28.1.13356709"
+  RECON_CMAKE_VERSION: "3.31.6"
+
+jobs:
+  # ===========================================================================
+  # 静态契约（零额外成本；与 ios.yml 共用同一份闸门映射）
+  # ===========================================================================
+  static-contract:
+    name: 静态契约（Android 契约 / 工具链版本 / ELF 解析器 / 负向注入）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ⚠️ 命令不在这里写死 —— 复用 tools/ci_run_gates.sh 的**唯一**映射。
+      #    若在此处另抄一遍命令清单，就会与 ios.yml 那份成为两处事实来源，
+      #    新增一条闸门时只改一处 → 它在某个 workflow 里**永远不跑且日志全绿**
+      #    （属 MEMORY.md「静默丢弃最难查」类）。
+      - name: Android 静态契约闸门（选择器见 tools/ci_run_gates.sh）
+        env:
+          RECON_CI_GATES: ${{ github.event.inputs.gates || 'android,toolchain,elf' }}
+        run: bash tools/ci_run_gates.sh "${RECON_CI_GATES}"
+
+      - name: 静态契约闸门选择器自检
+        if: github.event_name == 'workflow_dispatch'
+        run: bash tools/ci_run_gates.sh --self-test
+
+  # ===========================================================================
+  # 真编译：JDK + SDK + NDK + Gradle
+  # ===========================================================================
+  build:
+    name: 构建 APK（JDK 17 / NDK r28b / Gradle 8.9）
+    runs-on: ubuntu-latest
+    needs: static-contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # --- Android SDK cmdline-tools + 三个必需包 --------------------------
+      # ⚠️ `ndk;<version>` 与 `cmake;<version>` 必须与
+      #    platform/android/**/*.gradle 的 ndkVersion / cmake version 逐字一致，
+      #    否则 Gradle 会去联网**另下一个**版本（慢且不可复现），
+      #    或直接因版本断言（build.gradle 里显式 throw）失败。
+      #    本 job 的职责就是把"声明"变成"真实可用的工具链"。
+      - name: 安装 Android SDK 与 NDK
+        run: |
+          set -euo pipefail
+          # ubuntu-latest 镜像**已预装** Android SDK（ANDROID_SDK_ROOT 指向
+          # /usr/local/lib/android/sdk），故先探测、只在缺 sdkmanager 时才下载
+          # cmdline-tools —— 无脑重下会与镜像自带的 cmdline-tools 目录冲突
+          # （unzip 覆盖 + mv 竞态），是"CI 偶发失败"的经典来源。
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${HOME}/android-sdk}"
+          echo "SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          export ANDROID_SDK_ROOT="${SDK_ROOT}"
+          export ANDROID_HOME="${SDK_ROOT}"
+
+          if [ -x "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "使用镜像自带的 cmdline-tools"
+            export PATH="${SDK_ROOT}/cmdline-tools/latest/bin:${PATH}"
+          else
+            echo "镜像未带 cmdline-tools，下载 latest"
+            mkdir -p "${SDK_ROOT}/cmdline-tools"
+            curl -fsSL -o /tmp/clt.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/clt.zip -d "${SDK_ROOT}/cmdline-tools"
+            mv "${SDK_ROOT}/cmdline-tools/cmdline-tools" "${SDK_ROOT}/cmdline-tools/latest"
+            export PATH="${SDK_ROOT}/cmdline-tools/latest/bin:${PATH}"
+          fi
+          echo "${SDK_ROOT}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          sdkmanager --version
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;${RECON_NDK_VERSION}" \
+            "cmake;${RECON_CMAKE_VERSION}"
+          echo "--- 已安装 ---"
+          sdkmanager --list_installed
+
+      - name: 写入 local.properties 与 Gradle 缓存
+        run: |
+          set -euo pipefail
+          echo "sdk.dir=${SDK_ROOT}" > platform/android/local.properties
+          # Gradle 用户目录落到工作区，便于缓存（默认在 $HOME，缓存命中不稳定）
+          echo "GRADLE_USER_HOME=${GITHUB_WORKSPACE}/.gradle-home" >> "$GITHUB_ENV"
+
+      # --- 关键：断言 wrapper 真实可用 -------------------------------------
+      # 仓库曾**完全缺失** gradlew/gradlew.bat/gradle-wrapper.jar，
+      # 导致 docs/12 §3.5 的「本地复现」命令在任何机器上都跑不起来。
+      # 这里先验证三件齐备且 jar 是合法 zip（含 GradleWrapperMain.class），
+      # 让"wrapper 缺件"这类问题在**构建前**以可归因的方式失败，
+      # 而不是等到 `./gradlew` 报一句含糊的下载错误。
+      - name: 校验 gradle wrapper 三件齐备并探活
+        working-directory: platform/android
+        run: |
+          set -euo pipefail
+          for f in gradlew gradlew.bat gradle/wrapper/gradle-wrapper.jar; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少 gradle wrapper 文件：platform/android/$f"
+              exit 1
+            fi
+          done
+          python3 - <<'PY'
+          import zipfile, sys
+          p = "gradle/wrapper/gradle-wrapper.jar"
+          z = zipfile.ZipFile(p)
+          if z.testzip() is not None:
+              sys.exit("::error::wrapper jar 损坏（zip 校验失败）")
+          names = set(z.namelist())
+          if "org/gradle/wrapper/GradleWrapperMain.class" not in names:
+              sys.exit("::error::wrapper jar 内缺 GradleWrapperMain.class")
+          print(f"wrapper jar OK：{len(names)} 个条目，含 GradleWrapperMain.class")
+          PY
+          chmod +x gradlew
+          ./gradlew --version
+
+      # --- Debug APK ------------------------------------------------------
+      - name: 构建 Debug APK
+        working-directory: platform/android
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      # --- Release APK（R8 + 资源压缩 + 16 KB 链接参数全开）----------------
+      # Debug 与 Release 走的构建路径不同（minifyEnabled / shrinkResources /
+      # androidResources.noCompress / -O3 链接），只编 Debug 会漏掉
+      # "Release 才炸"的那类问题（例如 keep 规则缺失导致 JNI 方法被 R8 改名）。
+      - name: 构建 Release APK（未签名）
+        working-directory: platform/android
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # --- 关键产物断言 ---------------------------------------------------
+      # ⚠️ 这几条是"缺口 A/B"在**真编译**下的最终确认：
+      #    ① 两个 .so 必须真实存在 —— 否则 ReconApplication 的
+      #       `System.loadLibrary("recon_core")` / `("recon_platform_android")`
+      #       在真机第一步即 UnsatisfiedLinkError；
+      #    ② 两个 .so 内必须有 JNI 符号 —— 否则首调 NativeBridge 即崩；
+      #    ③ C ABI 符号必须在 —— 否则桥接层调不到核心。
+      #    这三条**静态闸门查不到**（静态库也"存在"，只是没有 .so 形态）。
+      - name: 断言 .so 与 JNI 符号真实存在（缺口 A/B 的最终确认）
+        run: |
+          set -euo pipefail
+          APK="platform/android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::未找到 APK：$APK"
+            find platform/android/app/build -name "*.apk" || true
+            exit 1
+          fi
+          echo "== APK 内的 native 库 =="
+          unzip -l "$APK" | grep -E "lib/.*\.so" || echo "(未列出 .so)"
+
+          # 解包出 .so 再做符号检查（用 NDK 自带的 llvm-nm）
+          NM="${SDK_ROOT}/ndk/${RECON_NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if [ ! -x "$NM" ]; then
+            NM=$(find "${SDK_ROOT}/ndk" -name llvm-nm -type f | head -1)
+          fi
+          [ -x "$NM" ] || { echo "::error::未找到 llvm-nm"; exit 1; }
+
+          rm -rf /tmp/apk-so && mkdir -p /tmp/apk-so
+          ( cd /tmp/apk-so && unzip -q "$GITHUB_WORKSPACE/$APK" "lib/*" )
+
+          fail=0
+          for abi in arm64-v8a; do
+            for so in librecon_core.so librecon_platform_android.so; do
+              p="/tmp/apk-so/lib/${abi}/${so}"
+              if [ ! -f "$p" ]; then
+                echo "::error::APK 内缺 lib/${abi}/${so}"
+                fail=1
+                continue
+              fi
+              njni=$("$NM" -D --defined-only "$p" 2>/dev/null | grep -c "Java_com_recon_scan_" || true)
+              ncabi=$("$NM" -D --defined-only "$p" 2>/dev/null | grep -cE " T recon_" || true)
+              echo "  ${so}: JNI 符号 ${njni} 个，recon_* 导出 ${ncabi} 个"
+            done
+          done
+
+          # ① 两个 .so 都存在（已在上面逐文件判）
+          # ② JNI 符号必须全部在（缺口 A 的判据落点）
+          total_jni=$("$NM" -D --defined-only /tmp/apk-so/lib/arm64-v8a/*.so 2>/dev/null \
+            | grep -oE "Java_com_recon_scan_[A-Za-z0-9_]+" | sort -u | wc -l | tr -d ' ')
+          echo "== APK 内去重 JNI 符号总数：${total_jni} =="
+          if [ "${total_jni}" -lt 31 ]; then
+            echo "::error::JNI 符号只有 ${total_jni} 个，期望 >= 31。" \
+                 "检查 build.gradle 的 externalNativeBuild.cmake.targets" \
+                 "是否同时列出 recon_core 与 recon_platform_android" \
+                 "（漏列则对应 .so 被 Gradle 静默丢弃，见 docs/14 缺口 R ②）"
+            fail=1
+          fi
+          # ③ recon_core 内必须有 C ABI 导出（否则桥接层调不到核心）
+          ncabi=$("$NM" -D --defined-only /tmp/apk-so/lib/arm64-v8a/librecon_core.so 2>/dev/null \
+            | grep -cE " T recon_" || true)
+          echo "== librecon_core.so 的 recon_* 导出：${ncabi} =="
+          if [ "${ncabi}" -lt 20 ]; then
+            echo "::error::librecon_core.so 的 C ABI 导出只有 ${ncabi} 个（期望 >= 20）。" \
+                 "确认 RECON_API 宏生效、且未把 recon_core 编成 STATIC"
+            fail=1
+          fi
+          [ "${fail}" -eq 0 ] || exit 1
+          echo "OK：.so 形态、JNI 符号、C ABI 导出三项断言全部通过"
+
+      - name: 上传 APK 与 .so（供 16 KB 校验与人工排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            platform/android/app/build/outputs/apk/debug/*.apk
+            platform/android/app/build/outputs/apk/release/*.apk
+            platform/android/app/build/intermediates/merged_native_libs/**/*.so
+          if-no-files-found: error
+
+  # ===========================================================================
+  # 16 KB 页对齐硬门禁（Play Console 上架要求）
+  # ===========================================================================
+  verify-16kb:
+    name: 16 KB 页对齐校验（LOAD align + zipalign）
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.run_16kb != 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # artifact 里保存的是**仓库相对路径**（见 build job 的 upload path），
+      # 故下载到工作区根即可让 `platform/android/app/build/...` 还原原位 ——
+      # 这样 `check_16kb.sh` 的默认路径推导（APP_DIR=platform/android/app）
+      # 无需任何改动就能命中，不必传 --build-dir（少一处需要维护的耦合）。
+      - name: 下载构建产物（APK + .so）
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+
+      # check_16kb.sh 会**自己**去 ANDROID_HOME/ANDROID_SDK_ROOT 下找最高版本的
+      # build-tools/zipalign（见脚本「定位 zipalign」段）。故这里只需把 SDK 装好、
+      # 无需把路径塞进环境变量 —— 判据的依赖由判据自己解析，避免"CI 传错路径
+      # 导致检查跳空"这种静默失效。
+      - name: 安装 Android SDK build-tools（提供 zipalign）
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          mkdir -p "${SDK_ROOT}/cmdline-tools"
+          curl -fsSL -o /tmp/clt.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/clt.zip -d "${SDK_ROOT}/cmdline-tools"
+          mv "${SDK_ROOT}/cmdline-tools/cmdline-tools" "${SDK_ROOT}/cmdline-tools/latest"
+          export PATH="${SDK_ROOT}/cmdline-tools/latest/bin:${PATH}"
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install "build-tools;35.0.0" > /dev/null
+          # 证实 zipalign 真的可执行（否则后面的检查 2 会以"找不到工具"失败，
+          # 而那种失败与"对齐不合格"是两件事，必须在**这里**区分开）
+          "${SDK_ROOT}/build-tools/35.0.0/zipalign" 2>&1 | head -3 || true
+
+      # ⚠️ 不传 --expect-so-only：本 job 的目的正是校验 **APK 内** .so 的
+      #    zip 对齐，那必须要 APK。若 APK 因 artifact 上传/下载环节丢失，
+      #    脚本会**硬失败**（"判据的目标对象缺失，不得静默通过"）——
+      #    这正是我们要的：无声跳过比失败危险得多。
+      - name: 跑 16 KB 校验（含 ELF 解析器自检）
+        run: |
+          set -euo pipefail
+          chmod +x tools/check_16kb.sh
+          bash tools/check_16kb.sh

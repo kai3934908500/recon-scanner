@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  res/drawable/ic_launcher_foreground.xml — 图标前景（矢量）。
+
+  设计口径：与 iOS 侧 Recon 图标同构的**极简几何**标记 ——
+  「一个立方体的三条可见棱 + 角点」，表示「扫描重建出的网格」。
+  刻意用纯几何线条，不用渐变/阴影/拟物质感（与 docs/09 的整体克制风格一致）。
+
+  ⚠️ 自适应图标规范：前景内容的可见部分必须落在**中心 66×66 dp** 安全区内
+     （108×108 dp 画布中，四周各 18 dp 会被系统以不同形状裁切）。
+     下面的图形全部落在 (27,34)–(81,74) 范围内，已留足余量。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+        android:width="108dp"
+        android:height="108dp"
+        android:viewportWidth="108"
+        android:viewportHeight="108">
+
+    <!-- 外框：等轴测立方体的六边形轮廓 -->
+    <path
+        android:strokeColor="#FF7FD4FF"
+        android:strokeWidth="3.2"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M54,34 L77,47.5 L77,74.5 L54,88 L31,74.5 L31,47.5 Z" />
+
+    <!-- 顶面两条棱：把立方体切成「上盖 + 两个侧面」，形成立体感 -->
+    <path
+        android:strokeColor="#FF7FD4FF"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M54,34 L54,61 M54,61 L31,47.5 M54,61 L77,47.5" />
+
+    <!-- 扫描基点：中心的一个实心小方点（表示重建原点） -->
+    <path
+        android:fillColor="#FFB9E8FF"
+        android:pathData="M54,58.5 L56.5,61 L54,63.5 L51.5,61 Z" />
+
+</vector>

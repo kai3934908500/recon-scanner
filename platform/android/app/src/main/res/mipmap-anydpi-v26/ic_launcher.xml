@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  res/mipmap-anydpi-v26/ic_launcher.xml — 自适应图标（API 26+）。
+
+  为什么必须有 mipmap 而不是只放 drawable：
+    AndroidManifest 里写的是 `android:icon="@mipmap/ic_launcher"`。
+    AAPT 按**资源类型目录名**解析（mipmap vs drawable 是不同类型），
+    把图标放在 drawable/ 下会在资源链接期报
+        error: resource mipmap/ic_launcher not found.
+    故必须落在 mipmap-* 目录里。这里用 anydpi-v26 的矢量自适应图标
+    覆盖 API 26+；minSdk 24 的 24/25 设备回落到下面的 mipmap-hdpi 等位图。
+
+  注：自适应图标只有一层 foreground 是不够的 —— background 可以是
+      颜色资源或另一个 drawable，这里用 values/colors.xml 里的颜色。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

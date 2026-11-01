@@ -36,6 +36,12 @@
 #   neg-parity
 #   shaders   着色器两端一致性（P1..P15）
 #   neg-shaders
+#   android   Android 静态契约（G-AND-1..5：JNI target 覆盖 / loadLibrary 动态库形态 /
+#             Manifest 资源与类名 / Kotlin 依赖 / res 反空）
+#   neg-android  上条的负向注入（15 项）
+#   toolchain Android 工具链版本一致性（NDK/AGP/Gradle/Kotlin/CMake 五处声明）
+#   neg-toolchain 上条的负向注入（12 项）
+#   elf       ELF PT_LOAD 对齐解析器自检（16 KB 门禁的判据实现本体）
 #   abi       C ABI 漂移闸门
 #   params    参数契约漂移闸门
 #   license   第三方许可扫描（GPL 家族硬阻断）
@@ -46,7 +52,9 @@
 #   ios       = generate,ios,neg-ios        ← 同时是能力点名，故会顺带补生成器
 #   parity    = generate,parity,neg-parity
 #   shaders   = shaders,neg-shaders
-#   negative  = neg-ios,neg-parity,neg-shaders
+#   android   = android,neg-android
+#   toolchain = toolchain,neg-toolchain
+#   negative  = neg-ios,neg-parity,neg-shaders,neg-android,neg-toolchain
 #
 #   `all` 单独出现即全选。未知选择器**报错退出**（不静默忽略 —— 否则打错字会
 #   表现为"以为跑了其实没跑"）。
@@ -55,6 +63,12 @@
 #    （platform/ios/*.xcconfig、Package.swift、Container/project.yml）与磁盘一致。
 #    漏跑生成器时这些闸门是在对**陈旧文件**判 —— "判据落在错误对象上"。
 #    故只要选了这三者，本脚本自动补上 generate。
+#
+# ⚠️ Android 侧的**真编译**与 **16 KB APK 校验**不在这里：前者需要
+#    JDK + Android SDK + NDK（属 .github/workflows/android.yml 的 build job），
+#    后者需要构建出的 APK 产物（无产物时 `check_16kb.sh` 会**硬失败**，
+#    不静默降级 —— 故它绝不能塞进零产物的静态 job）。
+#    这里只跑"纯静态、无工具链、任何机器可跑"的那部分。
 #
 # ⚠️ Vulkan SPIR-V 的**实证**编译不在这里：它需要 glslangValidator，属独立 job
 #    `shaders-vulkan`（与只做语法/一致性检查的闸门分开 —— 前者需要真工具链）。
@@ -70,20 +84,23 @@ cd "${ROOT}"
 # ---------------------------------------------------------------------------
 # 能力点全集（顺序 = 执行顺序，且与并入本脚本之前的 YAML step 顺序逐条对应）
 # ---------------------------------------------------------------------------
-CAPS_ALL="generate ios neg-ios parity neg-parity shaders neg-shaders abi params license xcodegen"
+CAPS_ALL="generate ios neg-ios parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license xcodegen"
 
 # 互为「组合选择器 → 能力点」的展开表。
 # 键与值都只用空格分隔的普通字符串（bash 3.2 无关联数组，macOS 上也能跑）。
 selector_expand() {
   case "$1" in
-    all)      echo "${CAPS_ALL}" ;;
-    ios)      echo "generate ios neg-ios" ;;
-    parity)   echo "generate parity neg-parity" ;;
-    shaders)  echo "shaders neg-shaders" ;;
-    negative) echo "neg-ios neg-parity neg-shaders" ;;
-    generate | neg-ios | neg-parity | neg-shaders | abi | params | license | xcodegen)
-              echo "$1" ;;
-    *)        return 1 ;;
+    all)        echo "${CAPS_ALL}" ;;
+    ios)        echo "generate ios neg-ios" ;;
+    parity)     echo "generate parity neg-parity" ;;
+    shaders)    echo "shaders neg-shaders" ;;
+    android)    echo "android neg-android" ;;
+    toolchain)  echo "toolchain neg-toolchain" ;;
+    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-toolchain" ;;
+    generate | neg-ios | neg-parity | neg-shaders | neg-android | neg-toolchain | \
+    elf | abi | params | license | xcodegen)
+                echo "$1" ;;
+    *)          return 1 ;;
   esac
   return 0
 }
@@ -148,7 +165,10 @@ if [ "${1:-}" = "--self-test" ]; then
   fi
 
   # ① 非空性 + ② 子集性
-  for s in generate ios parity shaders negative abi params license xcodegen; do
+  # ⚠️ 本列表必须与 `selector_expand` 的分支**逐项一致**（含组合选择器）。
+  #    漏一个组合选择器 → 它的展开结果不参与下面的 ③ 并集断言，
+  #    于是"该选择器指向已被删除的能力点"这类错误不会被发现。
+  for s in generate ios parity shaders android toolchain elf negative abi params license xcodegen; do
     caps="$(parse_selector "${s}")" || { echo "::error::选择器 ${s} 解析失败"; fail=1; continue; }
     n="$(echo "${caps}" | wc -w | tr -d ' ')"
     echo "  - ${s} → ${n} 个：${caps}"
@@ -165,8 +185,9 @@ if [ "${1:-}" = "--self-test" ]; then
   done
 
   # ③ 并集 == all，且每个能力点都可达（有选择器能选到它）
+  #    ⚠️ 同上：列表必须与 selector_expand 的分支逐项一致。
   union=""
-  for s in generate ios parity shaders negative abi params license xcodegen; do
+  for s in generate ios parity shaders android toolchain elf negative abi params license xcodegen; do
     union="${union} $(parse_selector "${s}")"
   done
   for c in ${CAPS_ALL}; do
@@ -256,10 +277,38 @@ if wants neg-shaders; then
   step "着色器一致性负向注入" "${PY}" tools/verify_shader_parity_negative.py
 fi
 
+# --- Android 静态契约（纯静态：无 JDK/SDK/NDK/产物，任何机器可跑）---------
+if wants android; then
+  step "Android 静态契约闸门（G-AND-1..5）" "${PY}" tools/check_android_contract.py
+fi
+if wants neg-android; then
+  step "Android 契约负向注入（证明 G-AND 判据非假闸门）" \
+    "${PY}" tools/verify_android_contract_negative.py
+fi
+
+# --- Android 工具链版本一致性（五处声明 vs docs/12 §3.1 锁定值）-------------
+if wants toolchain; then
+  step "Android 工具链版本一致性（NDK/AGP/Gradle/Kotlin/CMake）" \
+    "${PY}" tools/check_toolchain.py
+fi
+if wants neg-toolchain; then
+  step "工具链版本闸门负向注入" "${PY}" tools/verify_toolchain_negative.py
+fi
+
+# --- ELF 对齐解析器自检（16 KB 门禁的**判据实现本体**）----------------------
+# 为什么把它放进静态 job：`check_16kb.sh` 依赖本解析器判定 `p_align`。
+# 若解析器本身在"找不到 LOAD 段"时静默返回空集，门禁就退化成**恒真**
+# （MEMORY.md 明列的真事故形态）。故解析器的正确性必须**独立于 APK 产物**
+# 被验证 —— 用合成 ELF + 真实 ELF 互证，不需要 NDK。
+# `check_16kb.sh` 的检查 0 会在真构建 job 里再跑一次 --self-test（双保险）。
+if wants elf; then
+  step "ELF PT_LOAD 对齐解析器自检（合成 ELF + 反空约束）" \
+    "${PY}" tools/elf_load_align.py --self-test
+fi
+
 if wants abi; then
   step "C ABI 漂移闸门" "${PY}" tools/abi_drift_check.py
 fi
-
 if wants params; then
   step "参数契约漂移闸门" "${PY}" tools/check_params.py
 fi

@@ -173,7 +173,33 @@ set(RECON_CORE_SOURCES
     core/src/sfm/pose_graph.cpp
     core/src/orchestrator/orchestrator.cpp)
 
-add_library(recon_core STATIC ${RECON_CORE_SOURCES})
+# ── 库形态：Android 必须是 SHARED，其余平台 STATIC ──────────────────────────
+# 为什么 Android 不能是 STATIC（第四十三轮实测的**致命缺口 A**）：
+#   `platform/android/.../ReconApplication.kt:23` 在 `onCreate` 里
+#   `System.loadLibrary("recon_core")`。`loadLibrary` 只认 **`.so` 文件名**，
+#   而本仓库此前 **全部 target 都是 STATIC** —— 根本没有 `librecon_core.so`
+#   可加载，真机启动**第一步**即崩：
+#     java.lang.UnsatisfiedLinkError: dlopen failed:
+#       library "librecon_core.so" not found
+#   而这一缺口在**编译期、ctest 28/28、以及既有全部静态闸门**下**全绿**：
+#   静态库照样编译、照样被 App 链接，`add_library(STATIC)` 也不报错。
+#   属 MEMORY.md「静态闸门结构上查不出」类，只能靠真机/真编译暴露。
+# 为什么桌面与 iOS **保持 STATIC**：
+#   · 桌面：`recon_cli` 与 28 个单测直接链接静态库，改 SHARED 会引入运行时
+#     库搜索路径问题（Windows 上尤甚），且无任何收益；
+#   · iOS：`ios.yml` 的 `build-xcframework` 用 `libtool -static` 合并三个
+#     `librecon_*.a` 再用 `xcodebuild -create-xcframework -library` 打包。
+#     `-create-xcframework -library` **只接受静态库**，改 SHARED 会直接破掉
+#     已跑通四 job 的 iOS 链路。
+# 判据落点：Android 产物中 `librecon_core.so` 与 `librecon_platform_android.so`
+# 真实存在（见 `tools/check_android_contract.py` G-AND-5）。
+if(RECON_PLATFORM_ANDROID)
+  set(RECON_CORE_LIB_TYPE SHARED)
+else()
+  set(RECON_CORE_LIB_TYPE STATIC)
+endif()
+
+add_library(recon_core ${RECON_CORE_LIB_TYPE} ${RECON_CORE_SOURCES})
 add_library(recon::core ALIAS recon_core)
 
 target_include_directories(recon_core PUBLIC
@@ -396,11 +422,33 @@ endif()
 if(RECON_COMPILE_SHADERS AND (RECON_PLATFORM_ANDROID OR RECON_PLATFORM_DESKTOP))
   # Vulkan 着色器：GLSL → SPIR-V（glslangValidator），再内联为 C 数组（docs/12 §1.3）。
   # 两者的具体命令由 tools/build_vulkan_shaders.sh 承担（与 Metal 侧对称）。
+  #
+  # ── 为什么必须显式传产物目录（与 Metal 侧同一类真 bug，对称修法）──────────
+  # 脚本的默认输出是 `build/vulkan/...`（相对**仓库根**），而 CMAKE_BINARY_DIR
+  # 在 Gradle/CI 下是 `build/android/<abi>`。两者不一致时，产物会落在
+  # 「没人会去看、也没人声明依赖」的仓库根 `build/` 下 —— 构建不报错，
+  # 但消费方 include 不到内联头（属 MEMORY.md「静默丢弃最难查」）。
+  set(RECON_SPIRV_OUT_DIR "${CMAKE_BINARY_DIR}/vulkan/spirv")
+  set(RECON_SPIRV_HEADER_OUT "${CMAKE_BINARY_DIR}/vulkan/recon_shaders_vulkan_spv.h")
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh")
     add_custom_target(recon_spirv
-      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "RECON_SPIRV_DIR=${RECON_SPIRV_OUT_DIR}"
+              "RECON_SPIRV_HEADER=${RECON_SPIRV_HEADER_OUT}"
+              bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common/gpu_algo.h"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       COMMENT "编译 Vulkan 着色器 → SPIR-V（docs/12 §1.3）")
+    # ── 缺口 B 的修复：把生成目标接进依赖图 ──────────────────────────────
+    # 此前**没有**这一行，`recon_spirv` 是孤儿 custom target —— 任何构建都不会
+    # 触发它，SPIR-V 与内联头永不生成，而构建全绿。这与 iOS 侧
+    # `recon_shaders_metal` 早已修过的「设计意图未落实」完全同构。
+    # 由此处 `add_dependencies` + 下方 consumers 的 `target_link_libraries`，
+    # `RECON_COMPILE_SHADERS=ON` 时构建 Android 门面即自动产出着色器产物。
+    add_dependencies(recon_shaders_vulkan recon_spirv)
+    # 把产物头挂到 INTERFACE 上：C++ 侧（Vulkan 后端）include 它取内联数组。
+    target_sources(recon_shaders_vulkan INTERFACE "${RECON_SPIRV_HEADER_OUT}")
   else()
     message(STATUS "recon_shaders_vulkan: 未找到 tools/build_vulkan_shaders.sh，"
                    "跳过 SPIR-V 编译（仅源码参与一致性检查）")
@@ -445,7 +493,10 @@ endif()
 # Android 专属门面：JNI 桥接 + 明确定义 target 名（docs/12 §1.2）。
 # 仅在 Android 构建时存在；桌面构建不含 JNI 头，故不参与。
 if(RECON_PLATFORM_ANDROID)
-  add_library(recon_platform_android STATIC
+  # 形态同 recon_core：**必须 SHARED**，因为 `ReconApplication.kt:24` 有
+  # `System.loadLibrary("recon_platform_android")`。STATIC 下无 `.so` 可加载 →
+  # 同一个 `UnsatisfiedLinkError`（缺口 A 的第二处）。详见 recon_core 处注释。
+  add_library(recon_platform_android SHARED
       platform/android/app/src/main/cpp/native-lib.cpp
       platform/android/app/src/main/cpp/platform-bridge.cpp
       # IMU 环形缓冲的 JNI 薄封装：桥接 `platform/common/src/imu_window.cpp`
@@ -453,6 +504,21 @@ if(RECON_PLATFORM_ANDROID)
       # 交错布局重排，**不含任何切窗规则**（见 imu-bridge.cpp 文件头）。
       platform/android/app/src/main/cpp/imu-bridge.cpp)
   target_link_libraries(recon_platform_android PUBLIC recon_core recon_platform_common)
+  # ── 着色器依赖进 CMake 图（第四十三轮实测的**致命缺口 B**）──────────────
+  # 此前 `recon_shaders_vulkan` 从未被任何 target 链接，于是
+  # `add_custom_target(recon_spirv)` **永远不会被任何构建触发** —— 与 iOS 侧
+  # `recon_shaders_metal` 早已修过的那个「设计意图未落实」（见 recon_platform_ios
+  # 处的注释）**完全同构**，只是 Android 侧漏了同一个修法。
+  # 后果：`RECON_COMPILE_SHADERS=ON` 时 SPIR-V 产物与内联头**永不生成**，
+  # 而构建**不报错**（INTERFACE target 无人链接 = 静默空转）。
+  # 注：即使 `RECON_COMPILE_SHADERS=OFF` 也必须链接 —— 那时它们是空 INTERFACE，
+  # 链接无副作用；这正是把 target 无条件建出来、并无条件链接的理由。
+  target_link_libraries(recon_platform_android PUBLIC recon_shaders_vulkan)
+  target_link_libraries(recon_platform_android PUBLIC recon_shaders_common)
+  target_include_directories(recon_platform_android PRIVATE
+      # GPU 参数块的唯一事实来源（gpu_algo.h）。Vulkan 后端将来 include 它取
+      # 工作组常量/参数块布局，不得在 Android 侧手抄一份（必然漂移）。
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common")
   if(NOT MSVC)
     target_compile_options(recon_platform_android PRIVATE -Wall -Wextra -Wpedantic)
   endif()

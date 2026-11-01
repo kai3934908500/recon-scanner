@@ -59,6 +59,13 @@ Makefile
 /test_pipeline_model.glb
 /test_pipeline_model.ply
 
+# 手工用 glslangValidator 探活时留下的默认输出名（形如 `comp <file>.comp.spv`）。
+# 它既非源码也非登记的产物（正式产物在 build/vulkan/spirv/，已被上方 /build/ 覆盖），
+# 出现在工作区纯属噪声，且**两次**混进过待提交列表。故按精确名忽略；
+# 不写 *.spv —— 那会连将来有意入库的夹具也一起吃掉。
+/comp.spv
+/*.comp.spv
+
 # ---------------------------------------------------------------------------
 # iOS / Xcode / Metal（.xcodeproj 由 XcodeGen 在 macOS 上生成，属 CI 产物）
 # ---------------------------------------------------------------------------

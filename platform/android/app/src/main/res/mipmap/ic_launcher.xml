@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  res/mipmap/ic_launcher.xml — API 24/25 用的传统（非自适应）图标。
+  ⚠️ 本文件原误放在 res/drawable/ic_launcher_legacy.xml，已 `mv` 到此。
+     原因：AndroidManifest 写的是 `android:icon="@mipmap/ic_launcher"`，
+     AAPT 按**资源类型目录名**解析，放 drawable/ 下会在资源链接期报
+     `resource mipmap/ic_launcher not found`（第四十二轮真实事故）。
+
+  ⚠️ 为什么需要它：自适应图标（mipmap-anydpi-**v26**）只在 API 26+ 生效。
+    本项目 minSdk 是 **24** —— 24/25 设备会去找不带 -v26 限定的
+    `mipmap/ic_launcher`。若只提供 anydpi-v26 一份，AAPT 会在
+    **资源链接期**报 `resource mipmap/ic_launcher not found`（minSdk 24
+    的资源配置里没有任何候选项），而这类报错与「图标少一份」的因果
+    距离很远，故在此显式补齐。
+
+  绘制口径：把自适应图标的背景色 + 前景图形合成到一张矢量里，
+  并按传统图标惯例留出约 12% 的边距（外圈圆角由启动器自行裁切）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+        android:width="108dp"
+        android:height="108dp"
+        android:viewportWidth="108"
+        android:viewportHeight="108">
+
+    <!-- 背景整幅填充 -->
+    <path
+        android:fillColor="#FF101418"
+        android:pathData="M0,0 H108 V108 H0 Z" />
+
+    <!-- 前景：等轴测立方体轮廓 -->
+    <path
+        android:strokeColor="#FF7FD4FF"
+        android:strokeWidth="4.0"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M54,30 L79,44.5 L79,73.5 L54,88 L29,73.5 L29,44.5 Z" />
+    <path
+        android:strokeColor="#FF7FD4FF"
+        android:strokeWidth="4.0"
+        android:strokeLineCap="round"
+        android:pathData="M54,30 L54,59 M54,59 L29,44.5 M54,59 L79,44.5" />
+    <path
+        android:fillColor="#FFB9E8FF"
+        android:pathData="M54,56 L56.8,59 L54,62 L51.2,59 Z" />
+
+</vector>

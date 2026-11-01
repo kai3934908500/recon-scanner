@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  res/values/colors.xml — 应用配色（当前仅图标背景）。
+
+  契约：docs/09_UI规格.md 的深色基调（取景界面为纯黑底，见 themes.xml）。
+  说明：Android 侧 UI 尚未接线（骨架阶段），此处只提供资源层所需的
+        最小集合，避免 AAPT 因缺资源而失败。
+-->
+<resources>
+    <!-- 图标背景：深灰（近黑），与 themes.xml 的 windowBackground 同调 -->
+    <color name="ic_launcher_background">#FF101418</color>
+</resources>
