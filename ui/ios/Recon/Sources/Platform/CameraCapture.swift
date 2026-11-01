@@ -117,7 +117,7 @@ extension ARCapability {
     /// | `supports_gpu` | `MTLCreateSystemDefaultDevice() != nil` | Metal 可用性；iOS 15 起全机型可用，探测一次成交互式回退 |
     /// | `max_image_width/height` | ARKit 给定格式的 `imageResolution` | **取不到时写 0**（见下） |
     /// | `max_fps` | ARKit 视频格式的 `framesPerSecond` 上限 | **取不到时写 0** |
-    /// | `imu_max_rate_hz` | `1 / maximumGyroUpdateInterval`（钳到机型上限） | docs/11 §3.1.5 的速率表：`CMGyro` 典型 100–200 Hz。**不写 `cap_imu_rate_hz` 期望值** —— 那个是用户期望，不是事实 |
+    /// | `imu_max_rate_hz` | **写 0（iOS 不可查询，见下方实现处注释）** | Android 有 `Sensor.getMaxDelay()` 可算，iOS 的 `CMMotionManager` **无**任何暴露硬件上限的成员。**不写 `cap_imu_rate_hz` 期望值** —— 那个是用户期望，不是事实 |
     /// | `total/available_memory_bytes` | `ProcessInfo.physicalMemory` / `os_proc_available_memory()` | 见下 |
     ///
     /// ── 关于三个「取不到就写 0」的字段（**必须诚实，不能填一个像真的数**）──
@@ -179,18 +179,30 @@ extension ARCapability {
             maxFps = Int32(best.framesPerSecond)
         }
 
-        // IMU 硬件上限（IOS-IMU-2：以陀螺上限为准，因为它才是预积分输入）。
-        // `maximumGyroUpdateInterval` 是**最小间隔**（秒），其倒数为最大速率。
-        let motion = CMMotionManager()
-        var imuMaxRate: Int32 = 0
-        let minInterval = motion.maximumGyroUpdateInterval
-        if minInterval > 0, minInterval.isFinite {
-            // 钳到 Int32 域：该值理论上不会超过几千 Hz，但除零/NaN 已在上行排除。
-            let rate = 1.0 / minInterval
-            if rate.isFinite, rate > 0, rate < Double(Int32.max) {
-                imuMaxRate = Int32(rate.rounded())
-            }
-        }
+        // IMU 硬件上限：**iOS 无法查询，故诚实写 0**（不编造数字）。
+        //
+        // ── 为什么这里不能像 Android 那样算（2026-11-01 CI 真编译暴露）──────
+        //
+        // Android 的 `Sensor.getMaxDelay()` 是**真实存在**的 API（`DeviceProbe.kt`
+        // 用它取倒数），但 iOS 侧**没有对应能力**：
+        //   · `CMMotionManager.gyroUpdateInterval` 是**调用方设置的期望间隔**，
+        //     不是硬件上限 —— 读取它只会拿回自己刚写进去的值；
+        //   · Apple **未提供**任何查询「传感器最高采样率」的属性/方法。
+        // 先前此处写的 `motion.maximumGyroUpdateInterval` 是**不存在的成员**，
+        // 编译器直接报 `has no member`。docs/11 §3.1.5 的速率表引用了同一个
+        // 错名字（该表已被本次修正，见下）。
+        //
+        // ── 那 0 代表什么？─────────────────────────────────────────────────
+        // `recon_probe_data.imu_max_rate_hz` 的语义是「设备**事实**上限」。
+        // 探测期（docs/11 §1.3：不申请权限、不启动会话）拿不到该事实，
+        // 按本文件通行的「取不到写 0 + 注明原因」口径（与 max_image_width /
+        // max_fps 同一处置），此处写 0 表示**未知**，而非「不支持 IMU」——
+        // 后者由 `has_imu`（deviceMotionAvailable || gyroAvailable）独立判定，
+        // 两者不可混为一谈。
+        //
+        // 会话启动后若确需真实速率，可让内核以「实际投递的样本时间戳间隔」
+        // 统计得到（那是测量值，非查询值），届时再补；本轮**不**为此伪造常量。
+        let imuMaxRate: Int32 = 0
 
         // 内存：物理内存总量 + 本进程可申请上限（见上方口径说明）。
         let total = ProcessInfo.processInfo.physicalMemory
