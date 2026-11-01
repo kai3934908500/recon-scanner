@@ -61,6 +61,10 @@ docs/12 §4.4 的契约是「**算法同源、两端分别编译**」：
       且两端都不得出现浮点原子（`atomic_float` 是 Metal 3.0 / iOS 16 起
       才有，本项目部署下限 iOS 15.0；GLSL 侧无该扩展）。
       ⚠️ 本判据每面都带**反空**约束：匹配数为 0 即报「假判据」失败。
+  P14 Vulkan `.comp` 的**预处理指令顺序**自洽（本判据诞生于一次真实事故，
+      见下方长注释）：`#include "gpu_common.glsl"` 必须早于任何引用它定义
+      的宏的 `layout(local_size_*)`，且 `#version` 必须是第一个非注释指令。
+      纯静态可查，**不需要 glslang** —— 故本机（Windows）也能守住它。
 
 退出码
 ------
@@ -377,7 +381,7 @@ def parse_number(text: str):
 
 
 # ===========================================================================
-# 判据 P1..P13
+# 判据 P1..P14
 # ===========================================================================
 def gate_naming(rep: Report, common_algos: list[str],
                 metal_kernels: list[str],
@@ -777,8 +781,210 @@ def gate_cmake_metal_list(rep: Report, metal_files: list[str]) -> None:
 
 
 # ===========================================================================
-# P13 定点累加协议同构（Metal ↔ Vulkan）
+# P14 Vulkan .comp 预处理指令顺序自洽
 # ===========================================================================
+# 为什么需要这条判据（诞生于第四十一轮 CI 的一次真实事故）：
+#
+#   本轮新增了 `shaders-vulkan` job（用 glslangValidator 真编译 8 个 .comp），
+#   它**第一次**把这些着色器交给编译器 —— 立刻全炸：
+#
+#     ERROR: shaders/vulkan/recon_mvs_consistency.comp:56:
+#            'RECON_VK_WORKGROUP_X' : undeclared identifier
+#     ERROR: :56: 'local_size' : needs a literal integer
+#     ERROR: 6 compilation errors.  No code generated.
+#
+#   根因是**预处理指令的顺序**（8 个 .comp 全部同病）：
+#
+#     #version 450
+#     layout(local_size_x = RECON_VK_WORKGROUP_X, …) in;   ← 56 行，引用了宏
+#     #include "gpu_common.glsl"                           ← 60 行，宏在这里才定义
+#
+#   `RECON_VK_WORKGROUP_X` 定义在 `gpu_common.glsl` 里，而 include 写在它**之后**
+#   → 展开时是未声明标识符。附带还有第二个问题：全仓库**没有**任何
+#   `#extension GL_GOOGLE_include_directive : require`，`#include` 本身就不是
+#   GLSL 的合规指令（glslang 只是宽容地当注释/忽略处理，于是宏永远不生效）。
+#
+#   为什么既有 13 条判据一条都没拦住：它们比的是**名字集合、字段序列、常量值**
+#   —— 全是"文件里有没有出现某串文本"。而这是**文本的顺序与可见性**问题：
+#   所有被比对的文本都在，只是出现的位置没用。P1..P13 全绿，编译全炸。
+#   （与 MEMORY.md「判据必须落在目标对象上」同源：这里的目标对象是
+#    "预处理后的可见性"，不是"符号集合"。）
+#
+#   本判据刻意做成**纯静态**（不调 glslang）：
+#   ① 本机（Windows）没有 glslang，静态版让我在推送前就能自查，反馈以秒计；
+#   ② CI 的 shaders-vulkan job 是**权威**（真编译），两者互补 ——
+#      静态版负责"快速反馈 + 解释为什么"，CI 版负责"最终裁决"。
+#
+# 判据（对每个 .comp，可逐条负向注入证伪）：
+#   P14-a 必须存在且**恰好一条** `#version <数字>`，且它是第一个非注释、
+#         非空行的指令（GLSL 规范：`#version` 必须是首个语句）。
+#         证伪：在 `#version` 前插一行 `int x;` → 报错。
+#   P14-b 若引用了 `#include`，则**必须**同时声明
+#         `#extension GL_GOOGLE_include_directive : require|enable`
+#         （GLSL 不认识 `#include`；缺声明时 glslang 只当无关指令跳过，
+#          于是 `gpu_common.glsl` **从未被包含**，宏永远不可见）。
+#         证伪：删掉那行 `#extension` → 报错。
+#   P14-c 任何 `#include "X"` 必须**早于**第一个引用 X 所定义宏的 `layout(...)；
+#         且被 include 的文件必须**真实存在**（防引用不存在的公共头）。
+#         证伪：把 include 行移到 `layout(local_size_x…)` 之后 → 报错。
+#   P14-d `#include` 必须早于**任何**使用 `RECON_VK_*` / `RECON_GPU_*` 宏的位置
+#         （不止 layout —— 常量也可能是编译期数组上界）。
+#         证伪：在 include 前写 `#define N RECON_GPU_FIXED_MAX` 并用于数组 → 报错。
+#
+#   ⚠️ 反空约束：至少要有 1 个 .comp 被检查到，否则说明扫描式已失效 → 失败。
+def code_lines_keep_lineno(text: str) -> list[str]:
+    """逐行剥掉 `//` 与 `/* */` 注释，**保持行数不变**（行号 = 列表下标 + 1）。
+
+    为什么不用现成的 `strip_comments()`：它用 `DOTALL` 匹配 `/* */`，会把
+    跨行块注释里的换行一起删掉 → 后续所有行号左移 → 报错信息指向**无关的行**。
+    本判据的核心价值就是"报出准确的行号"（CI 报的是 `:56`，本地必须能对上），
+    所以必须有保行号的剥离。
+
+    剥离粒度是**字符级**（不是"整行是注释就丢"）：`x = 1; // RECON_VK_X` 这种
+    行尾注释里的宏名不应被当成使用，而同一行前面的真实代码仍要保留。
+    """
+    out: list[str] = []
+    in_block = False
+    for line in text.split("\n"):
+        buf: list[str] = []
+        i = 0
+        while i < len(line):
+            two = line[i:i + 2]
+            if in_block:
+                if two == "*/":
+                    in_block = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if two == "/*":
+                in_block = True
+                i += 2
+                continue
+            if two == "//":
+                break                      # 行尾注释：本行剩余部分丢弃
+            buf.append(line[i])
+            i += 1
+        out.append("".join(buf))
+    return out
+
+
+def gate_vulkan_preprocess_order(rep: Report, vulkan_files: list[str]) -> None:
+    """P14 —— Vulkan .comp 的 `#version` / `#extension` / `#include` 顺序自洽。
+
+    `vulkan_files` 是 `shaders/vulkan/` 下的 `.comp` 文件名列表（不含路径）。
+    """
+    checked = 0
+
+    for fname in vulkan_files:
+        if not fname.endswith(".comp"):
+            continue
+        path = os.path.join(VULKAN_DIR, fname)
+        if not os.path.isfile(path):
+            continue
+        checked += 1
+        raw = read(path)
+        # 一切判据都基于 `lines`（**已剥注释、行数不变**）：若用原文，文件头
+        # 注释里出现的宏名（如「量化方案：value → … × RECON_GPU_FIXED_SCALE」）
+        # 会被当成"使用了该宏"→ 红绿由注释措辞决定 → 判据本身不可信。
+        lines = code_lines_keep_lineno(raw)
+
+        # --- P14-a：`#version` 必须是第一个非注释行，且恰好一条 -------
+        ver_lines = [i for i, s in enumerate(lines)
+                     if re.match(r"^\s*#\s*version\b", s)]
+        if not ver_lines:
+            rep.fail(f"P14-a {fname}：没有 `#version` 指令（GLSL 计算着色器必须声明）")
+            continue
+        if len(ver_lines) > 1:
+            rep.fail(f"P14-a {fname}：出现 {len(ver_lines)} 条 `#version`"
+                     f"（行 {[i + 1 for i in ver_lines]}）—— 只允许一条")
+        vline = ver_lines[0]
+        if not re.search(r"#\s*version\s+\d+", lines[vline]):
+            rep.fail(f"P14-a {fname}:{vline + 1}：`#version` 后缺版本号"
+                     f"（形如 `#version 450`）")
+        first_code = next((i for i, s in enumerate(lines)
+                           if s.strip()), None)
+        if first_code is not None and first_code != vline:
+            rep.fail(f"P14-a {fname}：`#version` 位于第 {vline + 1} 行，"
+                     f"但它之前第 {first_code + 1} 行已有非注释内容 —— "
+                     f"GLSL 规定 `#version` 必须是第一个语句")
+
+        # --- P14-b：有 #include 就必须有 GL_GOOGLE_include_directive -----
+        has_include = any(re.match(r'^\s*#\s*include\s+"', s) for s in lines)
+        if has_include:
+            ext_ok = any(re.search(r"^\s*#\s*extension\s+GL_GOOGLE_include_directive\s*:"
+                                   r"\s*(require|enable)", s) for s in lines)
+            if not ext_ok:
+                rep.fail(f"P14-b {fname}：用了 `#include` 但没有声明 "
+                         f"`#extension GL_GOOGLE_include_directive : require`"
+                         f"（GLSL 不认识 `#include`；缺此声明时编译器会把它当无关"
+                         f"指令跳过，被包含的文件**从未生效**，其宏永远不可见 —— "
+                         f"这正是第四十一轮 8 个 .comp 全部编译失败的原因）")
+
+        # --- P14-c / P14-d：include 必须早于任何宏使用 -------------------
+        inc_lines = [i for i, s in enumerate(lines)
+                     if re.match(r'^\s*#\s*include\s+"', s)]
+        for il in inc_lines:
+            m = re.match(r'^\s*#\s*include\s+"([^"]+)"', lines[il])
+            assert m is not None
+            target = m.group(1)
+            # 被包含文件必须真实存在（相对 shaders/vulkan/）
+            if not os.path.isfile(os.path.join(VULKAN_DIR, target)):
+                rep.fail(f"P14-c {fname}:{il + 1}：`#include \"{target}\"` 指向的"
+                         f"文件不存在（应位于 shaders/vulkan/）")
+                continue
+            # 收集被包含文件里定义的全部宏名
+            inc_text = read(os.path.join(VULKAN_DIR, target))
+            macros = set(re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)",
+                                    inc_text, re.M))
+            if not macros:
+                continue
+            # P14-c：`#include` 必须早于**第一个**引用这些宏的 `layout(...)`。
+            #   （这里只针对 layout 限定符 —— 它是"宏必须编译期可见"的最典型
+            #   位置。其余任意位置的使用由下面的 P14-d 统一覆盖。）
+            lay_lines = [j for j, s in enumerate(lines)
+                         if re.search(r"\blayout\s*\(", s)
+                         and any(re.search(r"\b" + re.escape(mc) + r"\b", s)
+                                 for mc in macros)]
+            if lay_lines and lay_lines[0] < il:
+                rep.fail(f"P14-c {fname}：第 {lay_lines[0] + 1} 行的 "
+                         f"`layout(...)` 引用了 `{target}` 里的宏，"
+                         f"但 `#include \"{target}\"` 在第 {il + 1} 行（更晚）—— "
+                         f"布局限定符要求编译期常量，此时宏尚未定义")
+            # P14-d：include **之前**是否已使用被包含文件里的宏（任意位置，
+            #   含数组上界等非 layout 用法）。
+            for j in range(0, il):
+                used = sorted(mc for mc in macros
+                              if re.search(r"\b" + re.escape(mc) + r"\b", lines[j]))
+                if used:
+                    rep.fail(f"P14-d {fname}:{j + 1}：在第 {il + 1} 行的 "
+                             f"`#include \"{target}\"` **之前**就使用了它定义的宏 "
+                             + ", ".join(used)
+                             + "（预处理按文本顺序展开，此处宏尚未定义 → "
+                               "编译期报 `undeclared identifier`）")
+
+        # --- P14-d 补充：凡使用了 RECON_VK_* / RECON_GPU_* 宏，就必须有 include
+        #   否则宏不可能有来源（防"某文件根本没 include 却用了公共宏"）。
+        macro_use_re = re.compile(r"\b(RECON_VK_\w+|RECON_GPU_\w+)\b")
+        if not inc_lines:
+            bad = []
+            for j, s in enumerate(lines):
+                if re.match(r"^\s*#\s*(define|include)\b", s):
+                    continue           # 定义处与（不存在的）include 行不算使用
+                if macro_use_re.search(s):
+                    bad.append((j + 1, macro_use_re.search(s).group(1)))
+            if bad:
+                rep.fail(f"P14-d {fname}：使用了公共宏却没有 `#include \"gpu_common.glsl\"`"
+                         f"（首个：第 {bad[0][0]} 行的 {bad[0][1]}）")
+
+    if checked == 0:
+        rep.fail("P14：没有扫描到任何 .comp 文件 —— 判据已失效（反空约束）")
+    elif not rep.failures:
+        rep.note(f"P14 Vulkan .comp 预处理顺序自洽：{checked} 个文件"
+                 f"（#version 首位 / include 早于宏使用 / GL_GOOGLE_include_directive 已声明）")
+
+
+
 # 为什么需要这条判据（本判据的诞生背景 = 一次**假通过**被 CI 揭穿）：
 #
 #   第 39 轮之前，Metal 侧的 `recon_mvs_fuse_voxel` 用 `atomic_float` 做
@@ -1015,6 +1221,7 @@ def main() -> int:
                          parse_vulkan_helpers(vulkan_common_text))
     gate_cmake_metal_list(rep, metal_files)
     gate_fixed_point_atomics(rep, metal_all, vulkan_all)
+    gate_vulkan_preprocess_order(rep, vulkan_files)
 
     print(f"[shader-parity] common 算法 {len(common_algos)} / "
           f"Metal kernel {len(set(metal_kernels))} / "
@@ -1028,7 +1235,7 @@ def main() -> int:
         print(f"[shader-parity] FAIL：{len(rep.failures)} 项不一致")
         return 3
 
-    print("[shader-parity] PASS：着色器两端一致（P1..P13 全部通过）")
+    print("[shader-parity] PASS：着色器两端一致（P1..P14 全部通过）")
     return 0
 
 

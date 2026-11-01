@@ -279,6 +279,83 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "    int dw = int(clamp(round(w_contrib * RECON_GPU_FIXED_SCALE),",
           "    int dw = int(clamp(RECON_VK_LOCAL_RND(w_contrib * RECON_GPU_FIXED_SCALE),")],
     ),
+    # --------------------------------------------------------------------
+    # P14 Vulkan .comp 预处理指令顺序 / 可见性
+    #   现实原型：第四十一轮新增的 `shaders-vulkan` job（glslangValidator
+    #   真编译）第一次把 8 个 .comp 交给编译器，全部报
+    #     ERROR: recon_mvs_consistency.comp:56: 'RECON_VK_WORKGROUP_X'
+    #            : undeclared identifier
+    #     ERROR: :56: 'local_size' : needs a literal integer
+    #   根因 = `layout(local_size_x = RECON_VK_WORKGROUP_X, …)` 写在
+    #   `#include "gpu_common.glsl"` **之前**，而宏定义在被包含文件里；
+    #   且全仓库没有 `#extension GL_GOOGLE_include_directive : require`
+    #   （GLSL 不认识 `#include`，缺声明时 glslang 直接跳过它）。
+    #   既有 P1..P13 全是"文本在不在"的比对，结构上查不出"文本的顺序与
+    #   可见性" —— 故新增 P14。下面各项分别证伪 P14-a/b/c/d。
+    # --------------------------------------------------------------------
+    (
+        # P14-a：`#version` 必须是第一个非注释、非空语句。
+        "P14a-version-not-first",
+        "在 `#version` 之前插入一条语句（违反 GLSL「#version 必须首个」）",
+        "它之前第",
+        [(VULKAN_SEED,
+          "#version 450\n",
+          "int recon_vk_oops = 0;\n\n#version 450\n")],
+    ),
+    (
+        # P14-b：有 #include 就必须声明 GL_GOOGLE_include_directive。
+        "P14b-missing-extension",
+        "删掉 `#extension GL_GOOGLE_include_directive`（`#include` 失效）",
+        "但没有声明",
+        [(VULKAN_MVS_REDUCE,
+          "#extension GL_GOOGLE_include_directive : require\n",
+          "")],
+    ),
+    (
+        # P14-c：layout 引用公共宏，但 include 在它之后（事故原状）。
+        "P14c-layout-before-include",
+        "把 `#include` 移到引用其宏的 `layout(...)` 之后",
+        "布局限定符要求编译期常量",
+        [(VULKAN_MVS_REDUCE,
+          '#include "gpu_common.glsl"\n'
+          "\n"
+          "layout(local_size_x = RECON_VK_WORKGROUP_X,\n"
+          "       local_size_y = RECON_VK_WORKGROUP_Y,\n"
+          "       local_size_z = RECON_VK_WORKGROUP_Z) in;\n",
+          "layout(local_size_x = RECON_VK_WORKGROUP_X,\n"
+          "       local_size_y = RECON_VK_WORKGROUP_Y,\n"
+          "       local_size_z = RECON_VK_WORKGROUP_Z) in;\n"
+          "\n"
+          '#include "gpu_common.glsl"\n')],
+    ),
+    (
+        # P14-d：include 之前使用公共宏（非 layout 位置，如数组上界）。
+        "P14d-macro-used-before-include",
+        "在 `#include` 之前使用公共宏（如编译期数组上界）",
+        "之前**就使用了它定义的宏",
+        [(VULKAN_MVS_REDUCE,
+          '#include "gpu_common.glsl"\n',
+          "const int RECON_VK_OOB[RECON_GPU_FIXED_MAX];\n"
+          '#include "gpu_common.glsl"\n')],
+    ),
+    (
+        # P14-d 补充：完全没有 #include 却使用公共宏（宏不可能有来源）。
+        "P14d-macro-use-without-include",
+        "删掉 `#include` 但保留对公共宏的使用（宏无来源）",
+        "却没有",
+        [(VULKAN_SEED,
+          '#include "gpu_common.glsl"\n',
+          "")],
+    ),
+    (
+        # P14-c 的"被包含文件必须真实存在"分支。
+        "P14c-include-target-missing",
+        "`#include` 指向不存在的公共头",
+        "文件不存在",
+        [(VULKAN_SEED,
+          '#include "gpu_common.glsl"\n',
+          '#include "no_such_common.glsl"\n')],
+    ),
 ]
 
 
@@ -364,7 +441,7 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 P1..P13 均有效）")
+          f"（闸门 P1..P14 均有效）")
     return 0
 
 

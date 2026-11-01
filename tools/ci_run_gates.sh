@@ -34,7 +34,7 @@
 #   neg-ios   上条的负向注入
 #   parity    双端功能对等（1..9）
 #   neg-parity
-#   shaders   着色器两端一致性（P1..P13）
+#   shaders   着色器两端一致性（P1..P14）
 #   neg-shaders
 #   abi       C ABI 漂移闸门
 #   params    参数契约漂移闸门
@@ -250,7 +250,7 @@ if wants neg-parity; then
 fi
 
 if wants shaders; then
-  step "着色器两端一致性闸门（P1..P13）" "${PY}" tools/shader_parity.py
+  step "着色器两端一致性闸门（P1..P14）" "${PY}" tools/shader_parity.py
 fi
 if wants neg-shaders; then
   step "着色器一致性负向注入" "${PY}" tools/verify_shader_parity_negative.py

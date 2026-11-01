@@ -47,11 +47,20 @@
 
 #version 450
 
+// `#include` 不是 GLSL 核心语法：必须声明该扩展，否则编译器把 `#include`
+// 当**无关指令直接跳过** —— 被包含的文件从未生效、其宏全部不可见。
+#extension GL_GOOGLE_include_directive : require
+
+// ⚠️ `#include` 必须早于任何**使用**公共宏的位置（预处理按文本顺序展开）。
+//    `layout(local_size_x = RECON_VK_WORKGROUP_X, ...)` 的宏定义在
+//    `gpu_common.glsl` 内，故 `#include` 必须写在 `layout(...)` 之前，
+//    否则编译期报 `'RECON_VK_WORKGROUP_X' : undeclared identifier` +
+//    `'local_size' : needs a literal integer`。由闸门 P14-d 静态守住。
+#include "gpu_common.glsl"
+
 layout(local_size_x = RECON_VK_WORKGROUP_X,
        local_size_y = RECON_VK_WORKGROUP_Y,
        local_size_z = RECON_VK_WORKGROUP_Z) in;
-
-#include "gpu_common.glsl"
 
 layout(set = 0, binding = 0, std140) uniform ParamsBlock {
     ReconMvsGpuParams p;
