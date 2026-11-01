@@ -111,16 +111,40 @@ kernel void recon_mvs_seed(texture2d<float, access::read>  sparse_depth [[textur
 // 启用共享内存需要先确认 iOS 各机型的 `maxTotalThreadgroupMemory`
 // （docs/12 MT-5 要求启动时查询），在无真机可测的前提下贸然启用会踩
 // 「32 KB 限额」的坑而无法验证，故留待真机阶段。
+//
+// ── ⚠️ 纹理槽位排布（MSL 与 Vulkan 的**真实差异**，2026-11-01 CI 首编暴露）───
+// MSL 的 `array<texture2d<...>, N> x [[texture(k)]]` **占用连续的 N 个槽位**
+// （k .. k+N−1），而 Vulkan 的 `texture2D src_rgb[N]` 只占**一个** `binding`
+// （描述符数组）—— 两端在这一点的语义**不同**。
+// 因此 MSL 侧凡是带纹理数组的 kernel，都必须把数组声明**放在所有标量纹理
+// 之后**（或至少留出足够空档），否则后续 `[[texture(k+1)]]` 会与数组占用的
+// 槽位冲突，报 `cannot reserve 'texture' resource location at index N`。
+// 此前漏排（数组在中间）在 Windows 上**根本无法暴露**（本机无 Metal 编译器），
+// 只有 CI 首次真正编译才现形。见 LESSONS.md。
+//
+// ── ⚠️ 线程位置属性必须**维度一致**（CI 首编暴露的第 4 类错误）──────────────
+// MSL 要求同一 kernel 内的「位置」类内建（`thread_position_in_grid` /
+// `thread_position_in_threadgroup` / `threadgroup_position_in_grid` / …）
+// **要么全为标量、要么全为同元素数的向量**。本 kernel 的 `gid` 必须是
+// `uint2`（二维索引），故**不得再并存**标量形态的
+// `thread_position_in_threadgroup`，否则报
+// `expecting input declarations with either all scalar types or all vector
+// types with the same number of elements`。
+//
+// 原先声明的 `tid` 在本实现中**从未被读取**（`(void)tid;`，共享内存未启用，
+// 见 SOURCE-TODO-MVS-2），故直接移除 —— 零语义损失。
+// ⚠️ 将来启用共享内存时**不要**直接把它加回来：必须同时改掉 `gid` 的形态
+//    （或改用非「位置」类的索引内建，如 `thread_index_in_threadgroup`，
+//    其是否受同一维度约束需**在 macOS 上实测确认**，本机无法验证故不预设）。
 kernel void recon_mvs_patchmatch(texture2d<float, access::read>  rgb_ref   [[texture(0)]],
                                  texture2d<float, access::read>  in_invz   [[texture(1)]],
                                  texture2d<float, access::read>  in_cost   [[texture(2)]],
-                                 array<texture2d<float, access::read>, 8> src_rgb [[texture(3)]],
-                                 texture2d<float, access::write> out_invz  [[texture(4)]],
-                                 texture2d<float, access::write> out_cost  [[texture(5)]],
+                                 texture2d<float, access::write> out_invz  [[texture(3)]],
+                                 texture2d<float, access::write> out_cost  [[texture(4)]],
+                                 array<texture2d<float, access::read>, 8> src_rgb [[texture(5)]],
                                  constant ReconMvsGpuParams&     p         [[buffer(0)]],
                                  constant ReconViewParams*       views     [[buffer(1)]],
-                                 uint2 gid [[thread_position_in_grid]],
-                                 uint  tid [[thread_position_in_threadgroup]])
+                                 uint2 gid [[thread_position_in_grid]])
 {
     const int2 size = int2(p.ref_width, p.ref_height);
     if (gid.x >= uint(size.x) || gid.y >= uint(size.y)) return;
@@ -132,11 +156,11 @@ kernel void recon_mvs_patchmatch(texture2d<float, access::read>  rgb_ref   [[tex
     float best_iz   = in_invz.read(gid).r;
     float best_cost = in_cost.read(gid).r;
 
-    // 以下三个参数在**当前简化实现**中未被读取，显式标注以说明不是遗漏：
+    // 以下两个参数在**当前简化实现**中未被读取，显式标注以说明不是遗漏：
     //   src_rgb —— NCC 代价需要，但 NCC 聚合尚未接入（见下方 SOURCE-TODO）
     //   views   —— 候选视图投影需要，同上
-    //   tid     —— threadgroup 共享内存索引，共享内存未启用（见文件头）
-    (void)tid;
+    // （原第三个 `tid` 已随签名一并移除 —— MSL 不允许标量与向量位置内建混用，
+    //   而 2D 的 `gid` 必须保留；详见 kernel 签名上方的说明。）
     (void)src_rgb;
     (void)views;
 
@@ -216,10 +240,15 @@ kernel void recon_mvs_subpixel(texture2d<float, access::read>  in_cost  [[textur
 // 依赖**全部源视图**的深度图（docs/05 §5.9.3：CB-4 必须等待所有源视图完成）。
 // 对每个像素：把参考帧的深度投影到源视图，取源视图深度，再反投影回参考帧，
 // 若往返误差超过 `geo_consistency_pct` 则判为不一致（遮挡/错误匹配）。
+//
+// ⚠️ 纹理槽位：`array<texture2d, 8> [[texture(1)]]` 会占用槽位 1..8，
+//    故两个写纹理必须排在其后（9 / 10）。理由详见上方 `recon_mvs_patchmatch`
+//    签名处的「纹理槽位排布」段。Vulkan 侧的 binding 是描述符数组、只占一个，
+//    故两侧的**编号不同是有意的**（槽位语义不同），共享的只是「顺序与角色」。
 kernel void recon_mvs_consistency(texture2d<float, access::read>  in_invz  [[texture(0)]],
                                   array<texture2d<float, access::read>, 8> src_depth [[texture(1)]],
-                                  texture2d<float, access::write> out_depth [[texture(2)]],
-                                  texture2d<float, access::write> out_conf  [[texture(3)]],
+                                  texture2d<float, access::write> out_depth [[texture(9)]],
+                                  texture2d<float, access::write> out_conf  [[texture(10)]],
                                   constant ReconMvsGpuParams&     p        [[buffer(0)]],
                                   constant ReconViewParams*       views    [[buffer(1)]],
                                   uint2 gid [[thread_position_in_grid]])
@@ -335,8 +364,14 @@ kernel void recon_mvs_fuse_voxel(texture2d<float, access::read>  depth     [[tex
 // CB-6 融合归约 + 一致性检查：产出 D_r / C_r / 支撑视图数
 // docs/05 §5.10 输出契约
 // ---------------------------------------------------------------------------
-kernel void recon_mvs_reduce(device   const atomic_float* voxel_sum [[buffer(0)]],
-                             device   const atomic_float* voxel_w   [[buffer(1)]],
+//
+// ⚠️ 两个体素缓冲声明为 **非 const** `device atomic_float*`（而非
+//    `device const atomic_float*`）：`atomic_load_explicit` 在不同 MSL 版本里的
+//    形参 const 限定不一致，非 const 实参对两种签名都能绑定，是唯一稳妥的写法。
+//    （Vulkan 侧对应声明为 `readonly buffer`，那是 GLSL 的描述符限定；
+//     MSL 与 GLSL 在这一点的写法差异**不构成语义差异** —— 两者都只读不写。）
+kernel void recon_mvs_reduce(device   atomic_float* voxel_sum [[buffer(0)]],
+                             device   atomic_float* voxel_w   [[buffer(1)]],
                              texture2d<float, access::write> out_depth [[texture(0)]],
                              texture2d<float, access::write> out_conf  [[texture(1)]],
                              texture2d<float, access::write> out_support [[texture(2)]],
@@ -347,8 +382,17 @@ kernel void recon_mvs_reduce(device   const atomic_float* voxel_sum [[buffer(0)]
     if (gid.x >= uint(size.x) || gid.y >= uint(size.y)) return;
 
     int idx = int(gid.y) * p.ref_width + int(gid.x);
-    float w = float(voxel_w[idx]);
-    float s = float(voxel_sum[idx]);
+    // ⚠️ `atomic_float` **不能**隐式或显式转换到 `float`（没有 conversion
+    //    operator），必须走显式的原子读：`atomic_load_explicit`。
+    //    原先写的 `float(voxel_w[idx])` 在 MSL 下报
+    //    "cannot convert 'const device metal::atomic_float' to 'float'
+    //     without a conversion operator"。
+    //    `memory_order_relaxed` 与此前的写入口径一致（仅需原子性、无需顺序），
+    //    与 Vulkan 侧「读回累加结果」的语义对应。
+    //    （平台差异的登记只在 `shaders/common/gpu_algo.h` 与两端公共头各一处 ——
+    //      **不得**在实现文件里再写一遍编号，否则会削弱 P10 判据的负向注入。）
+    float w = atomic_load_explicit(&voxel_w[idx], memory_order_relaxed);
+    float s = atomic_load_explicit(&voxel_sum[idx], memory_order_relaxed);
     if (w <= 0.0f) {
         out_depth.write(float4(0, 0, 0, 1), gid);
         out_conf.write(float4(0, 0, 0, 1), gid);

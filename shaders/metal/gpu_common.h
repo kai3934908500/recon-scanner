@@ -225,7 +225,17 @@ static inline float recon_rand01(uint seed) {
 }
 
 // 投影：相机系点 → 像素。返回 false 表示在相机后方。
-static inline bool recon_project(float3 pc, float4 intr, float2* out_uv) {
+//
+// ⚠️ MSL 要求**指针参数带显式地址空间限定符**（`thread` / `device` / `constant`
+//    / `threadgroup`）；裸 `float2*` 会报
+//    "pointer type must have explicit address space qualifier"。
+//    这里必须写 `thread float2*`，与 `shaders/vulkan/gpu_common.glsl` 的
+//    `out vec2 uv`（GLSL 无地址空间概念）语义对应 —— 该对应关系此前
+//    只写在 GLSL 侧的注释里，而 **MSL 侧漏写了限定符**，于是本机无 Metal
+//    编译器时从未暴露（2026-11-01 CI 首编即失败，见 LESSONS.md）。
+//    `thread` 是正确选择：所有调用点的实参都是 kernel 内的局部 `float2`
+//    （`thread` 地址空间），且该函数只读/写调用者自己的局部变量。
+static inline bool recon_project(float3 pc, float4 intr, thread float2* out_uv) {
     if (pc.z <= RECON_GPU_EPS_DEPTH) return false;
     out_uv->x = intr.x * pc.x / pc.z + intr.z;
     out_uv->y = intr.y * pc.y / pc.z + intr.w;
