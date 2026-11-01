@@ -132,44 +132,13 @@ fi
 # 这是**产物层**的 CT-6（源码层已由 shader_parity.py 覆盖）——
 # 两者都要有，因为"源码写对了但没编进去"是可能的（如某个 .metal
 # 被误排除出 SOURCES）。
+#
+# 判定逻辑收敛到 tools/check_metallib_symbols.py（单一实现）：
+# CI 的「校验 default.metallib」步骤调同一个工具，避免两处实现漂移。
 if [ -n "${PY}" ]; then
   echo "[metal-shaders] 3b) 产物函数覆盖检查"
-  # `xcrun metal-nm` 或 `strings` 都能看到 metallib 里的函数名；
-  # `strings` 更通用（不依赖 Xcode 版本提供的子工具）。
-  if command -v strings >/dev/null 2>&1; then
-    # ⚠️ 这段 python 从 **stdin** 读入（`python - <<EOF`），此时 `__file__`
-    #    **未定义** —— 若照抄常规脚本写法（`os.path.dirname(__file__)`）会抛
-    #    NameError。故改为经环境变量把仓库根传进去（见下方 RECON_SHADER_ROOT=）。
-    #    这是一个**只有真正跑到这一行才会暴露**的 bug，本机（无 xcrun）永远
-    #    跑不到 —— 正因如此才必须在代码里写清，而不是等真机阶段踩。
-    EXPECTED="$(RECON_SHADER_ROOT="${ROOT}" "${PY}" - <<'PYEOF'
-import re, os, sys
-root = os.environ.get("RECON_SHADER_ROOT")
-if not root:
-    sys.exit(0)
-p = os.path.join(root, "shaders", "common", "gpu_algo.h")
-try:
-    t = open(p, encoding="utf-8").read()
-except OSError:
-    sys.exit(0)
-body = re.sub(r"^\s*#\s*define[^\n]*RECON_GPU_ALGO[^\n]*$", "", t, flags=re.M)
-for n in re.findall(r"RECON_GPU_ALGO\(\s*(\w+)\s*\)\s*;", body):
-    print(n)
-PYEOF
-)"
-    MISSING=""
-    for fn in ${EXPECTED}; do
-      if ! strings "${OUT_DIR}/default.metallib" | grep -qx "${fn}"; then
-        MISSING="${MISSING} ${fn}"
-      fi
-    done
-    if [ -n "${MISSING}" ]; then
-      echo "[metal-shaders] FAIL：metallib 里找不到这些算法函数：${MISSING}"
-      echo "            （源码可能写对了但未被编入；检查 SOURCES 收集逻辑）"
-      exit 1
-    fi
-    echo "    ✓ 产物覆盖全部声明的算法函数"
-  fi
+  "${PY}" "${ROOT}/tools/check_metallib_symbols.py" \
+      --metallib "${OUT_DIR}/default.metallib" --repo-root "${ROOT}"
 fi
 
 SIZE="$(wc -c < "${OUT_DIR}/default.metallib" | tr -d ' ')"

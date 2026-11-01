@@ -387,39 +387,16 @@ jobs:
           fi
           echo "== metallib 大小 =="
           wc -c < "$MB"
-          # 清单同样从**权威源** shaders/common/gpu_algo.h 动态提取（该文件是
-          # 「机器可解析的单一来源」：`RECON_GPU_ALGO(名字)` 声明即注册），
-          # 不再硬编码 —— 漏一个函数在这里是**静默通过**，属最坏一类闸门缺陷。
-          FNS=$(sed -n 's/^[[:space:]]*RECON_GPU_ALGO(\(recon_[A-Za-z0-9_]*\)).*/\1/p' \
-                  shaders/common/gpu_algo.h | sort -u)
-          n_fns=$(echo "$FNS" | grep -c . || true)
-          if [ "$n_fns" -eq 0 ]; then
-            echo "::error::未能从 shaders/common/gpu_algo.h 解析出任何算法函数"
-            exit 1
-          fi
-          echo "== 算法函数覆盖（${n_fns} 个，来自 shaders/common/gpu_algo.h） =="
 
-          # 与上面 C ABI 检查同理：strings 输出虽比 nm 小，但**不得**用
-          # `strings | grep -qx`（pipefail + SIGPIPE 会误判）；且此处还要判**每一个**
-          # 函数，先用一次 strings 落盘，再逐名对文件 grep。
-          STR_LIST=$(mktemp)
-          trap 'rm -f "$STR_LIST" || true' EXIT
-          strings "$MB" > "$STR_LIST" 2>/dev/null || true
-
-          missing=0
-          for fn in $FNS; do
-            if ! grep -qx "$fn" "$STR_LIST"; then
-              echo "::error::metallib 缺少算法函数 $fn"
-              missing=$((missing + 1))
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::metallib 共缺 ${missing} 个算法函数（声明 ${n_fns} 个）"
-            echo "--- 产物中 recon_ 开头的字符串（供定位）---"
-            grep -oE "recon_[A-Za-z0-9_]+" "$STR_LIST" | sort -u || true
-            exit 1
-          fi
-          echo "OK: 声明的 ${n_fns} 个算法函数在 metallib 中全部存在"
+          # 算法函数覆盖判定收敛到 tools/check_metallib_symbols.py（**单一实现**）：
+          # 该脚本的步骤 3b 调同一个工具，避免两处实现漂移。
+          # 反面教材（本项目真实事故，勿重犯）：曾在此处硬编码 8 个函数名，
+          # 且用 `strings "$MB" | grep -qx "$fn"` —— 在 `set -o pipefail` 下
+          # **必然误判**（grep -q 命中即关闭读端 → strings 收 SIGPIPE 退出 141
+          # → pipefail 令整条管道非零 → `if !` 成立 → 报「缺少函数」）。
+          # 产物小于 64 KB 管道缓冲时侥幸不触发，metallib 一变大便必然炸。
+          # 工具内改为「读文件 → 内存精确比对」，不经管道。
+          python tools/check_metallib_symbols.py --metallib "$MB" --repo-root .
 
       - name: 上传 xcframework
         uses: actions/upload-artifact@v4
@@ -459,10 +436,36 @@ jobs:
           sudo xcode-select -s /Applications/Xcode_16.4.app
           xcodebuild -version
 
-      - uses: actions/download-artifact@v4
+      # ⚠️ `path` 必须**就是** xcframework 目录名，因为 artifact 里不带这一层。
+      #    CI 实证（build-app 第一轮失败即此）：upload-artifact 以「上传路径的公共
+      #    前缀」为基准打包，单目录 path 时该前缀即路径本身 → 目录**内容被展开到
+      #    archive 根**。实测上传 build/ios/ReconCore.xcframework 得到的 archive
+      #    条目是 `Info.plist` + `ios-arm64/...`（**没有** ReconCore.xcframework/
+      #    这一层）。若下载到 platform/ios/build/，解包后该目录并不存在，
+      #    xcodegen 便找不到 project.yml 声明的 platform/ios/build/ReconCore.xcframework，
+      #    报 `error: There is no XCFramework found at '.../ReconCore.xcframework'`。
+      #    download-artifact 的 `path` 是**目标目录**（不存在则创建），故直接把
+      #    目标目录命名为 .../ReconCore.xcframework 即可，内容正好落在其中。
+      #    这样修复点只在下载侧一处，不必在上传侧加暂存目录。
+      - name: 下载 xcframework 到工程声明的路径
+        uses: actions/download-artifact@v4
         with:
           name: ReconCore.xcframework
-          path: platform/ios/build/
+          path: platform/ios/build/ReconCore.xcframework
+
+      - name: 校验下载落位（缺一层就会在这里失败，而不是拖到 xcodebuild）
+        run: |
+          set -euo pipefail
+          XCF=platform/ios/build/ReconCore.xcframework
+          for f in Info.plist ios-arm64/libReconCore.a \
+                   ios-arm64_x86_64-simulator/libReconCore.a; do
+            if [ ! -e "$XCF/$f" ]; then
+              echo "::error::artifact 解包后缺少 ${XCF}/${f}（artifact 目录层被展开？）"
+              find platform/ios/build -maxdepth 3 | sort || true
+              exit 1
+            fi
+          done
+          echo "OK: xcframework 落位正确"
 
       - uses: actions/download-artifact@v4
         with:
