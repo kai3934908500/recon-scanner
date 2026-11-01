@@ -78,9 +78,9 @@ using recon::DupCStr;
 
 extern "C" {
 
-uint32_t recon_abi_version(void) { return RECON_ABI_VERSION; }
+RECON_API uint32_t recon_abi_version(void) { return RECON_ABI_VERSION; }
 
-recon_status recon_create(const recon_config* config, void** out_context) {
+RECON_API recon_status recon_create(const recon_config* config, void** out_context) {
   if (out_context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   *out_context = nullptr;
 
@@ -99,24 +99,24 @@ recon_status recon_create(const recon_config* config, void** out_context) {
   }
 }
 
-void recon_destroy(void* context) {
+RECON_API void recon_destroy(void* context) {
   delete ToContext(context);
 }
 
-void recon_free_string(char* str) {
+RECON_API void recon_free_string(char* str) {
   if (str != nullptr) {
     std::free(str);
   }
 }
 
-void recon_free_buffer(void* buffer, size_t size) {
+RECON_API void recon_free_buffer(void* buffer, size_t size) {
   (void)size;
   if (buffer != nullptr) {
     std::free(buffer);
   }
 }
 
-recon_status recon_probe_capability(void* context, recon_capability* out_capability) {
+RECON_API recon_status recon_probe_capability(void* context, recon_capability* out_capability) {
   if (context == nullptr || out_capability == nullptr) {
     return RECON_ERR_INVALID_ARGUMENT;
   }
@@ -128,7 +128,7 @@ recon_status recon_probe_capability(void* context, recon_capability* out_capabil
   });
 }
 
-recon_status recon_set_param(void* context, const char* key, int32_t value_int,
+RECON_API recon_status recon_set_param(void* context, const char* key, int32_t value_int,
                              double value_double) {
   if (context == nullptr || key == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
@@ -152,7 +152,7 @@ recon_status recon_set_param(void* context, const char* key, int32_t value_int,
   });
 }
 
-recon_status recon_get_param(void* context, const char* key,
+RECON_API recon_status recon_get_param(void* context, const char* key,
                              int32_t* out_value_int, double* out_value_double) {
   if (context == nullptr || key == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
@@ -167,7 +167,7 @@ recon_status recon_get_param(void* context, const char* key,
   });
 }
 
-recon_status recon_apply_preset(void* context, int32_t preset) {
+RECON_API recon_status recon_apply_preset(void* context, int32_t preset) {
   if (context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   if (preset < 0 || preset > 2) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
@@ -177,7 +177,7 @@ recon_status recon_apply_preset(void* context, int32_t preset) {
   });
 }
 
-recon_status recon_export_params(void* context, char** out_json) {
+RECON_API recon_status recon_export_params(void* context, char** out_json) {
   if (context == nullptr || out_json == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   *out_json = nullptr;
   Context* ctx = ToContext(context);
@@ -190,7 +190,7 @@ recon_status recon_export_params(void* context, char** out_json) {
   });
 }
 
-recon_status recon_start_session(void* context, const char* session_id) {
+RECON_API recon_status recon_start_session(void* context, const char* session_id) {
   if (context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -206,7 +206,7 @@ recon_status recon_start_session(void* context, const char* session_id) {
   });
 }
 
-recon_status recon_push_frame(void* context, const recon_frame_packet* packet) {
+RECON_API recon_status recon_push_frame(void* context, const recon_frame_packet* packet) {
   if (context == nullptr || packet == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -229,7 +229,7 @@ recon_status recon_push_frame(void* context, const recon_frame_packet* packet) {
   });
 }
 
-recon_status recon_finish_capture(void* context) {
+RECON_API recon_status recon_finish_capture(void* context) {
   if (context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -238,7 +238,7 @@ recon_status recon_finish_capture(void* context) {
   });
 }
 
-recon_status recon_get_scan_stats(void* context, recon_scan_stats* out_stats) {
+RECON_API recon_status recon_get_scan_stats(void* context, recon_scan_stats* out_stats) {
   if (context == nullptr || out_stats == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -247,7 +247,7 @@ recon_status recon_get_scan_stats(void* context, recon_scan_stats* out_stats) {
   });
 }
 
-recon_status recon_run_reconstruction(void* context, recon_progress_cb progress_cb,
+RECON_API recon_status recon_run_reconstruction(void* context, recon_progress_cb progress_cb,
                                       recon_status_cb status_cb, recon_log_cb log_cb,
                                       void* user_data) {
   if (context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
@@ -272,7 +272,7 @@ recon_status recon_run_reconstruction(void* context, recon_progress_cb progress_
   });
 }
 
-recon_status recon_calibrate_scale(void* context,
+RECON_API recon_status recon_calibrate_scale(void* context,
                                     const recon_frame_packet* reference_frame,
                                     const double* detected_corners,
                                     int32_t reference_type, double ref_width_mm,
@@ -335,7 +335,7 @@ recon_status recon_calibrate_scale(void* context,
   });
 }
 
-recon_status recon_set_manual_scale(void* context, double scale,
+RECON_API recon_status recon_set_manual_scale(void* context, double scale,
                                      recon_scale_result* out_result) {
   if (context == nullptr || out_result == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
@@ -350,7 +350,7 @@ recon_status recon_set_manual_scale(void* context, double scale,
   });
 }
 
-recon_status recon_get_mesh_info(void* context, recon_mesh_info* out_info) {
+RECON_API recon_status recon_get_mesh_info(void* context, recon_mesh_info* out_info) {
   if (context == nullptr || out_info == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -359,7 +359,7 @@ recon_status recon_get_mesh_info(void* context, recon_mesh_info* out_info) {
   });
 }
 
-recon_status recon_export(void* context, const recon_export_options* options) {
+RECON_API recon_status recon_export(void* context, const recon_export_options* options) {
   if (context == nullptr || options == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
@@ -447,14 +447,14 @@ recon_status recon_export(void* context, const recon_export_options* options) {
   });
 }
 
-recon_status recon_cancel(void* context) {
+RECON_API recon_status recon_cancel(void* context) {
   if (context == nullptr) return RECON_ERR_INVALID_ARGUMENT;
   Context* ctx = ToContext(context);
   ctx->cancel_flag().store(true, std::memory_order_relaxed);
   return RECON_OK;
 }
 
-int32_t recon_is_cancelled(void* context) {
+RECON_API int32_t recon_is_cancelled(void* context) {
   if (context == nullptr) return 0;
   return ToContext(context)->IsCancelled() ? 1 : 0;
 }

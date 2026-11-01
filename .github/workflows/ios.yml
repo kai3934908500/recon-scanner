@@ -315,12 +315,28 @@ jobs:
                   "$XCF/ios-arm64_x86_64-simulator/Headers"
           echo "HEADERS IDENTICAL"
 
-          echo "== 三个库的符号是否都在（防止 libtool 合并丢成员） =="
-          for sym in recon_create recon_session_get_status; do
-            if ! nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -q "$sym"; then
-              echo "::error::合并后的归档缺少 C ABI 符号 $sym"
+          echo "== C ABI 符号是否都在（防止 libtool 合并丢成员） =="
+          # 符号名必须取自 core/include/recon/recon_c_api.h 的**真实导出清单**
+          # （共 21 个）。此前这里写的是 recon_session_get_status —— 该函数在头文件里
+          # **根本不存在**（全仓库仅有本处提及），属「闸门引用了不存在的符号」，
+          # 同类还有 docs/12 §4.2 的 recon/types.h 与桥接头注释里的
+          # RECON_BUILD_XCFRAMEWORK。因为脚本是 set -e，循环在第一个符号
+          # （recon_create）就退出了，这个错误符号此前从未被执行到，故一直未暴露。
+          #
+          # Mach-O 的 C 符号是 `_recon_create`，`[ _]` 前缀兼容有/无下划线；
+          # `$` 锚定行尾，避免 recon_create 误配到 recon_create_xxx 之类前缀符号。
+          for sym in recon_create recon_destroy recon_abi_version \
+                     recon_probe_capability recon_push_frame recon_run_reconstruction \
+                     recon_finish_capture recon_export; do
+            if ! nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -q "[ _]${sym}$"; then
+              echo "::error::合并后的归档缺少 C ABI 符号 ${sym}"
+              echo "--- 归档实际 external 符号（前 60 行，供定位）---"
+              nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | head -60 || true
+              echo "--- 归档全部符号中 recon_ 开头的 ---"
+              nm "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -i "recon_" | head -40 || true
               exit 1
             fi
+            echo "  ✓ ${sym}"
           done
           echo "OK: C ABI 符号存在"
 
