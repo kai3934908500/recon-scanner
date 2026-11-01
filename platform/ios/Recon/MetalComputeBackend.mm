@@ -129,31 +129,60 @@ QuantRange RangeFromFormat(OSType fmt, bool *known) {
     return QuantRange::kFull;   // 保守默认（iOS ARKit 实为 full）
 }
 
-// 由 `kCVImageBufferYCbCrMatrix` attachment 选 BT.601 / BT.709。
+// 由 `kCVImageBufferYCbCrMatrixKey` attachment 选 BT.601 / BT.709。
 // `known == false` 表示附件缺失或取值不认识 → 用 601 并记原因。
+//
+// ── ⚠️ 两处 API 名字/版本错误（2026-11-01 CI 第三轮实证）────────────────────
+// ① **key 的名字带 `Key` 后缀**：CoreVideo 里是
+//    `kCVImageBufferYCbCrMatrixKey`（CFString，用作附件查询键）。
+//    原先写的 `kCVImageBufferYCbCrMatrix`（无 `Key`）**根本不存在** ——
+//    CI 原文：use of undeclared identifier 'kCVImageBufferYCbCrMatrix';
+//    did you mean 'kCVImageBufferYCbCrMatrixKey'?
+//    注意区分：`kCVImageBufferYCbCrMatrix_ITU_R_601_4` / `_ITU_R_709_2`
+//    是**取值**（附件的内容），它们的名字是对的，不要跟着一起改。
+//
+// ② **`CVBufferGetAttachment` 在 iOS 15.0 起弃用**（官方标注
+//    API_DEPRECATED_WITH_REPLACEMENT("CVBufferCopyAttachment",
+//    ios(4.0,15.0))）。本项目部署目标正是 15.0 → 该弃用警告会**发出**，
+//    而上层 App 容器开了 `GCC_TREAT_WARNINGS_AS_ERRORS`（零警告标准），
+//    警告即错误。故改用 `CVBufferCopyAttachment`。
+//
+// ③ **`Copy` 是所有权约定**：返回对象由**调用者持有**，必须 CFRelease；
+//    而 Get 版是"借用"、不得释放。照搬旧代码的"用完不管"会**每帧泄漏**
+//    （这是每帧都走的 GPU 路径，泄漏会持续累积）。故下方用**单出口**结构
+//    配平释放，而不是在三处早退里各写一次 CFRelease。
 ColorMatrix MatrixFromAttachment(CVPixelBufferRef buf, bool *known,
                                  std::string *reason) {
-    CFTypeRef raw = CVBufferGetAttachment(buf, kCVImageBufferYCbCrMatrix, nullptr);
-    *known = true;
+    CFTypeRef raw = CVBufferCopyAttachment(buf, kCVImageBufferYCbCrMatrixKey,
+                                           nullptr);
+
+    // 无附件 → 假设 BT.601，并记录原因（调用方会把它带进 fallbackReason）。
+    // 本路径上 `raw` 必为 nullptr，无需释放。
     if (raw == nullptr) {
         *known = false;
         if (reason) *reason = "YCbCrMatrix 附件缺失，按 BT.601（**这是一个假设**）";
         return ColorMatrix::kBt601;
     }
+
     // 附件是 CFString。用桥接比较避免手写 CFString 字面量比较。
     NSString *s = (__bridge NSString *)raw;
+    ColorMatrix result = ColorMatrix::kBt601;   // 保守默认（BT.601）
+    bool recognized = true;
     if ([s isEqualToString:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2]) {
-        return ColorMatrix::kBt709;
+        result = ColorMatrix::kBt709;
+    } else if ([s isEqualToString:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_601_4]) {
+        result = ColorMatrix::kBt601;
+    } else {
+        recognized = false;
+        if (reason) {
+            *reason = [NSString stringWithFormat:
+                @"未知的 YCbCrMatrix（%@），按 BT.601", s].UTF8String;
+        }
     }
-    if ([s isEqualToString:(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_601_4]) {
-        return ColorMatrix::kBt601;
-    }
-    *known = false;
-    if (reason) {
-        *reason = [NSString stringWithFormat:
-            @"未知的 YCbCrMatrix（%@），按 BT.601", s].UTF8String;
-    }
-    return ColorMatrix::kBt601;
+
+    *known = recognized;
+    CFRelease(raw);   // 单出口释放：与 CVBufferCopyAttachment 的 Copy 约定配平。
+    return result;
 }
 
 // 把 `BgraFrame` 转成 ObjC 结果对象。
