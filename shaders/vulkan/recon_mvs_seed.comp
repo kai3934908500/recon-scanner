@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_seed.comp — CB-1 播种（Vulkan 实现）
+//
+// 契约：docs/05_单目管线.md §5.9（GPU 实现）、docs/05 §5.3.3（播种算法）、
+//       docs/12 §4.4（算法同源、两端分别编译）。
+//
+// 函数名 `recon_mvs_seed` 必须与 `shaders/common/gpu_algo.h` 的
+// `RECON_GPU_ALGO(recon_mvs_seed)` 及 `shaders/metal/mvs.metal` 的
+// `kernel void recon_mvs_seed(...)` **逐字相同**（docs/12 MT-3），
+// 由 `tools/shader_parity.py` 校验（docs/14 CT-6）。
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+// `vkCmdDispatch(ceil(W/8), ceil(H/8), 1)`，local_size = 8×8×1 = 64。
+// 逐线程处理一个像素（不是 tile）：播种阶段计算量小，无需 halo 复用。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams
+// set 0 binding 1  → SSBO  ReconViewParams[]（本 pass 未用，但布局与其它
+//                          pass 保持统一，避免 descriptor set 在 pass 间
+//                          反复重建；`views` 在此显式标注为未使用）
+// set 0 binding 2  → 纹理  sparse_depth（r32f，来自 SfM/VIO 的稀疏深度，无效处为 0）
+// set 0 binding 3  → 纹理  rgb_ref（r8 或 r32f，参考帧灰度；
+//                          灰度转换在 C++ 侧做，避免 GPU 内重复色彩变换）
+// set 0 binding 4  → 存储图像 out_invz（r32f）逆深度初值，0 = 无效
+// set 0 binding 5  → 存储图像 out_cost（r32f）初始代价
+//
+// ⚠️ 为什么用 `imageStore` 而非 `imageAtomic*`：本 pass 每像素写一次，
+// 无写冲突，普通存储图像即可（`layout(r32f)`），不需要原子 → 不需要
+// `shaderImageFloat32Atomics` 能力。
+//
+// ── 精度 ──────────────────────────────────────────────────────────────────
+// 全部用 `float`。理由见 `shaders/common/gpu_algo.h` 的「精度约定」段：
+// docs/05 §5.9.1 与 docs/12 对视差精度用 f16 还是 f32 **互相矛盾**，
+// 本项目取保守者（float32），fp16 由运行期能力探测决定（当前未启用）。
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ViewsBlock {
+    ReconViewParams views[];
+};
+
+// 输入纹理：一律 `texelFetch`（最近邻、无过滤、不依赖 sampler）——
+// 见 gpu_common.glsl 的 VK-DIFF-4（docs/04 §4.6.1 要求深度图最近邻）。
+layout(set = 0, binding = 2) uniform texture2D sparse_depth;
+layout(set = 0, binding = 3) uniform texture2D rgb_ref;
+
+layout(r32f, set = 0, binding = 4) uniform image2D out_invz;
+layout(r32f, set = 0, binding = 5) uniform image2D out_cost;
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_seed(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_seed(ivec2 gid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    float d = texelFetch(sparse_depth, gid, 0).r;
+
+    // 播种：有稀疏深度就用它的逆深度；否则置 0（无效），
+    // 由后续的红黑传播从邻居扩散填洞。
+    float iz = 0.0;
+    if (d > p.depth_min_m && d < p.depth_max_m) {
+        iz = recon_depth_to_invz(d);
+    }
+    imageStore(out_invz, gid, vec4(iz, 0.0, 0.0, 1.0));
+
+    // 初始代价：无支撑视图时置极大（正无穷会污染后续 mix，用大常数）。
+    imageStore(out_cost, gid, vec4(RECON_GPU_COST_INF, 0.0, 0.0, 1.0));
+
+    // 关于 `rgb_ref` 与 `views`：本 pass **不读取**它们 ——
+    //   - 初始代价恒为「极大」（等 CB-2 的 NCC 评估替换）→ 无需参考帧灰度；
+    //   - 视图参数由 CB-2 / CB-4 使用。
+    // 保留这两个 binding 的唯一目的是让 descriptor set 布局在六个 pass 间
+    // **完全一致**（C++ 侧只建一个 descriptor set layout，不必逐 pass 重建）。
+    //
+    // ⚠️ 这里**不写** `(void)rgb_ref;` 之类的占位：GLSL（与 MSL 不同）的对象
+    // **没有** `(void)` 强制转换，写了会直接编译失败。GLSL 编译器会自动剥离
+    // 未被读取的 uniform，因此「不引用」就是正确且无警告的写法。
+}
+
+void main() {
+    // `gl_GlobalInvocationID` → 像素坐标。二维分派下 .z 恒为 0。
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    recon_mvs_seed(gid);
+}

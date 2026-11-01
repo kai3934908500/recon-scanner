@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// module.modulemap — 把 core 的 C ABI 暴露为 Swift 可 import 的模块。
+//
+// 契约：docs/12_构建与打包.md §4.2（Swift / C++ 混编配置）。
+//
+// 为什么需要它：Swift 无法直接 `#include` C 头，必须经由 Clang module。
+// 本文件随 `ReconCore.xcframework` 的 Headers 目录分发（docs/12 §4.3 的产物
+// 结构要求 `Headers/module.modulemap` 存在），并**必须逐字节地**出现在两个
+// slice 中 —— 这正是 §4.3 XC-1 用 `diff -r` 校验的那份文件。
+//
+// ── 与 docs/12 §4.2 的一处偏差（已登记，非疏漏）───────────────────────
+// 该节示例写的是三个 header（`recon_c_api.h` / `recon/types.h` /
+// `recon/status.h`）。但**后两个文件在仓库中不存在**：实地核查
+// `core/include/recon/` 下只有 25 个头，无 `types.h`、无 `status.h`；
+// 且 `core/include/recon/recon_c_api.h` 只 `#include <stddef.h>`、`<stdint.h>`
+// —— 它是**刻意自包含**的（这是「C ABI 是唯一跨语言边界 / POD-only 单头入口」
+// 这条铁律的实现方式，docs/00 §7.1）。
+//
+// 处置：**以可验证的现实为准**，本文件只列真实存在的那一个头；不去创建两个
+// 空壳头来迎合文档字面（那是「表面满足」，本项目明令禁止）。docs/12 §4.2 的
+// 示例待修订 —— 见 tools/check_ios_contract.py 的 G7，它同时校验本文件的
+// header 列表 **与磁盘实际情况一致**，从而防止此类漂移复发。
+//
+// ⚠️ 这里只暴露 C ABI 单一头。**不得**把任何 C++ 头（如 `recon/linalg.h`）
+//    加进来：一旦暴露，Swift 侧就可能直接依赖 C++ 类型，破坏
+//    「C ABI 是唯一跨语言边界」（docs/00 §7.1）这条铁律。
+
+module ReconCore {
+    header "recon/recon_c_api.h"
+    export *
+}

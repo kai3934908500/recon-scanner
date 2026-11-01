@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_tsdf_fuse.comp — TSDF 体素中心式融合（Vulkan 实现）
+//
+// 契约：docs/04_RGBD管线.md §4.6（GPU 实现）、docs/12 §4.4。
+//
+// 函数名 `recon_tsdf_fuse` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 为什么是体素中心式（voxel-centric）─────────────────────────────────────
+// docs/04 §4.6.2 明文选定，理由是**原子操作需求**：
+//
+//   体素中心式：每线程处理**一个体素** → 该体素本帧只被这一个线程写
+//               → S/W/C 的更新**不需要原子**；仅块分配需要原子。
+//   像素中心式：每线程处理一个像素 → 沿射线遍历体素、逐体素累加
+//               → S/W/C **全部需要浮点原子累积**，而 Vulkan 的 `atomicAdd`
+//                  若不启用扩展则**只对整型可用**（见
+//                  `recon_mvs_fuse_voxel.comp` 的 VK-DIFF-1）→ 方案不可行。
+//
+// 因此本 pass 与 MVS 融合的差异**不是风格**：
+//   `recon_mvs_fuse_voxel` 必须原子（像素中心式，多像素撞同体素）；
+//   `recon_tsdf_fuse`      **不需**原子（体素中心式，一体素一线程）。
+// 这个差异是**结构性收益**：S/W/C 的写入顺序不影响结果。
+//
+// ── 与 docs/04 §4.6.2 的流程逐条对应 ─────────────────────────────────────
+//   ① P_c = R_i · p_v + t_i           → recon_world_to_cam
+//   ② (u,v) = π_K(P_c)                → recon_project；P_c.z ≤ 0 或越界则跳过
+//   ③ d = D_i(u,v)  最近邻采样          → texelFetch（**不**插值）
+//   ④ 早退：|d − P_c.z| > μ → 跳过     ★ 把 99% 体素在第 ④ 步剔除
+//   ⑤ s = d − P_c.z；t = clamp(s/μ,−1,1)
+//   ⑥ 算权重 w（§2.4.4 映射链）
+//   ⑦ S += w·t ; W += w ; C += w·c
+//
+// ── 采样方式 ──────────────────────────────────────────────────────────────
+// docs/04 §4.6.1 硬要求「深度图必须用**最近邻**采样」；
+// 本文件用 `texelFetch`（最近邻、无过滤、不依赖 sampler），
+// 与 MSL 侧 `access::read` + `read(uint2)` **语义逐条对应**（VK-DIFF-4）。
+// 注意这与 docs/05 §5.9.1 表格写的「线性过滤」**冲突**，以 docs/04 §4.6.1
+// 的硬要求为准（深度图插值会造出不存在的中间深度）。
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+// `vkCmdDispatch(ceil(total/64), 1, 1)`，一维展开，每线程解出一个体素索引。
+// 用**一维**而非三维分派：移动端对三维分派的 z 维限制更紧（与 MSL 侧
+// `dispatchThreads(grid_dim)` 的取舍相同，见 tsdf.metal 注释）。
+// local_size 仍是 64（8×8×1），与 MVS 侧统一（docs/05 §5.9.1）。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconTsdfGpuParams
+// set 0 binding 1  → UBO   ReconViewParams（**单个**当前帧视图）
+// set 0 binding 2  → 纹理  src_depth（r32f，当前帧深度）
+// set 0 binding 3  → 纹理  src_rgb（rgb8，当前帧颜色）
+// set 0 binding 4  → SSBO  tsdf_s（float，截断符号距离累加）
+// set 0 binding 5  → SSBO  tsdf_w（float，权重累加）
+// set 0 binding 6  → SSBO  tsdf_c（float，颜色累加；当前**单通道占位**）
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（与 MSL 侧 SOURCE-TODO-TSDF-1..4 **一一对应**）
+// ══════════════════════════════════════════════════════════════════════════
+// 已实现：七步流程、最近邻采样、早退、截断、权重映射链、体素线性索引解码、
+//         **无原子写入**（体素中心式的结构性结果，不是遗漏）。
+//
+// 未实现：
+//   SOURCE-TODO-TSDF-1  块分配原子（docs/04 §4.6.4）。当前假设块已在 C++ 侧预分配
+//                  （`block_count` 由 params 给出），故本文件**没有原子操作**。
+//                  接入块分配器后需新增 CAS（`atomicCompSwap`）。
+//   SOURCE-TODO-TSDF-2  颜色为**单通道**占位。真实实现按 3 通道存
+//                  （`tsdf_c` 需 3 倍长度或 vec3）。此处单通道是**明确缩写**，
+//                  不是"忘了第三通道"。
+//   SOURCE-TODO-TSDF-3  体素法向未计算，视角权重用「视线与光轴夹角余弦」近似。
+//   SOURCE-TODO-TSDF-4  未做 halo 跨块邻域查询（`SurfaceGradient` 需要）。
+//
+// ⚠️ 因此**不得**声称本 pass 可用于量产 RGBD 融合。真机验收项
+//    （docs/14 §5.3 GPU 行）需要显存实测，本轮**从未执行过**。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconTsdfGpuParams p;
+};
+
+// 单个视图参数（**不是数组**）：与 MSL 侧 `constant ReconViewParams& view`
+// 严格对应。TSDF 是逐帧融合，一次 dispatch 只处理当前帧的一个视图。
+layout(set = 0, binding = 1, std140) uniform ViewBlock {
+    ReconViewParams view;
+};
+
+layout(set = 0, binding = 2) uniform texture2D src_depth;
+layout(set = 0, binding = 3) uniform texture2D src_rgb;
+
+layout(std430, set = 0, binding = 4) buffer TsdfSBlock { float tsdf_s[]; };
+layout(std430, set = 0, binding = 5) buffer TsdfWBlock { float tsdf_w[]; };
+layout(std430, set = 0, binding = 6) buffer TsdfCBlock { float tsdf_c[]; };
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_tsdf_fuse(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_tsdf_fuse(uint gid) {
+    // --- 体素线性索引 → 三维坐标 ------------------------------------------
+    // 与 MSL 侧**同一解码式**（x 最快、然后 y、最后 z），否则两端写入的
+    // 体素在网格里的位置会不同 —— 这是静默的语义分叉。
+    int dimx = p.grid_dim_x;
+    int dimy = p.grid_dim_y;
+    int dimz = p.grid_dim_z;
+    int total = dimx * dimy * dimz;
+    if (int(gid) >= total) return;
+
+    int vz = int(gid) / (dimx * dimy);
+    int rest = int(gid) - vz * dimx * dimy;
+    int vy = rest / dimx;
+    int vx = rest - vy * dimx;
+
+    // --- ① 体素中心的世界坐标 → 相机系 ------------------------------------
+    // 体素中心：origin + (index + 0.5) × voxel_size。`+0.5` 是体素中心式的
+    // 定义要点（若省掉，整个 TSDF 会整体偏移半个体素 → 表面系统性外移）。
+    vec3 pw = vec3(p.origin_x + (float(vx) + 0.5) * p.voxel_size_m,
+                   p.origin_y + (float(vy) + 0.5) * p.voxel_size_m,
+                   p.origin_z + (float(vz) + 0.5) * p.voxel_size_m);
+    vec3 pc = recon_world_to_cam(view.Rt, pw);
+
+    // --- ② 投影；P_c.z ≤ 0 或越界 → 跳过 ---------------------------------
+    vec2 uv;
+    if (!recon_project(pc, view.intrinsics, uv)) return;
+    vec2 dsize = view.size_depth.xy;
+    if (!recon_in_image(uv, dsize)) return;
+
+    // 深度范围门限（docs/04 §4 的 min_depth_m / max_depth_m）。
+    if (pc.z < p.min_depth_m || pc.z > p.max_depth_m) return;
+
+    // --- ③ 最近邻查深度；无效则跳过 ---------------------------------------
+    // `texelFetch` = 最近邻（**不**插值），docs/04 §4.6.1 的硬要求。
+    ivec2 pix = ivec2(uv);
+    float d = texelFetch(src_depth, pix, 0).r;
+    if (d <= p.min_depth_m || d >= p.max_depth_m) return;
+
+    // --- ④ 早退：|d − P_c.z| > μ → 跳过（剔除 99% 体素）-------------------
+    float mu = p.truncation_m;
+    float s = d - pc.z;
+    if (abs(s) > mu) return;
+
+    // --- ⑤ 截断与归一化 ---------------------------------------------------
+    float t = clamp(s / mu, -1.0, 1.0);
+
+    // --- ⑥ 权重（docs/04 §2.4.4 映射链）-----------------------------------
+    // 视角权重：体素法向未计算（SOURCE-TODO-TSDF-3），用视线与光轴的夹角余弦近似。
+    float cos_theta = clamp(pc.z / max(length(pc), RECON_GPU_EPS_DEPTH), 0.0, 1.0);
+    float w = recon_tsdf_weight(t, cos_theta, p.weight_mode);
+    if (w <= 0.0) return;
+
+    // --- ⑦ 更新自身（**体质中心式**：本帧只有本线程写这三个量，无需原子）---
+    int idx = int(gid);
+    // 颜色同样用最近邻像素（TSDF 颜色只是低频底色，docs/04 §4.5 边界说明）。
+    vec3 c = texelFetch(src_rgb, pix, 0).rgb;
+
+    tsdf_s[idx] += w * t;
+    tsdf_w[idx] += w;
+    tsdf_c[idx] += w * c.r;   // 单通道占位；真实实现按 3 通道存（SOURCE-TODO-TSDF-2）
+}
+
+void main() {
+    // 一维展开：`local_size = (8, 8, 1)`（与 MVS 侧统一 64 线程），
+    // 故线性体素索引 = workgroup 序号 × 64 + threadgroup 内线性序号。
+    //
+    // ⚠️ **不能**用 `gl_GlobalInvocationID.x`：在 `local_size_x = 8` 下
+    //    它的上界是 `8 × workgroup 数`，只有 total/8 个线程拿到有效索引，
+    //    **余下 7/8 的体素永远不会被处理** —— 而且不会报错，是静默丢数据。
+    //    正确的 1D 映射必须用 `gl_WorkGroupID.x × 64 + gl_LocalInvocationIndex`，
+    //    由 C++ 侧 `vkCmdDispatch(ceil(total/64), 1, 1)` 配合。
+    //    这是本文件最容易写错的一行，也是最容易被静态检查漏掉的一行。
+    uint gid = gl_WorkGroupID.x * uint(RECON_VK_WORKGROUP_1D) + gl_LocalInvocationIndex;
+    recon_tsdf_fuse(gid);
+}

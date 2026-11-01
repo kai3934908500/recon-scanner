@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// settings.gradle — Android 工程入口。
+// 契约：docs/12_构建与打包.md §3.4。
+//
+// 单一模块 :app。native 侧不由 Gradle 定义 target —— 仓库根 CMakeLists.txt
+// 是唯一真源（B-1），Gradle 只负责把 toolchain 与参数透传过去。
+
+pluginManagement {
+    repositories {
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "recon"
+include ':app'

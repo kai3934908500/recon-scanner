@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  Info.plist — iOS 应用配置。
+  契约：docs/11_平台权限与集成.md §1.1（决策总表）、§1.2（逐项清单）、§1.4（其余键）。
+
+  零网络 / 不录音 / 不读相册 / 不追踪：Info.plist 中不出现对应键。
+-->
+<plist version="1.0">
+<dict>
+	<!-- ===== 应用标识 ===== -->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>recon</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>10200</string>
+
+	<!-- ===== 权限用途文案（docs/11 §1.2 中文原文，英文由 InfoPlist.strings 覆盖）===== -->
+	<key>NSCameraUsageDescription</key>
+	<string>用于拍摄物体照片并在本机重建三维模型。照片与模型只保存在本机，不会上传到任何服务器。</string>
+	<key>NSMotionUsageDescription</key>
+	<string>用于读取陀螺仪与加速度计数据，把手机自身的运动记录成位姿，减少三维重建的漂移。数据只在本机处理。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>用于把导出模型的预览图保存到你的相册。应用不会读取相册中的任何内容。</string>
+
+	<!-- 明确不写入：NSMicrophoneUsageDescription / NSPhotoLibraryUsageDescription -->
+	<!-- 明确不写入：NSLocalNetworkUsageDescription / NSUserTrackingUsageDescription -->
+
+	<!-- ===== 出口合规（docs/11 §1.2）===== -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+
+	<!-- ===== 设备能力与方向（docs/11 §1.4）===== -->
+	<!-- 不含 arkit：ARKit 不可用时走 BRANCH_MONO，不能成为安装门槛 -->
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- ===== 文件共享（用户主动取走模型，不是 App 读用户文件）===== -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+
+	<!-- ===== 隐私清单（iOS 17+ 的 PrivacyInfo.xcprivacy 由资源打包，此处无需键）===== -->
+</dict>
+</plist>

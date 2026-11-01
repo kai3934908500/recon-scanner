@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_subpixel.comp — CB-3 亚像素细化（Vulkan 实现）
+//
+// 契约：docs/05 §5.9.2（CB-3）、docs/05 §5.5（`mvs_subpixel_*`）、docs/12 §4.4。
+//
+// 函数名 `recon_mvs_subpixel` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 抛物线的物理意义 ──────────────────────────────────────────────────────
+// 在代价函数的三个采样点上拟合二次曲线，取顶点作为亚像素极值。
+// 这一步是「0.15 px 视差精度」（docs/05 §5.1 的 `δd`）的**直接来源**：
+// 整数像素只能给 1 px，抛物线顶点把这个分辨率提升到亚像素。
+//
+// 顶点偏移：`δ = 0.5·(c₋ − c₊) / (c₋ − 2·c₀ + c₊)`
+// 分母 = 二阶差分（曲率）；越接近 0 表示三点近乎共线 → 拟合退化 → 取 δ = 0。
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+// 每次 tile dispatch 一次。逐线程一个像素。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams
+// set 0 binding 1  → SSBO  ReconViewParams[]（本 pass 未用；布局统一）
+// set 0 binding 2  → 存储图像 in_cost
+// set 0 binding 3  → 存储图像 in_invz
+// set 0 binding 4  → 存储图像 out_invz
+//
+// ⚠️ 与 MSL 侧的**一处刻意差异**（必须说明，否则会被当成漂移）：
+// MSL 侧 `recon_mvs_subpixel` 用 `texture2d<..., access::read>` + `.read()`；
+// Vulkan 侧用 `image2D` + `imageLoad()`。这是两端**访问机制的必然差异**
+// （Metal 的 texture 在 compute 里可读可写；Vulkan 的存储图像是 image），
+// 而**不是算法差异** —— 读取模式都在本文件内统一为最近邻 `imageLoad`，
+// 与 docs/04 §4.6.1「深度图不得插值」一致。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态
+// ══════════════════════════════════════════════════════════════════════════
+// 已实现：三采样点抛物线拟合、退化保护（分母阈值）、顶点越界钳制 [−1,1]、
+//         逆深度相对修正、无效格保持无效。
+//
+// 未实现（与 MSL 侧 SOURCE-TODO 一一对应）：
+//   `subpixel_fit_points`（拟合点数）与 `subpixel_iterations`（连续细化轮数）
+//   经 params 传入但**当前未被读取** —— 本实现固定做一次三点（水平方向）拟合。
+//   真实实现需要：① 点数可变（>3 点时做最小二乘而非三点公式）；
+//   ② 连续迭代（对同一格反复细化直到 δ 收敛）。
+//   与 MSL 侧**同步未实现**，不引入单侧差异。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ViewsBlock {
+    ReconViewParams views[];
+};
+
+// 成本图与逆深度图：**只读**（本 pass 不改代价，只按代价修正逆深度）。
+layout(r32f, set = 0, binding = 2) uniform readonly  image2D in_cost;
+layout(r32f, set = 0, binding = 3) uniform readonly  image2D in_invz;
+layout(r32f, set = 0, binding = 4) uniform writeonly image2D out_invz;
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_subpixel(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_subpixel(ivec2 gid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    // 三个采样点：当前、左邻、右邻（边界处退化为不细化）。
+    // 边界用的是**复制端点**（cm = cp = c0）而非 0：若填 0，在图像边缘
+    // 会造出一个虚假的强"极值"（代价从 0 突变），把 δ 拉满钳制值。
+    // MSL 侧采用完全相同的退化方式。
+    float c0 = imageLoad(in_cost, gid).r;
+    float cm = (gid.x > 0) ? imageLoad(in_cost, ivec2(gid.x - 1, gid.y)).r : c0;
+    float cp = (gid.x + 1 < p.ref_width) ? imageLoad(in_cost, ivec2(gid.x + 1, gid.y)).r : c0;
+
+    // 顶点偏移 δ = 0.5·(cm − cp) / (cm − 2·c0 + cp)
+    float denom = cm - 2.0 * c0 + cp;
+    float delta = 0.0;
+    if (abs(denom) > RECON_GPU_EPS_DENOM) {
+        delta = 0.5 * (cm - cp) / denom;
+        // 越界保护：顶点必须落在 [−1, 1]（否则拟合退化，保持原值）。
+        delta = clamp(delta, -1.0, 1.0);
+    }
+
+    float iz = imageLoad(in_invz, gid).r;
+    if (iz <= 0.0) {
+        imageStore(out_invz, gid, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // 把（亚像素）偏移写回为逆深度的相对修正。
+    // `subpixel_window_ratio` / `subpixel_fit_points` / `subpixel_iterations`
+    // 全部经 params 传入（MT-4），此处**不硬编码**任何比例。
+    // 当前只有 `subpixel_window_ratio` 被实际使用（见文件头「实现状态」）。
+    imageStore(out_invz, gid,
+               vec4(iz * (1.0 + delta * p.subpixel_window_ratio), 0.0, 0.0, 1.0));
+}
+
+void main() {
+    recon_mvs_subpixel(ivec2(gl_GlobalInvocationID.xy));
+}

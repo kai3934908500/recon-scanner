@@ -1,0 +1,149 @@
+# project.yml — Recon iOS App 容器定义（XcodeGen）
+#
+# 契约：docs/12_构建与打包.md §4.2（混编配置）、§4.6（部署目标 15.0）。
+#
+# 为什么需要本文件：UI 层（ui/ios/）与桥接层（platform/ios/Recon/）在仓库里是
+# **物理分离**的两个目录树，而 SwiftPM 不允许 target 源码位于包根之外，无法用
+# Package.swift 把它们拢成一个可构建的 App。XcodeGen 支持任意路径的源码引用，
+# 且生成物（.xcodeproj）不进仓库（属 CI 产物）。
+#
+# ── ⚠️ 生成命令必须带 --project-root 与 --project（一次真实事故，必读）──────
+#   XcodeGen 解析 spec 中的相对路径，**默认基准是 spec 文件所在目录**
+#   （即 platform/ios/Container/），而本文件里的路径全部是按**仓库根**写的。
+#   若不显式指定，会同时坏掉两件事：
+#     ① `sources`/`framework` 找不到源码与 xcframework（路径基准错了一层）；
+#     ② `SRCROOT` 变成 Container/，于是下面所有 `$(SRCROOT)/core/include`
+#        之类全部指向不存在的位置（SRCROOT = .xcodeproj 所在目录）。
+#   正确调用（在**仓库根**执行；--project 与 --project-root 都指向仓库根）：
+#
+#     xcodegen generate --spec platform/ios/Container/project.yml \
+#       --project . --project-root .
+#
+#   这样 .xcodeproj 落在仓库根 → SRCROOT = 仓库根 → 下面所有路径与
+#   `$(SRCROOT)/...` 同时成立。CI 见 .github/workflows/ios.yml 的 build-app job。
+#
+# ⚠️ 本文件由 tools/gen_ios_project.py 生成，请勿手改。
+
+name: Recon
+options:
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"                       # docs/12 §4.1
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"         # docs/12 §4.6
+    TARGETED_DEVICE_FAMILY: "1"                # 仅 iPhone
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"      # 零警告标准
+    GCC_TREAT_WARNINGS_AS_ERRORS: "YES"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    CLANG_ENABLE_MODULES: "YES"
+    ENABLE_BITCODE: "NO"                       # docs/12 §4.5
+    ONLY_ACTIVE_ARCH: "NO"
+    # 脚本阶段沙箱必须关掉（如实声明的例外，不是图省事）：
+    #   「Compile Metal Shaders」phase 要调用 tools/build_metal_shaders.sh，
+    #   该脚本会 `find shaders/metal/*.metal` 并写产物到 $(BUILT_PRODUCTS_DIR)。
+    #   开启沙箱（Xcode 15+ 的默认）会将其限制在声明的 in/out 范围内，而脚本
+    #   需要读仓库根的源码树 —— 表现为 "Sandbox: bash(...) deny file-read-data"。
+    #   替代方案是在 phase 里逐文件声明 inputFiles，但脚本用 find 动态收集，
+    #   手抄清单 = 第二事实来源（必然漂移，见 MEMORY.md）。故明确关闭。
+    #   ⚠️ Recon.xcconfig 里该键为 YES，但 xcconfig **未接入** project.yml
+    #      （见 configFiles 说明），故这里必须独立设置。
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    # UI 层引用 C ABI：经 bridging header（docs/12 §4.2）。
+    SWIFT_OBJC_BRIDGING_HEADER: "platform/ios/Recon/Recon-Bridging-Header.h"
+    # core 的 C ABI 头搜索路径。
+    #
+    # ⚠️ 必须同时包含 `platform/common/include` 与 `shaders/common`：
+    #   · 前者：`platform/ios/Recon/*.mm` 直接 `#include "recon_platform/xxx.h"`
+    #     复用平台无关规则本体（DepthConverter / ImuRingBuffer / YuvConverter）。
+    #   · 后者：`MetalComputeBackend.mm` `#include "gpu_algo.h"` 复用 GPU 参数块
+    #     的**唯一事实来源**（否则要在 host 侧手抄一份，必然漂移）。
+    #   缺任一项 → 真机构建报 "file not found"，而本机（Windows）**查不出**。
+    #   这些 `$(SRCROOT)/...` 只在 SRCROOT = 仓库根时成立（见文件头的调用说明）。
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/core/include"
+      - "$(SRCROOT)/platform/ios/ReconCore/include"
+      - "$(SRCROOT)/platform/common/include"
+      - "$(SRCROOT)/shaders/common"
+
+targets:
+  Recon:
+    type: application
+    platform: iOS
+    sources:
+      # 两个物理分离的源码树，一次拢进来。
+      - path: ui/ios/Recon/Sources
+      - path: platform/ios/Recon
+        excludes:
+          - "Info.plist"
+          - "Recon-Bridging-Header.h"   # 由 SWIFT_OBJC_BRIDGING_HEADER 指定
+      - path: ui/ios/Recon/Resources    # locales/*.json
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "cn.qingfeng.recon"
+        PRODUCT_NAME: Recon
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: "platform/ios/Recon/Info.plist"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      # 核心静态库：CMake 构建 + xcodebuild -create-xcframework 的产物。
+      # 由 CI 在 xcodegen 之前放到此路径（docs/12 §4.3）。
+      - framework: platform/ios/build/ReconCore.xcframework
+        embed: false
+        codeSign: false
+      # 系统框架：用 XcodeGen 的显式 SDK 依赖，而不是靠 Swift `import` 的隐式
+      # 自动链接 —— MetalComputeBackend.mm 是 ObjC++ 层，其 Metal/CoreVideo
+      # 符号必须显式链接（Swift 的自动链接只覆盖 Swift 侧 import 的模块）。
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: CoreVideo.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreMotion.framework
+      - sdk: ARKit.framework
+      - sdk: Photos.framework
+    # 「Compile Metal Shaders」Build Phase（docs/12 §4.4 的挂载表）。
+    # 用 preBuildScripts → 位于「Compile Sources」之前，符合该表要求。
+    # 脚本自己按 OUT_DIR(=BUILT_PRODUCTS_DIR/Contents/Resources) 定位产物，
+    # 并由 `RECON_REQUIRE_METAL=1` 保证「缺工具链即硬失败」而**不伪造空产物**
+    # （空 default.metallib 会被 makeDefaultLibrary() 当作「库在但无函数」，
+    #  比「找不到库」更难查 —— 见 MEMORY.md「静默丢弃最难查」）。
+    preBuildScripts:
+      - name: Compile Metal Shaders
+        script: |
+          set -euo pipefail
+          export RECON_REQUIRE_METAL=1
+          # SDK 跟随当前构建平台：真机用 iphoneos、模拟器用 iphonesimulator。
+          # 脚本内 `xcrun -sdk "$SDK" metal` 会按此选 SDK；写死 iphoneos 会让
+          # 模拟器构建拿到错的 SDK（表现为链接/加载期问题，而非编译期报错）。
+          export RECON_IOS_SDK="${PLATFORM_NAME}"
+          export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"
+          export RECON_METAL_AIR_DIR="${DERIVED_FILE_DIR}/metal-air"
+          bash "${SRCROOT}/tools/build_metal_shaders.sh"
+        basedOnDependencyAnalysis: false
+
+# 显式 scheme：`xcodebuild -scheme Recon` 需要有共享 scheme。
+# XcodeGen 会为 application target 自动生成 scheme，但**显式声明**才能保证
+# scheme 名稳定（自动生成的命名规则随版本可能变），CI 里不能赌默认值。
+schemes:
+  Recon:
+    build:
+      targets:
+        Recon: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

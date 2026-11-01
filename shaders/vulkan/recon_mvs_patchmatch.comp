@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_patchmatch.comp — CB-2 PatchMatch 主循环（Vulkan 实现）
+//
+// 契约：docs/05 §5.9.2（CB-2）、docs/05 §5.3.4（`mvs_pm_*`）、docs/12 §4.4。
+//
+// 函数名 `recon_mvs_patchmatch` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 红黑交替（为什么必须）─────────────────────────────────────────────────
+// `p.red_black` 决定本次处理红格还是黑格：
+//     is_red = ((x + y) & 1) == 0
+//     若 is_red != (p.red_black == 0) → 本线程早退
+// 红黑的意义是**消除传播顺序依赖**：若按行序传播，同一 dispatch 内相邻线程
+// 读到的可能是上一轮刚被同批线程改写的值，导致结果随线程调度变化（不可复现）。
+// 红黑把同行/同列的邻居隔开，使一轮内所有读（in_*）与写（out_*）互不依赖 ——
+// **这才是 ping-pong 双缓冲能被安全用作"单缓冲语义"的原因**。
+//
+// ── 为什么 in/out 分开（ping-pong）────────────────────────────────────────
+// 即使红黑隔离了同色格，跨色格仍需读到"上一轮"的值。故本 pass 严格
+// 「只读 in_*、只写 out_*」，由 C++ 侧在两次 dispatch 之间交换绑定
+// （Vulkan 侧即更新 descriptor set 或使用两个 set 交替绑定）。
+// 若把 in/out 指向同一图像，红黑隔离就会被破坏 → 结果不可复现。
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+// 每次迭代 dispatch **两次**（red_black = 0 再 1）；
+// 标档 4 迭代 → 8 次 dispatch（docs/05 §5.9.2 层次 3）。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams（含 red_black / rand_search_radius）
+// set 0 binding 1  → SSBO  ReconViewParams[]
+// set 0 binding 2  → 纹理  rgb_ref（参考帧灰度）
+// set 0 binding 3  → 采样纹理数组 src_rgb[]（源视图灰度，长度 = num_views）
+// set 0 binding 4  → 存储图像 in_invz / out_invz 见下方 ping-pong 说明
+// set 0 binding 5  → 存储图像 in_cost
+// set 0 binding 6  → 存储图像 out_invz
+// set 0 binding 7  → 存储图像 out_cost
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（与 MSL 侧**同步**，两边必须一致地"未完成"）
+// ══════════════════════════════════════════════════════════════════════════
+// 已实现：红黑读写分离、无效格从**只读**邻居借初值、按 `rand_search_radius`
+//         的随机搜索、深度范围门限、越界保护。
+//
+// 未实现（与 MSL 侧 SOURCE-TODO 一一对应；两端**必须同步**，否则两端
+// "算法同源"的契约就名存实亡）：
+//   SOURCE-TODO-MVS-1  NCC 代价聚合。本 pass 只做初值传播与随机搜索，
+//                  **没有**计算 patch 的 NCC 代价 → `photo_threshold` /
+//                  `patch_size` / `geo_consistency_pct` 尚未真正参与决策。
+//                  注：C-1 还要求用 `restart_ratio` 做随机重启，同样未接。
+//   SOURCE-TODO-MVS-2  共享内存（`shared`）缓存 halo。见 gpu_common.glsl
+//                  的 VK-DIFF-2：两端**统一**留待真机阶段，不做单侧"优化"。
+//   SOURCE-TODO-MVS-5  视图数组上界。GLSL 的采样器数组长度只能来自
+//                  `layout(constant_id=...)` 特化常量或编译期常量；此处
+//                  用编译期上界 `RECON_VK_MAX_VIEWS`（= 8，与
+//                  `mvs_num_views` 高档 8 一致），**未做运行期断言**。
+//                  与 MSL 侧 `array<...,8>` 的上界同值。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+// 视图数组编译期上界（SPECIALIZATION 替代：当前用编译期常量）。
+// 与 MSL 侧 `array<texture2d<...>, 8>` 的上界**同值**（闸门校验）。
+#define RECON_VK_MAX_VIEWS 8
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ViewsBlock {
+    ReconViewParams views[];
+};
+
+layout(set = 0, binding = 2) uniform texture2D rgb_ref;
+layout(set = 0, binding = 3) uniform texture2D src_rgb[RECON_VK_MAX_VIEWS];
+
+// ping-pong：in_* 只读、out_* 只写。
+// 这里用**两个独立图像**而不是同一图像的自读自写 —— 理由见文件头
+// 「为什么 in/out 分开」。
+layout(r32f, set = 0, binding = 4) uniform readonly  image2D in_invz;
+layout(r32f, set = 0, binding = 5) uniform readonly  image2D in_cost;
+layout(r32f, set = 0, binding = 6) uniform writeonly image2D out_invz;
+layout(r32f, set = 0, binding = 7) uniform writeonly image2D out_cost;
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_patchmatch(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_patchmatch(ivec2 gid, uint tid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    // 红黑：用 (x + y) 的奇偶判定本格颜色。
+    // 位运算与 MSL 侧**同式**（`((gid.x + gid.y) & 1u) == 0u`），
+    // 否则两端在同一 dispatch 里处理的是**不同的格**，结果会分叉。
+    bool is_red = (((gid.x + gid.y) & 1) == 0);
+    if (is_red != (p.red_black == 0)) return;
+
+    float best_iz   = imageLoad(in_invz, gid).r;
+    float best_cost = imageLoad(in_cost, gid).r;
+
+    // 传播候选：若本格无效（best_iz == 0），从**上一轮**的邻居借初值。
+    // 邻居取自 `in_*`（只读）而非 `out_*`，保证一轮内读写分离、结果可复现。
+    // 邻居取 (−1,0) 与 (0,−1)：与 C++/MSL 侧同一取法（同一逻辑只此一份语义）。
+    if (best_iz <= 0.0) {
+        ivec2 nb[2] = ivec2[2](gid + ivec2(-1, 0), gid + ivec2(0, -1));
+        for (int k = 0; k < 2; ++k) {
+            if (nb[k].x < 0 || nb[k].y < 0) continue;
+            float iz = imageLoad(in_invz, nb[k]).r;
+            if (iz > 0.0) { best_iz = iz; break; }
+        }
+    }
+
+    // 随机搜索：半径按迭代收缩。`rand_search_radius` 由 C++ 侧按当前迭代
+    // 算好传入 —— **不在此处用 iteration 自算**，避免两端公式不一致（MT-4）。
+    if (best_iz > 0.0) {
+        float r = recon_rand01((uint(gid.x) << 16) ^ uint(gid.y) ^ uint(p.red_black));
+        float lo = best_iz * (1.0 - p.rand_search_radius);
+        float hi = best_iz * (1.0 + p.rand_search_radius);
+        float cand = mix(lo, hi, r);
+        float z = recon_invz_to_depth(cand);
+        if (z > p.depth_min_m && z < p.depth_max_m) {
+            best_iz = cand;
+        }
+    }
+
+    imageStore(out_invz, gid, vec4(best_iz, 0.0, 0.0, 1.0));
+    imageStore(out_cost, gid, vec4(best_cost, 0.0, 0.0, 1.0));
+
+    // 关于未读取的输入（与 MSL 侧 `(void)tid/src_rgb/views` 语义对应）：
+    //   src_rgb / views → NCC 代价聚合需要，尚未接入（SOURCE-TODO-MVS-1）；
+    //   rgb_ref         → 同上（NCC 的参考帧侧）；
+    //   tid             → 共享内存索引，共享内存未启用（SOURCE-TODO-MVS-2）。
+    // GLSL 无 `(void)` 强制转换，不引用即可（编译器自动剥离）。
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    // `gl_LocalInvocationIndex` = threadgroup 内的线性索引（0..63）。
+    // 与 MSL 的 `thread_position_in_threadgroup` 对应；当前未使用
+    // （共享内存未启用），但**必须传下去**以保持两端签名一致。
+    uint tid = gl_LocalInvocationIndex;
+    recon_mvs_patchmatch(gid, tid);
+}

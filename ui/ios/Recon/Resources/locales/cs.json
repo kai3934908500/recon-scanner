@@ -1,0 +1,11 @@
+{
+  "_meta": {
+    "locale": "cs",
+    "language_zh": "捷克语",
+    "language_en": "Czech",
+    "rtl": false,
+    "translation_status": "pending",
+    "note": "译文尚未提供。按 docs/09 §6.1 的三级回退链，本 locale 缺键时会依次回退到 en-US、再回退到源语言 zh-CN，最后显示键名本身。本文件**刻意不预填任何 msg.* 键**，以免用机器翻译冒充已完成翻译。",
+    "required_keys_source": "zh-CN.json"
+  }
+}

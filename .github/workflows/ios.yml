@@ -1,0 +1,402 @@
+# iOS 构建与静态契约 CI（docs/12 §4、§6.2）
+#
+# 为什么需要 macOS runner：Xcode 仅 macOS（见 tools/check_ios_contract.py 文件头
+# 的背景说明）。Windows / Linux 上无法编译 iOS 二进制，也无法生成 xcframework。
+#
+# 本工作流分两个 job：
+#   static-contract  —— **跑在 ubuntu 上**，零成本。它运行全部**不需要编译器**的
+#       契约闸门：iOS 静态契约（G1..G14）、双端功能对等、着色器两端一致性、
+#       C ABI 漂移、参数漂移、许可扫描、以及三份闸门的负向注入自检。
+#       这些检查与编译器无关，故不必耗 macOS 分钟数。
+#   build-xcframework —— 跑在 macos-15 上，真正编译三个静态库并打包 xcframework。
+#
+# 触发器：仅在 iOS / 着色器 / 契约相关路径变化时运行
+# （避免每次改 core/ 的无关文件都烧 macOS 分钟数）。
+#
+# ⚠️ 关于 Xcode 版本（本 workflow 的一个关键决策，留档以免被"顺手升级"破坏）
+#   · macos-15 镜像预装 Xcode 16.0–16.4 **与** 26.0.1–26.3，默认 16.4。
+#   · **Xcode 26 起 Metal 工具链被从 Xcode 中剥离**，需另行
+#     `xcodebuild -downloadComponent MetalToolchain`（约 700 MB，且**需要
+#     Apple ID 登录**，CI 上未登录会 401 失败 —— 见 CircleCI 支持文档与
+#     Apple 开发者论坛）。
+#   · 本项目**必须编译 Metal 着色器**（shaders/metal/*.metal），故**显式 pin
+#     Xcode 16.4** —— 它自带 `metal` / `metallib`，无需下载、无需登录。
+#   · 若将来要升到 Xcode 26，必须**同时**加上 Metal Toolchain 的
+#     export/import 两步（`-exportPath` + 导入资产），不能只改版本号。
+
+name: iOS
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "platform/ios/**"
+      - "ui/ios/**"
+      - "shaders/**"
+      - "cmake/toolchains/ios.cmake"
+      - "cmake/ThirdParty.cmake"
+      - "CMakeLists.txt"
+      - "tools/check_ios_contract.py"
+      - "tools/verify_ios_contract_negative.py"
+      - "tools/check_platform_parity.py"
+      - "tools/verify_platform_parity_negative.py"
+      - "tools/shader_parity.py"
+      - "tools/verify_shader_parity_negative.py"
+      - "tools/gen_ios_project.py"
+      - "tools/build_metal_shaders.sh"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "platform/ios/**"
+      - "ui/ios/**"
+      - "shaders/**"
+      - "cmake/toolchains/ios.cmake"
+      - "CMakeLists.txt"
+      - "tools/check_ios_contract.py"
+      - "tools/check_platform_parity.py"
+      - "tools/shader_parity.py"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+env:
+  # docs/12 §1.1：确定性构建
+  SOURCE_DATE_EPOCH: 1700000000
+
+jobs:
+  # ===========================================================================
+  # 静态契约（零 macOS 成本）
+  # ===========================================================================
+  static-contract:
+    name: 静态契约（locale / 玻璃白名单 / 禁令 / 权限 / ABI / 键集合 / 混编接线 / 着色器 / 负向注入）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 生成器必须先跑：它产出 platform/ios/*.xcconfig / Package.swift /
+      # Container/project.yml，而下面的 G 闸门会校验这些文件的**内容与磁盘一致**。
+      # 漏这一步 → 闸门对着陈旧/缺失的生成物判，属"判据落在错误对象上"。
+      - name: 生成 iOS 工程描述
+        run: python tools/gen_ios_project.py
+
+      - name: iOS 静态契约闸门（G1..G14）
+        run: python tools/check_ios_contract.py
+
+      - name: iOS 静态契约负向注入（证明 G 判据非假闸门）
+        run: python tools/verify_ios_contract_negative.py
+
+      - name: 双端功能对等闸门（1..9）
+        run: python tools/check_platform_parity.py
+
+      - name: 双端对等负向注入
+        run: python tools/verify_platform_parity_negative.py
+
+      - name: 着色器两端一致性闸门（P1..P12）
+        run: python tools/shader_parity.py
+
+      - name: 着色器一致性负向注入
+        run: python tools/verify_shader_parity_negative.py
+
+      - name: C ABI 漂移闸门
+        run: python tools/abi_drift_check.py
+
+      - name: 参数契约漂移闸门
+        run: python tools/check_params.py
+
+      - name: 第三方许可扫描（GPL 家族硬阻断）
+        run: python tools/license_scan.py --third-party third_party
+
+      # XcodeGen 的 --project-root 是"少一个参数就整个构建找不到源码、且报错
+      # 信息与根因距离很远"的那类陷阱（见 project.yml 文件头）。这里静态确认
+      # 本 workflow 与生成器产出的说明都带上了它 —— 防止将来有人"简化"掉。
+      - name: 确认 xcodegen 调用带 --project-root（防回归）
+        run: |
+          set -euo pipefail
+          if ! grep -q -- '--project-root' .github/workflows/ios.yml; then
+            echo "::error::ios.yml 的 xcodegen 调用缺少 --project-root"
+            exit 1
+          fi
+          if ! grep -q -- '--project-root' tools/gen_ios_project.py; then
+            echo "::error::gen_ios_project.py 的说明里缺少 --project-root"
+            exit 1
+          fi
+          echo "OK: --project-root 在两处都有"
+          # project.yml 必须显式声明 scheme，否则 build-app job 的
+          # `xcodebuild -scheme Recon` 会依赖 XcodeGen 的自动命名（版本相关）。
+          if ! grep -q '^schemes:' platform/ios/Container/project.yml; then
+            echo "::error::project.yml 缺少显式 schemes 段"
+            exit 1
+          fi
+          echo "OK: project.yml 有显式 scheme"
+
+      # 上传生成物给 build job 复用，避免 macOS 上再跑一次生成器
+      # （两处生成同一文件 = 第二事实来源的温床；下游只消费这里的一份）。
+      - name: 上传生成的工程描述（供 build job 复用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-project-descriptors
+          path: |
+            platform/ios/Recon.xcconfig
+            platform/ios/Package.swift
+            platform/ios/Container/project.yml
+          if-no-files-found: error
+
+  # ===========================================================================
+  # 真正编译静态库 + 打包 xcframework（macOS）
+  # ===========================================================================
+  build-xcframework:
+    name: 构建 ReconCore.xcframework（macos-15 / Xcode 16.4）
+    runs-on: macos-15
+    needs: static-contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --- 显式 pin Xcode 16.4（自带 Metal 工具链，见文件头说明）-------------
+      - name: 选择 Xcode 16.4
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcode-select -p
+          xcodebuild -version
+          # 证实 metal 编译器可用 —— 这是本 job 存在的前提，缺了就要早失败，
+          # 而不是等到 CompileMetalFile 阶段才报 "missing Metal Toolchain"。
+          xcrun -sdk iphoneos --find metal
+          xcrun -sdk iphoneos --find metallib
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          cmake --version
+          (xcodegen --version || brew install xcodegen)
+
+      - name: 生成工程描述
+        run: python tools/gen_ios_project.py
+
+      # --- 真机 slice（arm64）-------------------------------------------
+      - name: 配置真机 slice
+        run: |
+          cmake -S . -B build/ios/device -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DRECON_BUILD_TESTS=OFF -DRECON_BUILD_CLI=OFF \
+            -DRECON_COMPILE_SHADERS=ON \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
+
+      # 三个静态库都要编：App 链接的是 recon_core（算法）+ recon_platform_common
+      # （平台无关规则本体）+ recon_platform_ios（ObjC++/Metal 桥）。
+      # 只编 recon_core 会在 App 链接期因 bridge 符号缺失而 undefined symbol。
+      - name: 编译真机 slice
+        run: |
+          set -euo pipefail
+          cmake --build build/ios/device --config Release \
+            --target recon_core recon_platform_common recon_platform_ios
+          echo "--- 产物 ---"
+          find build/ios/device -name "*.a" | sort
+
+      # --- 模拟器 slice（arm64 + x86_64）--------------------------------
+      - name: 配置模拟器 slice
+        run: |
+          cmake -S . -B build/ios/simulator -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake \
+            -DRECON_IOS_SIMULATOR=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DRECON_BUILD_TESTS=OFF -DRECON_BUILD_CLI=OFF \
+            -DRECON_COMPILE_SHADERS=ON \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
+
+      - name: 编译模拟器 slice
+        run: |
+          set -euo pipefail
+          cmake --build build/ios/simulator --config Release \
+            --target recon_core recon_platform_common recon_platform_ios
+          find build/ios/simulator -name "*.a" | sort
+
+      # --- 合并三个库为单个静态归档，再打成 xcframework --------------------
+      # xcodebuild -create-xcframework 每个 slice 只接受**一个** -library。
+      # App 需要三个库，故先用 libtool 合并为一个 fat archive
+      # （这是静态库的标准做法；-static 保留成员，不做去重以免丢符号）。
+      - name: 合并静态库
+        run: |
+          set -euo pipefail
+          merge_slice() {
+            local srcdir="$1" out="$2"
+            local libs
+            libs=$(find "$srcdir" -name "librecon_core.a" -o \
+                          -name "librecon_platform_common.a" -o \
+                          -name "librecon_platform_ios.a" | sort)
+            echo "== $out 的输入 =="
+            echo "$libs"
+            local n
+            n=$(echo "$libs" | grep -c . || true)
+            if [ "$n" -ne 3 ]; then
+              echo "::error::期望 3 个静态库，实际 $n 个（device=$srcdir）"
+              find "$srcdir" -name "*.a" | sort || true
+              exit 1
+            fi
+            mkdir -p "$(dirname "$out")"
+            # shellcheck disable=SC2086
+            libtool -static -o "$out" $libs
+          }
+          merge_slice build/ios/device    build/ios/merged/device/libReconCore.a
+          merge_slice build/ios/simulator build/ios/merged/simulator/libReconCore.a
+          lipo -info build/ios/merged/device/libReconCore.a
+          lipo -info build/ios/merged/simulator/libReconCore.a
+
+      - name: 合并 xcframework
+        run: |
+          set -euo pipefail
+          xcodebuild -create-xcframework \
+            -library build/ios/merged/device/libReconCore.a \
+            -headers core/include \
+            -library build/ios/merged/simulator/libReconCore.a \
+            -headers core/include \
+            -output build/ios/ReconCore.xcframework
+          echo "--- 产物结构 ---"
+          find build/ios/ReconCore.xcframework -maxdepth 2 | sort
+
+      # --- docs/12 §4.3 的 XC 校验项 ------------------------------------
+      - name: 校验 xcframework（XC-1 头文件一致 / XC-2 架构 / 零网络框架）
+        run: |
+          set -euo pipefail
+          XCF=build/ios/ReconCore.xcframework
+
+          echo "== Info.plist =="
+          plutil -p "$XCF/Info.plist"
+
+          echo "== XC-2 架构 =="
+          lipo -info "$XCF/ios-arm64/libReconCore.a"
+          lipo -info "$XCF/ios-arm64_x86_64-simulator/libReconCore.a"
+
+          echo "== XC-1：两个 slice 的头文件目录必须逐字节相同 =="
+          diff -r "$XCF/ios-arm64/Headers" \
+                  "$XCF/ios-arm64_x86_64-simulator/Headers"
+          echo "HEADERS IDENTICAL"
+
+          echo "== 三个库的符号是否都在（防止 libtool 合并丢成员） =="
+          for sym in recon_create recon_session_get_status; do
+            if ! nm -g "$XCF/ios-arm64/libReconCore.a" 2>/dev/null | grep -q "$sym"; then
+              echo "::error::合并后的归档缺少 C ABI 符号 $sym"
+              exit 1
+            fi
+          done
+          echo "OK: C ABI 符号存在"
+
+          echo "== 零网络：不得引用网络框架（docs/12 §4.3） =="
+          if otool -L "$XCF/ios-arm64/libReconCore.a" \
+             | grep -E 'CFNetwork|Network\.framework|Security\.framework|WebKit'; then
+            echo "::error::引用了网络框架 —— 违反 R-LOCAL 零网络铁律"
+            exit 1
+          fi
+          echo "OK: 无网络框架"
+
+      # --- 产物层验证 default.metallib（此前从未真正编过）------------------
+      - name: 校验 default.metallib
+        run: |
+          set -euo pipefail
+          MB=build/ios/device/ios/Recon.app/Contents/Resources/default.metallib
+          if [ ! -s "$MB" ]; then
+            echo "::error::未生成 default.metallib（RECON_COMPILE_SHADERS=ON 已开）"
+            find build/ios -name "*.metallib" -o -name "*.air" || true
+            exit 1
+          fi
+          echo "== metallib 大小 =="
+          wc -c < "$MB"
+          echo "== 算法函数覆盖（8 个，来自 shaders/common/gpu_algo.h） =="
+          for fn in recon_mvs_seed recon_mvs_patchmatch recon_mvs_subpixel \
+                    recon_mvs_consistency recon_mvs_fuse_voxel recon_mvs_reduce \
+                    recon_tsdf_fuse recon_yuv_to_bgra; do
+            if ! strings "$MB" | grep -qx "$fn"; then
+              echo "::error::metallib 缺少算法函数 $fn"
+              exit 1
+            fi
+            echo "  ✓ $fn"
+          done
+
+      - name: 上传 xcframework
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReconCore.xcframework
+          path: build/ios/ReconCore.xcframework
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传 default.metallib
+        uses: actions/upload-artifact@v4
+        with:
+          name: default.metallib
+          path: build/ios/device/ios/Recon.app/Contents/Resources/default.metallib
+          if-no-files-found: error
+          retention-days: 14
+
+  # ===========================================================================
+  # 编译整机 App（XcodeGen 容器 + xcframework，不签名）
+  # ===========================================================================
+  # 这一步是"iOS 侧语言层首次真编译"——此前所有 Swift/ObjC++ 代码
+  # 只有静态闸门保障，从未过编译器。它的价值在于把"能不能编过"变成事实。
+  build-app:
+    name: 编译 Recon.app（不签名，验证 Swift/ObjC++ 可编译）
+    runs-on: macos-15
+    needs: build-xcframework
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 选择 Xcode 16.4
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ReconCore.xcframework
+          path: platform/ios/build/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: default.metallib
+          path: platform/ios/build/Recon.app/Contents/Resources/
+
+      - name: 生成工程描述
+        run: python tools/gen_ios_project.py
+
+      - name: 安装 XcodeGen 并生成容器
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+          # ⚠️ 必须在**仓库根**执行，且 --project/--project-root 不可省：
+          #   XcodeGen 的相对路径默认基准是 spec 所在目录（platform/ios/Container/），
+          #   而 project.yml 里的路径是按仓库根写的。不指定会同时坏掉
+          #   sources/framework 解析**与** SRCROOT（后者会让所有
+          #   $(SRCROOT)/core/include 失效）。详见 project.yml 文件头。
+          xcodegen generate --spec platform/ios/Container/project.yml \
+            --project . --project-root .
+          ls -d Recon.xcodeproj
+          xcodebuild -list -project Recon.xcodeproj
+
+      - name: 编译 App（不签名）
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project Recon.xcodeproj \
+            -scheme Recon \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/app \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""

@@ -1,0 +1,33 @@
+// Recon.xcconfig — iOS 构建设置（由 tools/gen_ios_project.py 生成）
+//
+// 契约：docs/12_构建与打包.md §4.2（Xcode Build Settings 关键项）、
+//       §4.5（Bitcode）、§4.6（最低部署版本 = 15.0）、§4.7（arm64 only）。
+//
+// ⚠️ 本文件由脚本生成，请不要手改 —— 改 tools/gen_ios_project.py 后重跑。
+//    理由：规格值需要可审查、可在 diff 中复核；手改会与生成器漂移。
+
+IPHONEOS_DEPLOYMENT_TARGET = 15.0
+SWIFT_VERSION = 5.0
+ENABLE_BITCODE = NO
+SKIP_INSTALL = YES
+PRODUCT_NAME = Recon
+TARGETED_DEVICE_FAMILY = 1
+SUPPORTS_MACCATALYST = NO
+SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO
+SUPPORTS_UIKITFORMAC = NO
+ONLY_ACTIVE_ARCH = NO
+SWIFT_TREAT_WARNINGS_AS_ERRORS = YES
+GCC_TREAT_WARNINGS_AS_ERRORS = YES
+CLANG_ENABLE_OBJC_ARC = YES
+CLANG_CXX_LANGUAGE_STANDARD = c++17
+CLANG_CXX_LIBRARY = libc++
+ENABLE_USER_SCRIPT_SANDBOXING = YES
+ENABLE_MODULE_VERIFIER = NO
+CODE_SIGN_STYLE = Automatic
+DEAD_CODE_STRIPPING = YES
+COPY_PHASE_STRIP = YES
+
+// docs/11 §1.6：零网络 —— 仅链接白名单系统框架。
+// 该列表只作声明；真正的校验由 tools/check_ios_contract.py 与 CI 的
+// otool -L 步骤执行（见 docs/12 §4.3 XC 校验项）。
+OTHER_LDFLAGS = $(inherited) -framework Foundation -framework UIKit -framework AVFoundation -framework CoreMedia -framework CoreMotion -framework Metal -framework MetalKit -framework ARKit -framework Photos

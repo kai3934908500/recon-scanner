@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_consistency.comp — CB-4 单视图一致性 / 左右一致性校验（Vulkan 实现）
+//
+// 契约：docs/05 §5.9.2（CB-4）、docs/05 §5.6、docs/12 §4.4。
+//
+// 函数名 `recon_mvs_consistency` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 算法 ──────────────────────────────────────────────────────────────────
+// 对每个像素：把参考帧的深度投影到源视图，取源视图深度，再反投影回参考帧，
+// 若往返误差超过 `geo_consistency_pct` 则判为不一致（遮挡 / 错误匹配）。
+// 逐源视图投票，支撑数 ≥ `min_view_consistency` 才保留。
+//
+// ── 显存含义（docs/05 §5.9.3）─────────────────────────────────────────────
+// 「CB-4 必须等待**所有**源视图的深度图完成」→ 源视图深度图必须常驻显存
+// （或分批重算）。这是 §5.9.3 显存估算的**主要来源**（1080p 全图常驻
+// 164.5 MB 中，源视图深度图 7 个占 58.1 MB）。本 pass 只是这个内存压力的
+// **消费端**，不改变它。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams
+// set 0 binding 1  → SSBO  ReconViewParams[]
+// set 0 binding 2  → 存储图像 in_invz（参考帧逆深度）
+// set 0 binding 3  → 采样纹理数组 src_depth[]（源视图深度图，长度 = num_views）
+// set 0 binding 4  → 存储图像 out_depth（r32f，保留像素输出 z_ref，否则 0）
+// set 0 binding 5  → 存储图像 out_conf （r32f，支撑数/总视图数，否则 0）
+//
+// 输出契约（docs/05 §5.10）：`D_r` 为**沿光轴 z**（不是径向距离），
+// `C_r` 为融合权重归一化后的值。本 pass 产出的 conf 即 `C_r` 的第一步。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（与 MSL 侧 SOURCE-TODO-MVS-3 **完全对应**）
+// ══════════════════════════════════════════════════════════════════════════
+// 已实现：往返投影框架、逐视图投票、图像边界剔除、无效深度剔除、
+//         支撑数阈值判定、置信度归一化。
+//
+// 未实现的近似（**两端必须一致地近似**，否则"算法同源"名存实亡）：
+//   SOURCE-TODO-MVS-3  往返变换的第一步用**参考帧位姿**近似。严格做法是
+//                  `pc_src = R_src·(R_refᵀ·(pc_ref − t_ref)) + t_src`，
+//                  即需要 `views[ref].Rt` 的**逆**；本实现只对 `pc_back`
+//                  再做一次 `world_to_cam(views[ref])`。
+//                  待与 CPU 版 `core/src/mvs/patchmatch_stereo.cpp` 做数值
+//                  对齐后再定稿；在此之前**不得**声称本 pass 精度达标。
+//   SOURCE-TODO-MVS-5  源视图数组上界 `RECON_VK_MAX_VIEWS`（= 8，与 MSL 同值），
+//                  **未做运行期断言**。
+//
+// ⚠️ `restart_ratio` / `photo_threshold` / `geo_consistency_pct` 中，
+//    本 pass 只使用 `geo_consistency_pct`；其余属 CB-2 的 NCC（未接入）。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+// 视图数组编译期上界，与 MSL 侧 `array<..., 8>` 同值（闸门校验）。
+#define RECON_VK_MAX_VIEWS 8
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ViewsBlock {
+    ReconViewParams views[];
+};
+
+layout(r32f, set = 0, binding = 2) uniform readonly  image2D in_invz;
+layout(set = 0, binding = 3) uniform texture2D src_depth[RECON_VK_MAX_VIEWS];
+layout(r32f, set = 0, binding = 4) uniform writeonly image2D out_depth;
+layout(r32f, set = 0, binding = 5) uniform writeonly image2D out_conf;
+
+// 无效输出的统一写法：depth=0 / conf=0 / support 无。
+// 抽成函数避免在 3 处各写一遍（同一逻辑写两遍必然漂移）。
+void recon_vk_local_consistency_invalid(ivec2 gid) {
+    imageStore(out_depth, gid, vec4(0.0, 0.0, 0.0, 1.0));
+    imageStore(out_conf,  gid, vec4(0.0, 0.0, 0.0, 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_consistency(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_consistency(ivec2 gid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    float iz = imageLoad(in_invz, gid).r;
+    if (iz <= 0.0) { recon_vk_local_consistency_invalid(gid); return; }
+
+    float z_ref = recon_invz_to_depth(iz);
+    if (z_ref <= p.depth_min_m || z_ref >= p.depth_max_m) {
+        recon_vk_local_consistency_invalid(gid);
+        return;
+    }
+
+    // 参考像素 → 参考相机系点。uv 用像素中心 (+0.5)，与 MSL 侧同式。
+    vec2 uv_ref = vec2(gid) + vec2(RECON_GPU_PIXEL_CENTER);
+    vec4 intr_ref = views[p.ref_view_index].intrinsics;
+    vec3 pc_ref = recon_backproject(uv_ref, z_ref, intr_ref);
+
+    // 逐源视图做左右一致性投票，累计支撑数。
+    float support = 0.0;
+    for (int v = 0; v < p.num_views; ++v) {
+        if (v == p.ref_view_index) continue;
+        if (v >= RECON_VK_MAX_VIEWS) break;   // 静态上界（见 SOURCE-TODO-MVS-5）
+
+        mat4 Rt = views[v].Rt;
+        vec3 pc_src = recon_world_to_cam(Rt, pc_ref);
+        vec2 uv_src;
+        if (!recon_project(pc_src, views[v].intrinsics, uv_src)) continue;
+        vec2 dsize = views[v].size_depth.xy;
+        if (!recon_in_image(uv_src, dsize)) continue;
+
+        // 最近邻查源视图深度（imageLoad ≠ 插值，符合 docs/04 §4.6.1）。
+        float d_src = texelFetch(src_depth[v], ivec2(uv_src), 0).r;
+        if (d_src <= 0.0) continue;
+
+        // 反投影回参考帧，比较深度相对偏差。
+        // ⚠️ 这里的第二步是**近似**（见 SOURCE-TODO-MVS-3），与 MSL 侧同式。
+        vec3 pc_back = recon_backproject(uv_src, d_src, views[v].intrinsics);
+        vec3 pc_back_ref = recon_world_to_cam(views[p.ref_view_index].Rt, pc_back);
+        float rel = abs(pc_back_ref.z - z_ref) / max(z_ref, RECON_GPU_EPS_DEPTH) * RECON_GPU_PERCENT_SCALE;
+        if (rel <= p.geo_consistency_pct) support += 1.0;
+    }
+
+    if (support >= float(p.min_view_consistency)) {
+        imageStore(out_depth, gid, vec4(z_ref, 0.0, 0.0, 1.0));
+        // 置信度 = 支撑视图占比（后续 CB-6 会再做权重归一化，见 §5.10）。
+        imageStore(out_conf, gid,
+                   vec4(support / max(float(p.num_views), 1.0), 0.0, 0.0, 1.0));
+    } else {
+        recon_vk_local_consistency_invalid(gid);
+    }
+}
+
+void main() {
+    recon_mvs_consistency(ivec2(gl_GlobalInvocationID.xy));
+}

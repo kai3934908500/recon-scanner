@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_fuse_voxel.comp — CB-5 体素融合 / 点云散射（Vulkan 实现）
+//
+// 契约：docs/05 §5.9.2（CB-5）、docs/05 §5.7、docs/12 §4.4。
+//
+// 函数名 `recon_mvs_fuse_voxel` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 为什么这里**必须**用原子（与 TSDF 正好相反）────────────────────────────
+// MVS 的融合是**像素中心式**：每线程处理一个像素，多个像素可能落到**同一体素**
+// → 对 `voxel_sum` / `voxel_w` 的累加存在写-写冲突 → **必须原子**。
+// 而 TSDF（`recon_tsdf_fuse`）是**体素中心式**：每体素只被一个线程写 →
+// 不需要原子。两者不可混用，这是 docs/04 §4.6.2 与 docs/05 §5.7 的分野。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// VK-DIFF-1 — 浮点原子的**真实跨端差异**（本文件的核心，必须读懂）
+// ══════════════════════════════════════════════════════════════════════════
+//  docs/05 §5.9.1 的映射表把两端原子写成
+//      「`atomic_fetch_min_explicit`（Metal） ↔ `atomicMin`（Vulkan）」
+//  但那是针对**投票**（整型）的映射。本 pass 需要的是 **atomicAdd，且对象是
+//  float** —— 而：
+//
+//    Metal ：`device atomic_float*` + `atomic_fetch_add_explicit`
+//            是 **Metal 核心特性**，无需任何扩展。
+//    Vulkan：`atomicAdd` 对 **float** 需要扩展 `VK_EXT_shader_atomic_float`
+//            （GLSL 侧为 `GL_EXT_shader_atomic_float_add`），**不是核心特性**。
+//
+//  两端因此**无法用同一种语句写同一个算法**。这是真实的平台能力差异，
+//  不是实现偷懒。本项目**不接受静默降级**（docs/14 CT-9），故提供两条
+//  **显式可选**路径，由 C++ 侧按运行期能力探测二选一并记录选择结果：
+//
+//    ┌─ 路径 A：`RECON_VK_FLOAT_ATOMIC` 已定义
+//    │     需 C++ 侧确认 `VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
+//    │     .shaderBufferFloat32AtomicAdd == VK_TRUE`，并启用该扩展。
+//    │     与 Metal 侧**完全同构**（同一数学式、同一累加语义）。
+//    │
+//    └─ 路径 B：未定义（**默认**）
+//          定点整数原子（scale = RECON_VK_FIXED_SCALE = 2^12），
+//          `atomicAdd` 作用于 `int`（核心特性，无需扩展）。
+//          与路径 A 存在**量化差异**（相对误差 ≤ 1/4096 ≈ 2.4e-4）。
+//          ⚠️ 该差异**是真实的**：两条路径的体素和值不保证逐位相同。
+//          已登记为缺口，待真机阶段用同一输入跑两条路径对比。
+//
+//  **为什么选定点而不是「改用非原子两遍法」**：两遍法（先计数、再按槽位写）
+//  需要为每个体素预留"最大命中数"的槽位，内存开销 = 体素数 × 平均命中数 × 8 B，
+//  在体素 0.5 mm 级时远超声预算（docs/05 §5.9.3），不可行。
+//  定点原子内存开销与浮点原子**完全相同**（同样两个 4 B 累加器），只是精度略降。
+//
+// ⚠️ 饱和而非回绕：`atomicAdd` 到 `RECON_VK_FIXED_MAX`（2^30）后不再增长。
+//   回绕会把大数变负（等价于静默数据损坏）；饱和是**可观测**的
+//   （`recon_mvs_reduce` 会产出异常大的值）。上界充裕性论证见
+//   `shaders/vulkan/gpu_common.glsl` 的 `RECON_VK_FIXED_SCALE` 段。
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+// 全部 tile 完成后 dispatch 一次（docs/05 §5.9.2 层次 5）。
+// 逐线程一个参考帧深度像素。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams
+// set 0 binding 1  → UBO   ReconViewParams（**单个**参考帧视图，与 MSL 侧
+//                          `constant ReconViewParams& view` 对应）
+// set 0 binding 2  → 存储图像 depth（参考帧深度，CB-4 产出）
+// set 0 binding 3  → 存储图像 conf （CB-4 产出）
+// set 0 binding 4  → SSBO  体素加权深度累加器（路径 A: float / 路径 B: int）
+// set 0 binding 5  → SSBO  体素权重累加器（同上）
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（与 MSL 侧 SOURCE-TODO-MVS-4 **对应**）
+// ══════════════════════════════════════════════════════════════════════════
+//   SOURCE-TODO-MVS-4  体素线性索引用 `dim = ref_width × ref_height` 作**占位维度**。
+//                  真实实现须用**体素网格维度**（与 C++ 侧扁平化约定一致），
+//                  且需**上界检查**（本文件当前只能剔负坐标，无法剔上界 ——
+//                  params 里还没有体素网格维度字段）。
+//                  这是**跨端一致**的缺口：MSL 侧同样是占位维度。
+//
+// ⚠️ 因此本 pass **不能**声称「MVS 融合可用」：它的价值是让两端算法同源
+//    可机器验证 + 把浮点原子的平台差异**显式化**，而不是提供可运行实现。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+// ---------------------------------------------------------------------------
+// 路径 A：需要 GL_EXT_shader_atomic_float_add（Vulkan 侧非核心特性）
+// ---------------------------------------------------------------------------
+#ifdef RECON_VK_FLOAT_ATOMIC
+#extension GL_EXT_shader_atomic_float_add : require
+#endif
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+// 单个视图参数（**不是数组**）：与 MSL 侧 `constant ReconViewParams& view`
+// 严格对应。本 pass 只用到参考帧的位姿 —— CB-4 产出的 depth/conf 就是
+// 参考帧的产物，用参考帧位姿是唯一正确的反投影口径。
+layout(set = 0, binding = 1, std140) uniform ViewBlock {
+    ReconViewParams view;
+};
+
+layout(r32f, set = 0, binding = 2) uniform readonly image2D depth;
+layout(r32f, set = 0, binding = 3) uniform readonly image2D conf;
+
+// ---------------------------------------------------------------------------
+// 累加器：两条路径的**元素类型不同**，故用条件编译整块声明。
+// 两者的**元素个数相同**、**索引公式相同**、**语义相同**（加权和 / 权重和）。
+// ---------------------------------------------------------------------------
+#ifdef RECON_VK_FLOAT_ATOMIC
+// 路径 A：float 原子（需扩展）。布局与 Metal 侧 `device atomic_float*` 一致。
+layout(std430, set = 0, binding = 4) buffer VoxelSumBlock { float voxel_sum[]; };
+layout(std430, set = 0, binding = 5) buffer VoxelWBlock   { float voxel_w[];   };
+#else
+// 路径 B（默认）：定点整数原子（核心特性，无需扩展）。
+// `int` 而非 `uint`：饱和下界为负值侧也需要（虽然本 pass 只加非负数，
+// 但用 int 让两条路径的语义更容易对齐 —— 负数即"异常"，便于观测）。
+layout(std430, set = 0, binding = 4) buffer VoxelSumBlock { int voxel_sum[]; };
+layout(std430, set = 0, binding = 5) buffer VoxelWBlock   { int voxel_w[];   };
+#endif
+
+// ---------------------------------------------------------------------------
+// 定点饱和加法的统一封装：两条路径**共用同一调用点**，
+// 差异只在此函数内部与累加器类型上 —— 这样算法主体的代码是**唯一一份**，
+// 不会出现「路径 A 改了、路径 B 忘了改」的漂移。
+// ---------------------------------------------------------------------------
+#ifdef RECON_VK_FLOAT_ATOMIC
+void recon_vk_local_voxel_accumulate(int idx, float sum_contrib, float w_contrib) {
+    atomicAdd(voxel_sum[idx], sum_contrib);
+    atomicAdd(voxel_w[idx],   w_contrib);
+}
+#else
+void recon_vk_local_voxel_accumulate(int idx, float sum_contrib, float w_contrib) {
+    // 量化：value → round(value × 2^12)，饱和于 ±2^30。
+    int ds = int(clamp(round(sum_contrib * RECON_VK_FIXED_SCALE),
+                       -RECON_VK_FIXED_MAX, RECON_VK_FIXED_MAX));
+    int dw = int(clamp(round(w_contrib * RECON_VK_FIXED_SCALE),
+                       -RECON_VK_FIXED_MAX, RECON_VK_FIXED_MAX));
+    int old_s = atomicAdd(voxel_sum[idx], ds);
+    int old_w = atomicAdd(voxel_w[idx],   dw);
+    // 饱和回写：若越过上界，把超出部分减回去。
+    // 用「一次修正」而非循环：并发下多次饱和可能相互追逐，故允许**轻微**超出
+    // 上界（不是严格饱和）。这是**已知的近似**，如实登记：
+    //   真实严格饱和需 CAS 循环；此处用单次修正以保持无锁且低成本。
+    if (old_s > RECON_VK_FIXED_MAX - ds) atomicAdd(voxel_sum[idx], RECON_VK_FIXED_MAX - (old_s + ds));
+    if (old_w > RECON_VK_FIXED_MAX - dw) atomicAdd(voxel_w[idx],   RECON_VK_FIXED_MAX - (old_w + dw));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_fuse_voxel(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_fuse_voxel(ivec2 gid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    float z = imageLoad(depth, gid).r;
+    float c = imageLoad(conf,  gid).r;
+    // 无效像素（CB-4 已把不合格的置 0）与超范围像素一律不参与。
+    if (z <= p.depth_min_m || z >= p.depth_max_m) return;
+
+    // 像素 → 参考相机系 → 世界。用 `view` 的位姿。
+    vec3 pc_cam = recon_backproject(vec2(gid) + vec2(RECON_GPU_PIXEL_CENTER), z, view.intrinsics);
+    vec3 pc_world = recon_cam_to_world(view.Rt, pc_cam);
+
+    // 体素边长来自 `mvs_fusion_voxel_size`（mm，整数传参避免浮点往返误差，MT-4）。
+    float vs = float(p.voxel_size_mm) * 0.001;
+    if (vs <= 0.0) return;
+    ivec3 vi = ivec3(floor(pc_world / vs));
+
+    // 体素线性索引：与 C++ 侧的体积扁平化约定一致（x 最快）。
+    // ⚠️ 占位维度，见文件头 SOURCE-TODO-MVS-4；且**当前无上界检查**。
+    int dim = p.ref_width * p.ref_height;
+    if (vi.x < 0 || vi.y < 0 || vi.z < 0) return;
+    int idx = (vi.z * dim + vi.y) * dim + vi.x;
+
+    recon_vk_local_voxel_accumulate(idx, z * c, c);
+}
+
+void main() {
+    recon_mvs_fuse_voxel(ivec2(gl_GlobalInvocationID.xy));
+}

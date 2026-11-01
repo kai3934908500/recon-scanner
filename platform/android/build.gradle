@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// build.gradle（顶层）— 版本锁定与断言。
+// 契约：docs/12_构建与打包.md §3.1（版本要求）、§3.4.2（版本断言）。
+//
+// 三个版本必须一致，由 tools/check_toolchain.py 在 CI 复核：
+//   NDK 28.1.13356709 (r28b) / AGP 8.7.3 / Gradle 8.9
+
+buildscript {
+    ext {
+        ndkRequired = '28.1.13356709'
+        agpRequired = '8.7.3'
+        kotlinRequired = '2.0.21'
+        compileSdkRequired = 35
+        minSdkRequired = 24
+        targetSdkRequired = 35
+    }
+}
+
+plugins {
+    id 'com.android.application' version "${agpRequired}" apply false
+    id 'org.jetbrains.kotlin.android' version "${kotlinRequired}" apply false
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// app/build.gradle — 应用模块。
+// 契约：docs/12_构建与打包.md §3.4.1（关键片段，逐字对齐）、§3.2（ABI 矩阵）、
+//       §3.5（16 KB 页对齐）、§3.6（R8 混淆）。
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.recon.scan'
+    compileSdk 35
+    ndkVersion '28.1.13356709'          // ← 锁定 r28b（docs/12 §3.1）
+
+    defaultConfig {
+        applicationId "com.recon.scan"
+        minSdk 24
+        targetSdk 35
+        versionCode 10200                 // 见 docs/12 §7.1 版本号规则
+        versionName "1.2.0"
+
+        ndk {
+            // docs/12 §3.2 ABI 矩阵：三 ABI。
+            // arm64-v8a 为主（16 KB 页对齐必检）；armeabi-v7a 保持 4 KB；
+            // x86_64 供模拟器与 CI。
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared',
+                          '-DRECON_BUILD_TESTS=OFF',
+                          '-DRECON_BUILD_CLI=OFF',
+                          '-DCMAKE_BUILD_TYPE=Release'
+                cppFlags '-std=c++17', '-fvisibility=hidden'
+                targets 'recon_core'
+            }
+        }
+
+        // 资源压缩：仅对 Java/Kotlin 生效，native 库不受影响（docs/12 §3.6）
+        resourceConfigurations += ['zh-rCN', 'en']
+    }
+
+    externalNativeBuild {
+        cmake {
+            // 薄壳仅作转发；仓库根 CMakeLists.txt 是唯一真源（B-1）
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.31.6'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // false = .so 以未压缩方式存入 APK（可被 zipalign 按 16 KB 对齐）
+            // 16 KB 合规的必要条件之一（docs/12 §3.5）
+            useLegacyPackaging false
+        }
+        jniLibs.pickFirsts += ['**/libc++_shared.so']
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // native 库不参与 R8，但资源压缩会移除未引用的资源；
+            // 本项目全部资源由 Compose 代码按名引用，保留 assets 下的许可清单
+            androidResources { noCompress 'spv', 'txt' }
+        }
+        debug {
+            minifyEnabled false
+            externalNativeBuild { cmake { arguments '-DRECON_BUILD_TESTS=ON' } }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+    buildFeatures { buildConfig true }
+
+    // 版本断言（docs/12 §3.4.2）：本地即刻失败，不等 CI
+    if (ndkVersion != rootProject.ext.ndkRequired) {
+        throw new GradleException(
+            "NDK 版本必须为 ${rootProject.ext.ndkRequired}，当前 ${ndkVersion}。" +
+            "原因见 docs/12_构建与打包.md §3.1")
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    // Camera2 直接路径为主（docs/11 §3.4.1）；CameraX 仅作降级路径备选，
+    // 故此处不引入 camera-camera2 依赖。ARCore 为 optional（见 AndroidManifest）。
+    implementation 'com.google.ar:core:1.45.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+}

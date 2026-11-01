@@ -1,0 +1,79 @@
+# .gitattributes — 行尾与二进制归一化（跨平台 CI 的正确性前提）
+#
+# 为什么必须有这个文件：
+#   Git for Windows 的 system 级默认 core.autocrlf=true。若仓库没有 .gitattributes，
+#   「什么文件该用 LF / CRLF」就完全取决于每台机器的本地配置 —— 同一次提交在不同
+#   机器上会得到不同的行尾，而 **CI 在 Linux/macOS 上直接 `bash tools/*.sh`**：
+#   一旦脚本被检出成 CRLF，bash 会报 `\r: command not found` 而失败。
+#   显式钉死行尾，才能让「本地跑绿」等于「CI 跑绿」。
+#
+# 原则：文本一律 LF（仓库内规范），仅在 Windows 原生工具链（MSVC/VS）确实需要时
+#       才保留 CRLF；二进制显式标记，防止 Git 尝试做行尾转换而损坏文件。
+
+# ── 默认：自动识别文本，仓库内统一 LF ───────────────────────────────
+* text=auto eol=lf
+
+# ── 必须 LF 的「被解释执行 / 被工具解析」文件 ──────────────────────
+*.sh          text eol=lf
+*.py          text eol=lf
+*.cmake       text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake.in    text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.json        text eol=lf
+*.md          text eol=lf
+*.txt         text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# ── C/C++/Swift/Kotlin/着色器源码：统一 LF（本机实测已全部 LF）─────
+*.c    text eol=lf
+*.h    text eol=lf
+*.cpp  text eol=lf
+*.cc   text eol=lf
+*.cxx  text eol=lf
+*.hpp  text eol=lf
+*.inl  text eol=lf
+*.inc  text eol=lf
+*.mm   text eol=lf
+*.swift text eol=lf
+*.kt   text eol=lf
+*.metal text eol=lf
+*.comp  text eol=lf
+*.glsl  text eol=lf
+
+# ── Apple / Android 工程与配置：统一 LF（避免解析差异）──────────────
+*.plist    text eol=lf
+*.xcprivacy text eol=lf
+*.xcconfig text eol=lf
+*.strings  text eol=lf
+*.modulemap text eol=lf
+*.pro      text eol=lf
+*.gradle   text eol=lf
+*.properties text eol=lf
+
+# ── Windows 构建脚本：保留 CRLF（原生 shell 解析）────────────────────
+#   注：本仓库的 `.sln`/`.vcxproj`/`.filters`（均来自 third_party 上游）**实测全为 LF**
+#   → 不在此处改成 CRLF，避免制造整文件级虚假 diff。MSVC 对二者皆可读。
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
+
+# ── 二进制：禁止任何行尾转换 ───────────────────────────────────────
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
+*.glb     binary
+*.ply     binary
+*.metallib binary
+*.a       binary
+*.so      binary
+*.dylib   binary
+*.o       binary
+*.jar     binary
+*.keystore binary

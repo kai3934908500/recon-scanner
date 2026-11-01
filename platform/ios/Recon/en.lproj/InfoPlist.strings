@@ -1,0 +1,12 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/*
+  InfoPlist.strings (en) — 权限用途文案的英文覆盖。
+  契约：docs/11_平台权限与集成.md §1.2「用途文案（英文原文）」逐字对齐。
+  中文原文在 Info.plist；此处只覆盖三者，其余键沿用 Info.plist。
+*/
+
+"NSCameraUsageDescription" = "Used to capture photos of objects so they can be reconstructed into 3D models on this device. Photos and models stay on this device and are never uploaded.";
+
+"NSMotionUsageDescription" = "Used to read gyroscope and accelerometer data to record the device's own motion as camera poses, reducing drift in 3D reconstruction. The data is processed only on this device.";
+
+"NSPhotoLibraryAddUsageDescription" = "Used to save preview images of exported models to your photo library. The app never reads anything from your photo library.";

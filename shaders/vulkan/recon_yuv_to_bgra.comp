@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_yuv_to_bgra.comp — 采集前置：YUV 4:2:0 双平面 → BGRA8（Vulkan 实现）
+//
+// 契约：docs/11_平台权限与集成.md §3.4（Android Camera2 路径：
+//       `ImageReader(ImageFormat.YUV_420_888)`）、§693 IOS-AR-5
+//       （iOS 侧同算法的规格与 < 0.4 ms 预算）、docs/00 §7.2
+//       （`recon_frame_packet.rgb_data` = BGRA8）。
+//
+// 函数名 `recon_yuv_to_bgra` 必须与 `shaders/common/gpu_algo.h` 的
+// `RECON_GPU_ALGO(recon_yuv_to_bgra)` 及 `shaders/metal/yuv.metal` 的
+// `kernel void recon_yuv_to_bgra(...)` **逐字相同**（docs/12 MT-3）。
+//
+// ── 为什么 Android 也需要它（不是"照搬 iOS"）──────────────────────────────
+// Android 的采集格式是 `ImageFormat.YUV_420_888`（docs/11 §3.4.1 论证了
+// 为什么必须走 `ImageReader` 直接路径）。它与 iOS 的
+// `420YpCbCr8BiPlanarFullRange` **同族**：都是 4:2:0、Y 全分辨率、
+// 色度半分辨率。因此「YUV → BGRA」这一步是双端**同一件事** →
+// 按铁律必须以一份算法承载（写两遍必然漂移），故本文件与 yuv.metal
+// 逐条同构，差异只在语言。
+//
+// ⚠️ 与 iOS 的**真实差异**在平台层，不在这里：
+//   · iOS：色度平面被 ARKit 固定为**交错**（`CbCr`，即 NV12 序）。
+//   · Android：`Plane[1].pixelStride` 在多数机型上是 2（NV12/NV21 半平面），
+//     但也有机型是 1（真平面 I420）。C++ 侧读 `pixelStride` 判定后填入
+//     `chroma_pixel_stride`；为 1 时本 kernel **不产出**（见缺口 YUV-1），
+//     由调用方走 CPU 回退（`platform/common/src/yuv_convert.cpp`），
+//     并**显式记录降级**（docs/14 CT-9：不得静默降级）。
+//   · `cb_index_in_pair` 覆盖 NV12（Cb 在前，=0）与 NV21（Cr 在前，=1）
+//     两种 Android 常见布局。**由 C++ 侧决定并传参**，kernel 不做分支 ——
+//     与 MSL 侧「C++ 侧换序后绑定」的做法保持一致（同一决定只有一处）。
+//
+// ── 数学式（与 MSL 侧逐条对应，一字不差）────────────────────────────────
+//   1.  Y  = (raw_Y  − y_bias)  × y_gain
+//       Cb = (raw_Cb − c_bias)  × c_gain
+//       Cr = (raw_Cr − c_bias)  × c_gain
+//   2.  r = Y + r_from_cr·Cr ;  b = Y + b_from_cb·Cb
+//       g = Y + g_from_cr·Cr + g_from_cb·Cb
+//   3.  rgb = clamp(vec3(r,g,b), 0, 1)      // 先钳后量化（口径同 CPU 本体）
+//   4.  写出 BGRA8（内存序 B,G,R,A）
+//
+// ── 调度 ──────────────────────────────────────────────────────────────────
+//   `vkCmdDispatch(ceil(out_width/8), ceil(out_height/8), 1)`，local_size 8×8×1。
+//   **必须**用二维全局索引换算（见 gpu_common.glsl 的「一维分派陷阱」）：
+//       ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+//   若错用 `gl_LocalInvocationIndex` 直接当索引，只会覆盖 1/64 的像素 ——
+//   静默丢数据，且无 GPU 环境下静态比对**查不出**。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（必须如实阅读）
+// ══════════════════════════════════════════════════════════════════════════
+//   SOURCE-TODO-YUV-1  只支持**交错色度平面**（`chroma_pixel_stride == 2`）。
+//                      真平面 I420 时写全 0（alpha=0）表示"未产出"，
+//                      由调用方走 CPU 回退。见 common 头的 YUV-1 登记。
+//
+// 本文件**从未被编译过**（本机无 glslang/glslc）。它与 MSL 侧的一致性
+// 目前完全来自 `tools/shader_parity.py` 的**静态结构比对**（P1..P11），
+// 不是编译或运行验证。数值正确性由 CPU 规则本体在桌面锁定。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconYuvToBgraGpuParams p;
+};
+
+// 输入纹理：一律 `texelFetch`（最近邻、无过滤、不依赖 sampler）——
+// 与 VK-DIFF-4 的纪律一致。**本算法尤其不能容忍过滤**：色度是 2×2 下采样，
+// 若硬件做了双线性插值，等于在色度上做了一次未登记的平滑（docs/04 IR-4
+// 禁止把滤波结果当作更准的数据）。
+//
+//   y_tex     —— r8（`.r` = Y，全分辨率）
+//   cbcr_tex  —— rg8（`.r` = Cb、`.g` = Cr，半分辨率；顺序由 C++ 侧按
+//                `cb_index_in_pair` 建视图时确定，kernel 不分支）
+layout(set = 0, binding = 1) uniform texture2D y_tex;
+layout(set = 0, binding = 2) uniform texture2D cbcr_tex;
+
+layout(rgba8, set = 0, binding = 3) uniform image2D out_bgra;
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_yuv_to_bgra(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_yuv_to_bgra(ivec2 gid) {
+    // 越界保护：分派是按 8 的倍数向上取整的，尾部线程必须自行退出。
+    if (gid.x >= p.out_width || gid.y >= p.out_height) return;
+
+    // 前置：只支持交错色度平面（YUV-1）。真平面 I420 时**不产出** ——
+    // alpha=0 是"未写出"哨兵，调用方据此走 CPU 回退（不静默给错结果）。
+    if (p.chroma_pixel_stride != 2) {
+        imageStore(out_bgra, gid, vec4(0.0));
+        return;
+    }
+
+    // ── Y：全分辨率 ────────────────────────────────────────────────────────
+    // r8 纹理解包为 normalized float（[0,1]），按 255 还原回整数域，
+    // 再做与 CPU 规则本体**完全相同**的归一化 —— 保证"归一化 + 量化"
+    // 两个环节的取舍与 CPU 侧一字不差（否则出现 ±1 量化差，跨端对拍失败）。
+    float y_raw = round(texelFetch(y_tex, gid, 0).r * 255.0);
+
+    // ── Cb/Cr：半分辨率，右移一位取色度像素 ───────────────────────────────
+    ivec2 cgid = ivec2(gid.x >> 1, gid.y >> 1);
+    vec2 cbcr_raw = round(texelFetch(cbcr_tex, cgid, 0).rg * 255.0);
+
+    // ── 归一化（系数由 C++ 侧经 params 传入）──────────────────────────────
+    float y  = (y_raw - p.y_bias) * p.y_gain;
+    float cb = (cbcr_raw.x - p.c_bias) * p.c_gain;
+    float cr = (cbcr_raw.y - p.c_bias) * p.c_gain;
+
+    // ── 色彩矩阵（系数由 C++ 侧派生后传入）─────────────────────────────────
+    float r = y + p.r_from_cr * cr;
+    float b = y + p.b_from_cb * cb;
+    float g = y + p.g_from_cr * cr + p.g_from_cb * cb;
+
+    // ── 量化：先钳后乘（口径同 CPU 规则本体；先乘后钳会在边界溢出 8 位）─────
+    vec3 rgb = clamp(vec3(r, g, b), vec3(0.0), vec3(1.0));
+
+    // ── 写出 BGRA8：rgba8 存储图像的 `.bgra` 分量排列 → 内存序 B,G,R,A ─────
+    imageStore(out_bgra, gid, vec4(rgb.z, rgb.y, rgb.x, 1.0));
+}
+
+void main() {
+    // 二维分派：必须用 xy 两个分量（见文件头「调度」段的陷阱说明）。
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    recon_yuv_to_bgra(gid);
+}

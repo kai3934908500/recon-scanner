@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// recon_mvs_reduce.comp — CB-6 融合归约 + 一致性检查（Vulkan 实现）
+//
+// 契约：docs/05 §5.9.2（CB-6）、docs/05 §5.10（MVS 输出契约）、docs/12 §4.4。
+//
+// 函数名 `recon_mvs_reduce` 与 common 头 / MSL 侧逐字相同（MT-3）。
+//
+// ── 输出契约（docs/05 §5.10）──────────────────────────────────────────────
+//   `D_r` 深度图   float32, W×H, **米**，沿**光轴 z**（不是径向距离）
+//   `C_r` 置信度图 float32, W×H, [0,1]，融合权重归一化后的值
+//   支撑视图数     ——（本实现写入 support 通道，供 06 判断点的可靠性）
+//
+// ⚠️ **单位与坐标**：`D_r` 沿光轴 z（与 docs/02 §5.5 F-1 深度语义一致）；
+//    融合点云为 **Y-up 右手系、米**（docs/05 §5.10「坐标系统一」）。
+//
+// ── 与 CB-5 的**路径耦合**（必须一起读）────────────────────────────────────
+// CB-5 的定点回退路径把累加器写成 `int`（scale = 2^12），本 pass 必须
+// **按同一条件编译读回并反量化**。若两端选择不一致（如 CB-5 用 A、CB-6 用 B），
+// 累加器会被按错误的类型解释 —— 这是**静默失效**，且不会编译报错。
+// 故两个文件的 `#ifdef RECON_VK_FLOAT_ATOMIC` **必须由同一个 CMake 定义控制**
+// （见 CMakeLists 的 `recon_shaders_vulkan` target 说明）。
+//
+// ── 输入/输出 ─────────────────────────────────────────────────────────────
+// set 0 binding 0  → UBO   ReconMvsGpuParams
+// set 0 binding 1  → SSBO  体素加权深度累加器（类型随路径）
+// set 0 binding 2  → SSBO  体素权重累加器（类型随路径）
+// set 0 binding 3  → 存储图像 out_depth
+// set 0 binding 4  → 存储图像 out_conf
+// set 0 binding 5  → 存储图像 out_support
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ 实现状态（与 MSL 侧 **同步**）
+// ══════════════════════════════════════════════════════════════════════════
+//   SOURCE-TODO-MVS-4  索引用 `dim = ref_width × ref_height` 占位维度（与 CB-5
+//                  同源缺口）。真实实现须用体素网格维度。
+//   ⚠️ 由于占位维度 + 无上界检查，本 pass 对**越界索引的读**风险与 CB-5 的
+//      越界写风险**同源**。两者必须在接入真体素网格时**同时**修好，
+//      不得只修一边（半边保护等于没有保护）。
+// ══════════════════════════════════════════════════════════════════════════
+
+#version 450
+
+layout(local_size_x = RECON_VK_WORKGROUP_X,
+       local_size_y = RECON_VK_WORKGROUP_Y,
+       local_size_z = RECON_VK_WORKGROUP_Z) in;
+
+#include "gpu_common.glsl"
+
+layout(set = 0, binding = 0, std140) uniform ParamsBlock {
+    ReconMvsGpuParams p;
+};
+
+// 累加器类型必须与 CB-5 的**同一条件编译**保持一致（见文件头「路径耦合」）。
+#ifdef RECON_VK_FLOAT_ATOMIC
+layout(std430, set = 0, binding = 1) readonly buffer VoxelSumBlock { float voxel_sum[]; };
+layout(std430, set = 0, binding = 2) readonly buffer VoxelWBlock   { float voxel_w[];   };
+#else
+layout(std430, set = 0, binding = 1) readonly buffer VoxelSumBlock { int voxel_sum[]; };
+layout(std430, set = 0, binding = 2) readonly buffer VoxelWBlock   { int voxel_w[];   };
+#endif
+
+layout(r32f, set = 0, binding = 3) uniform writeonly image2D out_depth;
+layout(r32f, set = 0, binding = 4) uniform writeonly image2D out_conf;
+layout(r32f, set = 0, binding = 5) uniform writeonly image2D out_support;
+
+// ---------------------------------------------------------------------------
+// 读回累加器：两条路径的**唯一差异点**，封装成函数使算法主体只有一份。
+// 定点路径在此**反量化**（× 1/2^12），调用方拿到的永远是 float，
+// 与路径 A 语义一致。
+// ---------------------------------------------------------------------------
+#ifdef RECON_VK_FLOAT_ATOMIC
+void recon_vk_local_voxel_load(int idx, out float s, out float w) {
+    s = voxel_sum[idx];
+    w = voxel_w[idx];
+}
+#else
+void recon_vk_local_voxel_load(int idx, out float s, out float w) {
+    s = float(voxel_sum[idx]) * RECON_VK_FIXED_SCALE_INV;
+    w = float(voxel_w[idx])   * RECON_VK_FIXED_SCALE_INV;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 算法本体：与 MSL 侧 `kernel void recon_mvs_reduce(...)` 逐条对应
+// ---------------------------------------------------------------------------
+void recon_mvs_reduce(ivec2 gid) {
+    if (gid.x >= p.ref_width || gid.y >= p.ref_height) return;
+
+    int idx = gid.y * p.ref_width + gid.x;   // 与 CB-5 的占位维度同源（SOURCE-TODO-MVS-4）
+
+    float s;
+    float w;
+    recon_vk_local_voxel_load(idx, s, w);
+
+    if (w <= 0.0) {
+        imageStore(out_depth,   gid, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(out_conf,    gid, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(out_support, gid, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // 加权平均深度（docs/05 §5.10：D_r 为沿光轴 z，米）。
+    float z = s / w;
+    // 置信度 = 归一化权重（docs/05 §5.10：融合权重归一化后的值），钳制 [0,1]。
+    float conf = clamp(w / max(float(p.min_view_consistency), 1.0), 0.0, 1.0);
+
+    imageStore(out_depth,   gid, vec4(z,    0.0, 0.0, 1.0));
+    imageStore(out_conf,    gid, vec4(conf, 0.0, 0.0, 1.0));
+    imageStore(out_support, gid, vec4(w,    0.0, 0.0, 1.0));
+}
+
+void main() {
+    recon_mvs_reduce(ivec2(gl_GlobalInvocationID.xy));
+}
