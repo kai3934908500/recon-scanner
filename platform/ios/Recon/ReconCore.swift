@@ -29,7 +29,13 @@ import simd
 /// 为什么不引用 C 枚举：Swift 只能 import C 的**整数常量**，无法遍历 C 枚举
 /// 成员，故仍以 Swift 枚举承载；一致性靠闸门而非语言特性保证。
 /// **改本表必须同步头文件（或反之），CI 会拒收单边改动。**
-enum ReconStatus: Int32 {
+///
+/// `public`：本类型是 UI 层公开 API 的一部分（`ReconOutcome.failed(status:)`、
+/// `ReconStatusPresentation` 等均以其为参数/返回），而 UI 源文件与 `ReconCore`
+/// **不在同一 module**（前者属 `Recon` app target，后者属 `ReconCore` 库 target）。
+/// 保持 internal 会让所有引用它的 public 声明报
+/// 「cannot be declared public because its parameter uses an internal type」。
+public enum ReconStatus: Int32 {
     case ok = 0
 
     // 通用
@@ -129,27 +135,35 @@ extension ReconStatus {
 }
 
 /// 管线分支（`recon_pipeline_branch`）。
-enum ReconBranch: Int32 {
+///
+/// `public`：被 `ReconCapability.branch`（`public`）使用，理由同 `ReconCapability`。
+/// 取值必须与头文件 `recon_pipeline_branch` 逐值对应（G11 同类判据）。
+public enum ReconBranch: Int32 {
     case rgbd = 0
     case mono = 1
 }
 
 /// 设备能力（对应 `recon_capability`）。
-struct ReconCapability {
-    var branch: ReconBranch
-    var depthTier: Int32
-    var depthSource: Int32
-    var hasCamera: Bool
-    var hasImu: Bool
-    var hasLidar: Bool
-    var hasTof: Bool
-    var supportsGpu: Bool
-    var maxImageWidth: Int32
-    var maxImageHeight: Int32
-    var maxFps: Int32
-    var imuMaxRateHz: Int32
-    var availableMemoryBytes: UInt64
-    var totalMemoryBytes: UInt64
+///
+/// `public`：由 UI 层 `ReconSessionController.capability`（`public`）与
+/// `CapabilityView.make(capability:)`（`public`）暴露 —— Swift 规则要求
+/// `public` 声明的参数/属性类型也必须是 `public`（与是否跨 module 无关，
+/// 同一 module 内同样强制）。成员与之同步，否则 memberwise init 不可见。
+public struct ReconCapability {
+    public var branch: ReconBranch
+    public var depthTier: Int32
+    public var depthSource: Int32
+    public var hasCamera: Bool
+    public var hasImu: Bool
+    public var hasLidar: Bool
+    public var hasTof: Bool
+    public var supportsGpu: Bool
+    public var maxImageWidth: Int32
+    public var maxImageHeight: Int32
+    public var maxFps: Int32
+    public var imuMaxRateHz: Int32
+    public var availableMemoryBytes: UInt64
+    public var totalMemoryBytes: UInt64
 }
 
 /// 网格信息（对应 `recon_mesh_info`）。
@@ -173,43 +187,86 @@ struct ReconMeshInfo {
 ///
 /// 与 Android 侧 `NativeBridge.getScanStats` 返回的 DoubleArray 布局**逐项对应**
 /// （见 native-lib.cpp 的 `kStatsCount` 注释），字段顺序不得单边调整。
-struct ReconScanStats {
-    var framesCaptured: UInt64
-    var framesAccepted: UInt64
-    var keyframes: UInt64
-    var imuSamples: UInt64
-    var durationS: Double
+///
+/// `public`：由 `ReconSessionController.scanStats`（`public`）暴露，理由同上。
+public struct ReconScanStats {
+    public var framesCaptured: UInt64
+    public var framesAccepted: UInt64
+    public var keyframes: UInt64
+    public var imuSamples: UInt64
+    public var durationS: Double
     /// 方位覆盖度 [0,1]（§3.3「覆盖方位」的真实来源，而非估算）。
-    var azimuthCoverage: Double
-    var elevationCoverage: Double
-    var anomalyBlur: UInt32
-    var anomalyFastMotion: UInt32
-    var anomalyLowOverlap: UInt32
-    var anomalySpecular: UInt32
-    var anomalyLowTexture: UInt32
-    var anomalyBlindSpot: UInt32
+    public var azimuthCoverage: Double
+    public var elevationCoverage: Double
+    public var anomalyBlur: UInt32
+    public var anomalyFastMotion: UInt32
+    public var anomalyLowOverlap: UInt32
+    public var anomalySpecular: UInt32
+    public var anomalyLowTexture: UInt32
+    public var anomalyBlindSpot: UInt32
 }
 
 /// 尺度标定结果（对应 `recon_scale_result`）。
-struct ReconScaleResult {
-    var ok: Bool
-    var scale: Double
+///
+/// `public`：由 `ReconSessionController.applyManualScale(longEdgeMM:)`
+/// （`public`）作为返回值暴露，也被 `CalibrationView` 的 `@State` 持有。
+/// 不提升访问级别会报「method cannot be declared public because its result
+/// uses an internal type」（CI 首次真编暴露），且**无法靠改调用点绕过** ——
+/// 公开 API 的签名必须自洽。成员同步 `public`，与 `ReconScanStats` 同风格。
+public struct ReconScaleResult {
+    public var ok: Bool
+    public var scale: Double
     /// 相对不确定度 σ_s/s（用于 §3.9 置信度三档判定：≤0.02 高 / ≤0.05 中 / 其余低）。
-    var relativeSigma: Double
-    var referenceType: Int32
-    var referenceWidthMM: Double
-    var referenceHeightMM: Double
-    var measuredWidthMM: Double
-    var measuredHeightMM: Double
+    public var relativeSigma: Double
+    public var referenceType: Int32
+    public var referenceWidthMM: Double
+    public var referenceHeightMM: Double
+    public var measuredWidthMM: Double
+    public var measuredHeightMM: Double
 }
 
 /// 进度回调协议。实现方需自行切回主线程再更新 UI。
-protocol ReconProgressDelegate: AnyObject {
+///
+/// ── 为什么继承 `Sendable`（而不是只 `AnyObject`）────────────────────────
+///
+/// `ReconSessionController.confirmReconstruct()` 把实现者**捕获进
+/// `worker.async { }`（`@Sendable` 闭包）**传给内核（内核在后台线程回调它）。
+/// 若协议本身不 `Sendable`，则 **existential 类型 `any ReconProgressDelegate`
+/// 也不是 Sendable** —— 即便具体实现类已标注 `@unchecked Sendable`（那是
+/// 对**具体类型**的声明，不传递到 `any P` 上）仍会报
+/// 「capture of 'proxy' with non-sendable type」（CI 首次真编暴露）。
+///
+/// 继承 `Sendable` 后，协议要求**每个实现者**都是 Sendable；本工程唯一实现
+/// `ProgressProxy` 已标注 `@unchecked Sendable`（依据见其定义处注释），
+/// 语义上成立而非放宽。`ProgressBox` 里的 `weak var delegate` 也随之可安全
+/// 跨线程弱引用。
+protocol ReconProgressDelegate: AnyObject, Sendable {
     func onProgress(stage: Int32, progress: Double, message: String?)
 }
 
 /// core C ABI 的 Swift 门面。与 Android 侧 `NativeBridge` 一一对等。
+///
+/// ── 为什么是 `@unchecked Sendable`（而不是 `Sendable`）──────────────────────
+///
+/// `ReconSessionController.confirmReconstruct()` 把本对象**捕获进
+/// `worker.async { }`（`@Sendable` 闭包）**在后台队列调用
+/// `recon_run_reconstruction`（该函数同步阻塞，不得在主线程跑）。不标注
+/// `Sendable` 会报「capture of 'core' with non-sendable type 'ReconCore?' in a
+/// '@Sendable' closure」（CI run 41274385705 首次真编暴露）。
+///
+/// 用 `@unchecked`（而非编译器可验证的 `Sendable`）是本文件**已明文声明的
+/// 调用纪律**的直接产物 —— 见文件头「设计约束 ③」：
+///     **句柄不可并发**：除 `recon_cancel` 外，同一 context 不跨线程并发调用。
+/// 即：`ReconCore` 本身**不含**线程同步原语（内部持 C 侧裸句柄），
+/// 安全性由**调用方**的串行化保证（重建走单条串行 `worker` 队列、帧投递走
+/// 自有队列且与重建不重叠 —— `confirmReconstruct()` 会先 `capture.stop()`）。
+/// 这类「正确性由使用约定而非类型系统保证」的情况，正是 `@unchecked Sendable`
+/// 的既定用途。**代价是诚实的**：若将来有人新增一条并发调用路径，
+/// 编译器**不会**拦 —— 故此处显式复述该前提，供后人核对。
+extension ReconCore: @unchecked Sendable {}
+
 final class ReconCore {
+
 
     /// 与 core 的 `RECON_ABI_VERSION` 对应。
     static let expectedAbiVersion: UInt32 = 1

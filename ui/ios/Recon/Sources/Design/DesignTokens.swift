@@ -44,6 +44,19 @@ public enum ReconColor {
         public static let third = pair(light: "#FFFFFF", dark: "#2C2C2E")
     }
 
+    /// `bg` 命名空间别名（**小写**，与 docs/09 §1.3 的令牌名 `bg.page` 逐字对应）。
+    ///
+    /// 为什么需要它：Swift 的嵌套类型**不能**用小写成员访问（`ReconColor.bg`
+    /// 不是 `Bg` 的合法写法，编译器报 `type 'ReconColor' has no member 'bg'`）。
+    /// 但 docs/09 §1.3 的表里令牌名就是 `bg.page` / `bg.secondary` / …
+    /// 若强制调用点改写成 `ReconColor.Bg.page`，令牌名与规格表就不再逐字对应，
+    /// 后续按规格核对时会产生「代码里找不到 `bg.page`」的假缺口。
+    ///
+    /// 故在此提供**同一份值**的小写入口：`public static let bg = Bg.self`。
+    /// 它不复制任何色值（`Bg` 仍是唯一真源），只是暴露一个符合规格命名的访问路径。
+    /// 两种写法 `ReconColor.bg.page` 与 `ReconColor.Bg.page` 完全等价。
+    public static let bg = Bg.self
+
     // --- separator --------------------------------------------------------
     /// `separator` — 1px 分隔线
     public static let separator = pair(light: "#C6C6C8", dark: "#38383A")

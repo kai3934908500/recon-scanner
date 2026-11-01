@@ -110,10 +110,13 @@ public final class IMURingBuffer {
     public func append(_ sample: IMUSample) {
         let a = sample.accelIncludingGravity
         let g = sample.gyro
-        impl.append(
-            timestampNs: Int64(sample.timestamp * 1_000_000_000),
-            accelX: a.x, accelY: a.y, accelZ: a.z,
-            gyroX: g.x, gyroY: g.y, gyroZ: g.z)
+        // ⚠️ ObjC 选择子 `appendTimestampNs:accelX:accelY:accelZ:gyroX:gyroY:gyroZ:`
+        //    导入 Swift 后**首个参数标签保留完整名 `timestampNs`**（ObjC 不区分
+        //    方法基名与首参标签，Swift 把选择子首段整体作为首参标签）。
+        //    故不能写 `impl.append(...)`（那是把 `append` 当无标签基名）。
+        impl.append(timestampNs: Int64(sample.timestamp * 1_000_000_000),
+                    accelX: a.x, accelY: a.y, accelZ: a.z,
+                    gyroX: g.x, gyroY: g.y, gyroZ: g.z)
     }
 
     /// 取「`timestamp` 之前（含等于）的窗口」，并把已消费样本移出缓冲。
@@ -129,7 +132,9 @@ public final class IMURingBuffer {
     /// 第 300 帧的窗口将携带全部历史样本 —— 内核的预积分是**增量式**的
     /// （docs/02 §3.5），重复预积分已算过的区间会**双重计数**。
     public func window(before timestamp: TimeInterval) -> ReconImuWindow {
-        impl.windowBeforeNs(Int64(timestamp * 1_000_000_000))
+        // ⚠️ ObjC `- (ReconImuWindow *)windowBeforeNs:` 导入 Swift 后为
+        //    `window(beforeNs:)`（Swift 的 API 改写把 `Ns` 从基名拆出）。
+        impl.window(beforeNs: Int64(timestamp * 1_000_000_000))
     }
 
     /// 清空缓冲（停止采集时调用）。

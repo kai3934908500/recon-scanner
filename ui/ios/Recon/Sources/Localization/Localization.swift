@@ -24,6 +24,12 @@
 //
 
 import Foundation
+// ⚠️ `EnvironmentKey` / `EnvironmentValues` 来自 **SwiftUI**，不在 Foundation。
+//    本文件下方的 `L10nEnvironmentKey: EnvironmentKey` 与
+//    `extension EnvironmentValues { var l10n … }` 都依赖它 —— 只 import
+//    Foundation 会报 "cannot find type 'EnvironmentKey' in scope"
+//    （CI run 41274385705 首次真编暴露）。
+import SwiftUI
 
 // ===========================================================================
 // MARK: - 语言清单（§6.1 的 20 个 locale）

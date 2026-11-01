@@ -98,11 +98,22 @@ public struct MonoNumber: View {
     }
 
     /// 整数千分位格式化（`1284512` → `1,284,512`）。
-    public static func group(_ n: Int) -> String {
+    ///
+    /// `nonisolated`：本函数是**纯格式化**，不触碰任何视图状态，却被
+    /// `ScanSessionModel.frameCountText(_:)`（`nonisolated public static`）
+    /// 调用 —— 而 `MonoNumber: View` 的类型成员在 Swift 6 下默认 `@MainActor`
+    /// 隔离，于是非隔离上下文调用它会报
+    /// 「call to main actor-isolated static method 'group' in a synchronous
+    /// nonisolated context」。标记 `nonisolated` 是**语义正确**的修法
+    /// （它本就不需要 actor 隔离），而非为了让编译通过而放宽调用点。
+    /// `formatter` 也随之 `nonisolated(unsafe)` —— `NumberFormatter` 的
+    /// `string(from:)` 在 Apple 文档中标注为线程安全；此处只在静态初始化时
+    /// 配置一次、之后只读，故该标注是准确的（不是"为过编译而撒谎"）。
+    nonisolated public static func group(_ n: Int) -> String {
         Self.formatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
-    private static let formatter: NumberFormatter = {
+    nonisolated(unsafe) private static let formatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.groupingSeparator = ","

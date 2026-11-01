@@ -328,8 +328,16 @@ public final class ReconSessionController: ObservableObject {
     /// 后台重建队列（`recon_run_reconstruction` 阻塞，不得在主线程跑）。
     private let worker = DispatchQueue(label: "recon.reconstruction", qos: .userInitiated)
 
-    public init(session: ScanSessionModel = ScanSessionModel()) {
-        self.session = session
+    /// ⚠️ `session` 用 **`Optional` + init 体内构造**，而不是默认参数
+    /// `= ScanSessionModel()`。原因（Swift 并发规则，CI 首次真编暴露）：
+    /// **默认参数表达式在调用点求值**，而 `ScanSessionModel` 是 `@MainActor`
+    /// 隔离类型、其 `init()` 亦为 MainActor-isolated；当调用点处于非隔离上下文
+    /// （如 `@StateObject` 之外的构造路径）时，会报
+    /// 「call to main actor-isolated initializer 'init()' in a synchronous
+    /// nonisolated context」。放到 init 体内则**继承 init 自身的 actor 隔离**
+    /// （本类 `@MainActor`），语义与隔离都正确。
+    public init(session: ScanSessionModel? = nil) {
+        self.session = session ?? ScanSessionModel()
         wireCaptureCallbacks()
     }
 
@@ -758,13 +766,28 @@ public final class ReconSessionController: ObservableObject {
                                  fraction: 0, message: nil)
         outcome = .running
 
+        // ⚠️ 在**主线程**先取好两样东西，再进 worker 闭包（Swift 6 并发，CI 首次真编暴露）：
+        //    ① `progressProxy` 是 `@MainActor` 隔离的 `lazy var` —— 在
+        //       `@Sendable` 的 worker 闭包里引用它会报
+        //       「main actor-isolated property 'progressProxy' can not be
+        //       referenced from a Sendable closure」。提到闭包外取值，
+        //       既消除该错误，也**真正落实了 `progressProxy` 注释里声明的
+        //       "调用点在主线程先取好引用"这一前提**（原代码其实没有做到，
+        //       注释与实现不符；此处顺手修正为与注释一致）。
+        //    ② `core` 是非 Sendable 的 C ABI 门面；把它作为**局部常量**捕获
+        //       （而非捕获 `self` 再读 `self.core`）后仍需 `ReconCore` 声明
+        //       `@unchecked Sendable`，否则报「capture of 'core' with
+        //       non-sendable type」。该声明的依据见 ReconCore.swift：
+        //       「除 recon_cancel 外，同一 context 不跨线程并发调用」——
+        //       worker 队列串行 + 帧投递另走自有队列，满足该前提。
         let core = self.core
+        let proxy = self.progressProxy
         worker.async { [weak self] in
             guard let core else {
                 Task { @MainActor in self?.finishFailure(.invalidArgument) }
                 return
             }
-            let status = core.runReconstruction(delegate: self?.progressProxy)
+            let status = core.runReconstruction(delegate: proxy)
             Task { @MainActor in
                 self?.finishReconstruction(status)
             }
@@ -822,7 +845,13 @@ public final class ReconSessionController: ObservableObject {
         // 未知阶段不静默归类（ReconStage.init?(abi:) 返回 nil）。
         let mapped = ReconStage(abi: stage)
         let segment = mapped.flatMap(ReconStageMap.uiSegment(for:))
-        let name = segment.map(RebuildStage.name(_:))
+        // ⚠️ 不能写 `segment.map(RebuildStage.name(_:))`：
+        //    `RebuildStage.name(_:branch:)` 有**默认参数**，而 Swift 的
+        //    **函数引用（function reference）不支持默认参数** —— 传 `name(_:)`
+        //    会被当作缺失实参，报 "generic parameter 'E'/'U' could not be
+        //    inferred" 与 "type 'RebuildStage' has no member 'name'"。
+        //    用显式闭包即可（这是 `map` 传函数引用的通用注意点）。
+        let name = segment.map { RebuildStage.name($0) }
         progress = ReconProgress(abiStage: stage,
                                  uiSegment: segment,
                                  segmentName: name,
@@ -889,7 +918,14 @@ public final class ReconSessionController: ObservableObject {
 /// `progressProxy` 是 `lazy var`，在后台线程首次访问理论上可能竞态；实际调用点
 /// 在 `confirmReconstruct()`（主线程）先取好引用再进入 worker，故安全。
 /// 这里显式标注该前提，避免后续改动无声破坏它。
-private final class ProgressProxy: ReconProgressDelegate {
+///
+/// `@unchecked Sendable`：本对象被**捕获进 `worker.async { }`（`@Sendable`
+/// 闭包）**传给内核 —— 不标注会报「capture of 'proxy' with non-sendable
+/// type」（CI 首次真编暴露）。它本身**无可变状态**（只有一个 `let handler`
+/// 闭包），内部实现的 `onProgress` 只做 `handler(...)` 转发；
+/// 而 `handler` 内部第一件事就是 `Task { @MainActor in … }` 弹回主线程
+/// （见 `progressProxy` 的定义），故不产生跨线程共享可变状态。
+private final class ProgressProxy: ReconProgressDelegate, @unchecked Sendable {
     private let handler: (Int32, Double, String?) -> Void
     init(_ handler: @escaping (Int32, Double, String?) -> Void) {
         self.handler = handler

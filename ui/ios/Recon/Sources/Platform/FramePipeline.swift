@@ -248,7 +248,13 @@ final class FramePipeline: @unchecked Sendable {
             SIMD3<Double>(pose.r.6, pose.r.7, pose.r.8))
         let c = -(r3.transpose * t4)
         pose.t = (c.x, c.y, c.z)
-        pose.timestamp_ns = timestampNs
+        // ⚠️ `recon_pose.timestamp_ns` 是 **`double`**（单位仍是纳秒，见
+        //    recon_c_api.h:62），而 `recon_frame.timestamp_ns`（同文件:215）是
+        //    `uint64_t`。同一个纳秒量在两条结构里类型不同 —— 故此处必须显式
+        //    转 `Double`，否则 `UInt64 → Double` 无隐式转换，编译失败。
+        //    精度：纳秒级时间戳（~1e18）在 double 下有效位约 15–16 位十进制，
+        //    即 ~1e3 ns 分辨率 —— 该字段由内核按 double 契约消费，保持原样。
+        pose.timestamp_ns = Double(timestampNs)
 
         // ── ⑦ 帧号：在锁内自增，保证唯一且单调（帧队列串行，但实现不依赖该前提）
         stateLock.lock()

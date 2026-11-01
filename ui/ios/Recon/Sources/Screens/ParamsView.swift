@@ -264,6 +264,14 @@ public struct ParamGroup: Identifiable {
 
     /// 展开态可见参数。真实键与取值由 `ReconSessionController.groupItems` 提供
     /// （数据源是内核 `recon_export_params`），本视图不伪造。
+    ///
+    /// `@MainActor`：`ReconSessionController` 是 `@MainActor` 隔离类，
+    /// 其 `groupItems(groupId:expert:)` 也是隔离方法；在**非隔离**上下文调用
+    /// 会报「call to main actor-isolated instance method 'groupItems(...)' in a
+    /// synchronous nonisolated context」（CI 首次真编暴露）。
+    /// 标注 `@MainActor` 是**语义正确**的（本方法的唯一调用者是视图 body，
+    /// 本就在主线程），不是为过编译而放宽调用点。
+    @MainActor
     public func visibleKeys(expert: Bool,
                             from controller: ReconSessionController) -> [ParamItem] {
         controller.groupItems(groupId: id, expert: expert)

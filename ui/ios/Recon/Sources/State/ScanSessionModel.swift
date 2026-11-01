@@ -66,7 +66,12 @@ public final class ScanSessionModel: ObservableObject {
         if let failureStage {
             machine.setFailureStage(failureStage)
         }
-        let next = machine.applyEvent(event)
+        // ⚠️ ObjC 选择子 `- (ReconCaptureState)applyEvent:(ReconCaptureEvent)event;`
+        //    导入 Swift 后被 **API 改写**为 `apply(_:)` —— 因为方法基名 `applyEvent`
+        //    的 `Event` 后缀与首参类型 `ReconCaptureEvent` 重复，Swift 会去掉它。
+        //    写 `machine.applyEvent(event)` 会报
+        //    "'applyEvent' has been renamed to 'apply(_:)'"（CI 首次真编暴露）。
+        let next = machine.apply(event)
         syncFromMachine(nextState: next)
         return next
     }

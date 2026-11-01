@@ -104,14 +104,12 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
         "在 iOS Swift 里重写一份 IMU 切窗（循环条件含 timestamp 比较）",
         "疑似重写 IMU 切窗",
         [(IOS_IMU_WINDOW,
-          "    public func window(before timestamp: TimeInterval) -> ReconImuWindow {\n"
-          "        impl.windowBeforeNs(Int64(timestamp * 1_000_000_000))\n"
+          "        impl.window(beforeNs: Int64(timestamp * 1_000_000_000))\n"
           "    }\n",
-          "    public func window(before timestamp: TimeInterval) -> ReconImuWindow {\n"
           "        // 注入：重写一份切窗规则\n"
           "        var split = 0\n"
           "        while split < 0 && sampleTs[split] <= timestamp { split += 1 }\n"
-          "        return impl.windowBeforeNs(Int64(timestamp * 1_000_000_000))\n"
+          "        impl.window(beforeNs: Int64(timestamp * 1_000_000_000))\n"
           "    }\n")],
     ),
     (
