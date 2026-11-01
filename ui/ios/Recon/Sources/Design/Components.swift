@@ -106,19 +106,27 @@ public struct MonoNumber: View {
     /// 「call to main actor-isolated static method 'group' in a synchronous
     /// nonisolated context」。标记 `nonisolated` 是**语义正确**的修法
     /// （它本就不需要 actor 隔离），而非为了让编译通过而放宽调用点。
-    /// `formatter` 是 `static let` 且类型 `NumberFormatter` 已符合 `Sendable`
-    /// （Foundation 在 Swift 6 下为其标注），故**不加** `nonisolated(unsafe)` ——
-    /// 加了会被当作「不必要的 unsafe 标注」而**在零警告标准下直接报错**
-    /// （`SWIFT_TREAT_WARNINGS_AS_ERRORS=YES`）：
+    ///
+    /// `formatter` 也必须 `nonisolated`：它是 `View` 的静态成员，默认同样
+    /// 继承 `@MainActor` 隔离，不加则 `group`（非隔离）读它会报
+    /// 「main actor-isolated static property 'formatter' can not be referenced
+    /// from a nonisolated context; this is an error in the Swift 6 language
+    /// mode」（CI run 41276039107）。
+    ///
+    /// 但**不能**加 `nonisolated(unsafe)`：`NumberFormatter` 在 Swift 6 下
+    /// 已符合 `Sendable`，`static let` 本身即不可变全局，`unsafe` 变体属
+    /// 多余标注，在本工程 `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES`（零警告标准）
+    /// 下会**直接报错**：
     ///   "'nonisolated(unsafe)' is unnecessary for a constant with 'Sendable'
     ///    type 'NumberFormatter', consider removing it"
-    ///   （CI run 41275447507）。`static let` 本身即不可变全局，
-    /// 无需额外的隔离豁免。
+    ///   （CI run 41275447507）。
+    /// 即：正确形式是**无 `(unsafe)` 的 `nonisolated`** —— 两轮 CI 各证伪了
+    /// 一个方向（少了不行、多了也不行），此处为两次实证后的收敛解。
     nonisolated public static func group(_ n: Int) -> String {
         Self.formatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
-    private static let formatter: NumberFormatter = {
+    nonisolated private static let formatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.groupingSeparator = ","
