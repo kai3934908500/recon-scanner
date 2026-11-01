@@ -135,6 +135,42 @@
 #define RECON_VULKAN_GPU_COMMON_GLSL_
 
 // ---------------------------------------------------------------------------
+// 采样器无关纹理读取：必须显式请求的编译期扩展
+// ---------------------------------------------------------------------------
+//
+// ⚠️ **为什么必须声明**（第四十一轮首次真编译暴露的真实缺陷）：
+//   `texelFetch(<texture2D>, coord, lod)` 的第一个参数**不带 sampler**
+//   （即裸 `texture2D`），而 GLSL 核心只为 `sampler2D` 提供 `texelFetch`
+//   重载。要对裸 `texture2D` 做 texel fetch，必须请求扩展
+//   `GL_EXT_samplerless_texture_functions` —— 它补上该重载。
+//
+//   缺此声明时 glslang 报两处（8 个 .comp 全部同源，均指向本文件 338 行）：
+//     ERROR: gpu_common.glsl:338: 'texelFetch' : required extension not
+//            requested: GL_EXT_samplerless_texture_functions
+//     ERROR: gpu_common.glsl:338: '=' : cannot convert from
+//            'global highp 4-component vector of float' to 'temp highp float'
+//   （第二处是连带的：`texelFetch` 未解析 → 返回类型推断失败 → `.r` 取分量
+//     得到 vec4 而非 float。补上扩展后它自动消失。）
+//
+//   ⚠️ 这个错误**此前不可能被发现**：在 `#include "gpu_common.glsl"` 真正生效
+//   之前（缺 `GL_GOOGLE_include_directive`，见各 .comp 的说明），本文件
+//   **从未被任何编译器读过**。这正是"设计意图未落实"的一种：文件存在、
+//   闸门 P1..P13 全绿，但内容从未进过编译器。
+//
+//   本扩展是**纯源码层**要求：不影响 SPIR-V 产物（`texelFetch` 编译后是核心
+//   `OpImageFetch`），也不要求任何运行期设备特性 —— 故不存在"旧驱动不支持"
+//   的风险。用 `require` 而非 `enable`：本文件的 helper 依赖该重载，缺它
+//   必然编译失败；大声失败优于静默降级（docs/14 CT-9 无静默降级）。
+//
+//   与 Metal 侧的差异（真实不对称，产物语义一致）：MSL 的
+//   `texture2d<T, access::read>` 本身**没有** sampler 概念，`read(uint2)`
+//   直接可用，**不需要**任何扩展声明。这是**编译期语法**层面的两端差异，
+//   与下文 VK-DIFF-4（深度图用 `texelFetch` 做最近邻采样、不建 sampler 对象）
+//   是同一处设计的两面：VK-DIFF-4 说明**为何**不建 sampler，本段说明
+//   不建 sampler 后**必须**补哪个扩展。
+#extension GL_EXT_samplerless_texture_functions : require
+
+// ---------------------------------------------------------------------------
 // workgroup 尺寸（docs/05 §5.9.1：统一 8×8 = 64 线程）
 // ---------------------------------------------------------------------------
 //

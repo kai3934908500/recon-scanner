@@ -356,6 +356,43 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           '#include "gpu_common.glsl"\n',
           '#include "no_such_common.glsl"\n')],
     ),
+    # --------------------------------------------------------------------
+    # P15 Vulkan 共享头的编译期扩展自洽
+    #   现实原型：第四十一轮**首次真编译** —— P14 修好 `#include` 可见性后，
+    #   `gpu_common.glsl` 第一次进编译器，立刻报（8 个 .comp 全部同源）：
+    #     ERROR: gpu_common.glsl:338: 'texelFetch' : required extension
+    #            not requested: GL_EXT_samplerless_texture_functions
+    #     ERROR: gpu_common.glsl:338: '=' : cannot convert from
+    #            'global highp 4-component vector of float' to 'temp highp float'
+    #   P14 只能证明"共享头被读到了"，证明不了"共享头自己能编过"。
+    # --------------------------------------------------------------------
+    (
+        # P15-a：用 samplerless 函数但不声明扩展。
+        "P15a-missing-samplerless-ext",
+        "删掉 `GL_EXT_samplerless_texture_functions` 声明（texelFetch 失效）",
+        "samplerless",
+        [(VULKAN_COMMON,
+          "#extension GL_EXT_samplerless_texture_functions : require\n",
+          "")],
+    ),
+    (
+        # P15-b：声明了扩展却没有 samplerless 调用点（多余声明）。
+        "P15b-unused-samplerless-ext",
+        "把 texelFetch 改成不存在的名字，令扩展声明变成多余",
+        "该声明是多余的",
+        [(VULKAN_COMMON,
+          "    float v00 = texelFetch(tex, ivec2(c0.x, c0.y), 0).r;\n",
+          "    float v00 = recon_no_such_fetch(tex, ivec2(c0.x, c0.y), 0).r;\n"),
+         (VULKAN_COMMON,
+          "    float v10 = texelFetch(tex, ivec2(c1.x, c0.y), 0).r;\n",
+          "    float v10 = recon_no_such_fetch(tex, ivec2(c1.x, c0.y), 0).r;\n"),
+         (VULKAN_COMMON,
+          "    float v01 = texelFetch(tex, ivec2(c0.x, c1.y), 0).r;\n",
+          "    float v01 = recon_no_such_fetch(tex, ivec2(c0.x, c1.y), 0).r;\n"),
+         (VULKAN_COMMON,
+          "    float v11 = texelFetch(tex, ivec2(c1.x, c1.y), 0).r;\n",
+          "    float v11 = recon_no_such_fetch(tex, ivec2(c1.x, c1.y), 0).r;\n")],
+    ),
 ]
 
 
@@ -441,7 +478,7 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 P1..P14 均有效）")
+          f"（闸门 P1..P15 均有效）")
     return 0
 
 

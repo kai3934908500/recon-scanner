@@ -132,16 +132,60 @@ if [ "${#SOURCES[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# ⚠️ **每个文件都编、都收输出、最后汇总**（第四十一轮的教训，勿"简化"回
+#    `set -e` 直接调用）：
+#    ① `set -e` + 裸调用时，**第一个**失败的文件就让脚本退出 —— 后续 7 个
+#       文件的信息全丢，一次迭代只能看到一个文件的错（而 8 个文件往往同病）。
+#    ② `glslangValidator` 的**退出码 = 错误条数**（不是 0/1 约定），故裸调用
+#       会以 `2`、`6` 这类码退出，日志里只留一句
+#       `Process completed with exit code 2.` —— 看不出是哪个文件、什么错。
+#    ③ 编译输出必须转成 `::error file=...,line=...::msg`：GitHub runner 会把
+#       它提取为 check-run **annotation**（无需 admin 权限即可经 API 读取），
+#       故 CI 失败时错误详情对我可观测，而不是淹在需 admin 的原始日志里。
+FAILED=0
+LOG_DIR="${SPV_DIR}/../logs"
+mkdir -p "${LOG_DIR}"
 for src in "${SOURCES[@]}"; do
   base="$(basename "${src}" .comp)"
-  echo "    - ${src} → ${SPV_DIR}/${base}.spv"
+  log="${LOG_DIR}/${base}.log"
   # `-V` = 编译为 SPIR-V；`--target-env` 固定目标环境，避免不同 SDK
   # 默认值不同导致产物不可复现（docs/12 §1.1 确定性构建要求）。
   # `-I` 指向 shaders/vulkan 以便 `#include "gpu_common.glsl"` 能解析。
-  "${GLSLANG}" -V --target-env "${TARGET_ENV}" \
-      -I"${VULKAN_SRC_DIR}" \
-      "${src}" -o "${SPV_DIR}/${base}.spv"
+  # ⚠️ `-I` 与其参数必须**紧贴**（`-Ipath`），glslang 不接受 `-I path`。
+  if "${GLSLANG}" -V --target-env "${TARGET_ENV}" \
+        -I"${VULKAN_SRC_DIR}" \
+        "${src}" -o "${SPV_DIR}/${base}.spv" > "${log}" 2>&1; then
+    echo "    ✓ ${src} → ${SPV_DIR}/${base}.spv"
+  else
+    rc=$?
+    echo "    ✗ ${src}（glslangValidator 退出码 ${rc} = 该文件错误条数）"
+    FAILED=$((FAILED + 1))
+    # 逐行转发：`ERROR: <file>:<line>: <msg>` 提取行号做成 annotation，
+    # 其余原样打印（保留上下文，如 `#include` 展开后的定位信息）。
+    echo "----- ${src} 编译输出 -----"
+    while IFS= read -r line; do
+      echo "${line}"
+      case "${line}" in
+        ERROR:*)
+          # 形如 `ERROR: path:LINE: MESSAGE` → 取行号
+          lno="$(printf '%s' "${line}" \
+                 | sed -n 's/^ERROR:[^:]*:\([0-9][0-9]*\):.*/\1/p')"
+          if [ -n "${lno}" ]; then
+            echo "::error file=${src},line=${lno}::${line}"
+          else
+            echo "::error file=${src}::${line}"
+          fi
+          ;;
+      esac
+    done < "${log}"
+    echo "----- ${src} 编译输出结束 -----"
+  fi
 done
+
+if [ "${FAILED}" -ne 0 ]; then
+  echo "[vulkan-shaders] FAIL：${#SOURCES[@]} 个 .comp 中有 ${FAILED} 个编译失败。"
+  exit 1
+fi
 
 # --- 步骤 2：校验产物 + 入口点 --------------------------------------------
 echo "[vulkan-shaders] 2) 校验 SPIR-V 与入口点"

@@ -65,6 +65,12 @@ docs/12 §4.4 的契约是「**算法同源、两端分别编译**」：
       见下方长注释）：`#include "gpu_common.glsl"` 必须早于任何引用它定义
       的宏的 `layout(local_size_*)`，且 `#version` 必须是第一个非注释指令。
       纯静态可查，**不需要 glslang** —— 故本机（Windows）也能守住它。
+  P15 Vulkan **共享头**的编译期扩展自洽：对裸 `texture2D` 调用
+      `texelFetch` / `textureSize` / `texelFetchOffset` 等 samplerless 函数时，
+      必须声明 `#extension GL_EXT_samplerless_texture_functions`。
+      （诞生于第四十一轮**首次真编译**：P14 修好 include 可见性后，
+      `gpu_common.glsl` 第一次进编译器就因缺该扩展而失败 —— 8 个 .comp
+      同源报错。P14 只能证明"共享头被读到了"，证明不了"它能编过"。）
 
 退出码
 ------
@@ -381,7 +387,7 @@ def parse_number(text: str):
 
 
 # ===========================================================================
-# 判据 P1..P14
+# 判据 P1..P15
 # ===========================================================================
 def gate_naming(rep: Report, common_algos: list[str],
                 metal_kernels: list[str],
@@ -984,6 +990,93 @@ def gate_vulkan_preprocess_order(rep: Report, vulkan_files: list[str]) -> None:
                  f"（#version 首位 / include 早于宏使用 / GL_GOOGLE_include_directive 已声明）")
 
 
+# ===========================================================================
+# P15 Vulkan 共享头的「编译期扩展」自洽
+# ===========================================================================
+# 为什么需要这条判据（诞生于第四十一轮**首次真编译**）：
+#
+#   在 P14 修好 `#include` 的可见性之后，`gpu_common.glsl` **第一次**真正进
+#   编译器，立刻暴露它自身的一个缺陷（8 个 .comp 全部同源、均指向该文件）：
+#
+#     ERROR: gpu_common.glsl:338: 'texelFetch' : required extension not
+#            requested: GL_EXT_samplerless_texture_functions
+#     ERROR: gpu_common.glsl:338: '=' : cannot convert from
+#            'global highp 4-component vector of float' to 'temp highp float'
+#
+#   根因：`texelFetch(<texture2D>, coord, lod)` 的第一参数**不带 sampler**，
+#   而 GLSL 核心只为 `sampler2D` 提供 `texelFetch` 重载；对裸 `texture2D`
+#   做 texel fetch 必须请求 `GL_EXT_samplerless_texture_functions`。
+#
+#   这条判据的存在价值 = **把「共享头需要哪个扩展」变成可被静态检查的命题**。
+#   P14 只能证明"共享头被读到了"，证明不了"共享头自己能编过" —— 二者是
+#   不同的目标对象，不能互相替代（本项目铁律：判据要落在目标对象上）。
+#
+# 判据（对每个共享头文件解析其**代码体**，不含注释）：
+#   P15-a 若代码里出现「对裸 texture2D 的 texelFetch / textureSize / texelFetchOffset」
+#         这类 samplerless 调用，则必须声明
+#         `#extension GL_EXT_samplerless_texture_functions : require|enable`。
+#   P15-b 反向：若声明了该扩展，就必须真的有 samplerless 调用点
+#         （防"声明了却没用到"→ 会让别人误以为该扩展是必需的）。
+#   ⚠️ 反空约束：必须至少解析到 1 个共享头文件，否则判据已失效。
+#
+# ⚠️ 本判据是**近似**（正则不做类型推断）：它按"标识符名"判定调用对象是不是
+#   裸 texture2D —— 做法是看该标识符在**本文件**里的声明是否形如
+#    `texture2D <name>`（无 sampler）。对 `recon_sample_bilinear` 那种
+#    **形参**为 `texture2D` 的情况，靠"函数签名里出现过 texture2D 形参"覆盖。
+#    真正的最终裁决仍是 CI 的 glslang（本机现在也有 glslang 可自测）。
+def gate_vulkan_samplerless_ext(rep: Report) -> None:
+    """P15 —— 使用裸 texture2D 的 texelFetch 时必须请求 samplerless 扩展。"""
+    shared_headers = ["gpu_common.glsl"]
+    checked = 0
+    ext_re = re.compile(
+        r"^\s*#\s*extension\s+GL_EXT_samplerless_texture_functions\s*:"
+        r"\s*(require|enable)", re.M)
+    # samplerless 族：这些函数在 GLSL 核心只对 sampler* 有重载，对裸 texture*
+    # 需要该扩展（`textureSize`/`texelFetch`/`texelFetchOffset` 是常用三个）。
+    samplerless_fn = r"(texelFetch|texelFetchOffset|textureSize|textureQueryLod)"
+
+    for name in shared_headers:
+        path = os.path.join(VULKAN_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        checked += 1
+        code = strip_comments(read(path))
+
+        has_ext = bool(ext_re.search(code))
+
+        # 找本文件里"裸 texture2D"的标识符：声明（uniform texture2D x / 形参
+        # texture2D x）+ 形参中出现的 texture2D。
+        bare_ids = set(re.findall(r"texture2D\s+([A-Za-z_]\w*)", code))
+        # 也考虑 `texture2D` 出现在函数签名里的情况（helper 接收裸纹理）。
+        sig_bare = bool(re.search(r"\(\s*texture2D\s+\w+", code))
+
+        uses = []
+        if bare_ids or sig_bare:
+            # 只要有 samplerless 调用出现在本文件，就算需要扩展
+            # （本文件的裸纹理标识符是有限的、且都在本文件内声明）。
+            for m in re.finditer(samplerless_fn + r"\s*\(", code):
+                uses.append(m.group(1))
+
+        if uses and not has_ext:
+            rep.fail(
+                f"P15-a {name}：使用了 samplerless 纹理函数 "
+                f"{', '.join(sorted(set(uses)))}（对裸 `texture2D` 调用），"
+                f"但没有声明 `#extension GL_EXT_samplerless_texture_functions : require`"
+                f" —— GLSL 核心只为 `sampler2D` 提供这些重载，缺此声明时编译报"
+                f"`required extension not requested` + 连带的返回类型不匹配")
+        elif has_ext and not uses:
+            rep.fail(
+                f"P15-b {name}：声明了 `GL_EXT_samplerless_texture_functions`"
+                f"但代码里没有任何 samplerless 纹理函数调用 —— "
+                f"该声明是多余的（会误导读者以为本文件必须依赖它）")
+
+    if checked == 0:
+        rep.fail("P15：没有扫描到任何 Vulkan 共享头 —— 判据已失效（反空约束）")
+    elif not rep.failures:
+        rep.note(f"P15 Vulkan 共享头扩展自洽：{checked} 个文件"
+                 f"（samplerless 调用 ↔ GL_EXT_samplerless_texture_functions 声明成对）")
+
+
 
 # 为什么需要这条判据（本判据的诞生背景 = 一次**假通过**被 CI 揭穿）：
 #
@@ -1222,6 +1315,7 @@ def main() -> int:
     gate_cmake_metal_list(rep, metal_files)
     gate_fixed_point_atomics(rep, metal_all, vulkan_all)
     gate_vulkan_preprocess_order(rep, vulkan_files)
+    gate_vulkan_samplerless_ext(rep)
 
     print(f"[shader-parity] common 算法 {len(common_algos)} / "
           f"Metal kernel {len(set(metal_kernels))} / "
@@ -1235,7 +1329,7 @@ def main() -> int:
         print(f"[shader-parity] FAIL：{len(rep.failures)} 项不一致")
         return 3
 
-    print("[shader-parity] PASS：着色器两端一致（P1..P14 全部通过）")
+    print("[shader-parity] PASS：着色器两端一致（P1..P15 全部通过）")
     return 0
 
 
