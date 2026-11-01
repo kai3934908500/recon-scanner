@@ -94,7 +94,7 @@ jobs:
       - name: 双端对等负向注入
         run: python tools/verify_platform_parity_negative.py
 
-      - name: 着色器两端一致性闸门（P1..P12）
+      - name: 着色器两端一致性闸门（P1..P13）
         run: python tools/shader_parity.py
 
       - name: 着色器一致性负向注入
