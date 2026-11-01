@@ -50,7 +50,38 @@ endif()
 # 真机 slice 走 iphoneos SDK；模拟器 slice 走 iphonesimulator SDK。两者必须分别
 # 构建后再由 xcodebuild -create-xcframework 合并 —— xcframework 要求的两个 slice
 # 在本工具链里就是两次独立的 CMake 配置。
-option(RECON_IOS_SIMULATOR "构建 iphonesimulator slice（默认 iphoneos 真机 slice）" OFF)
+#
+# ⚠️ 判定源必须是 CMAKE_OSX_SYSROOT，不能只靠自定义的 RECON_IOS_SIMULATOR。
+#
+#   本文件会被 include **两次**：主工程一次；CMake 做「编译器 ABI 探测」时创建的
+#   try_compile 子工程再一次（CMakeDetermineCompilerABI.cmake）。子工程有全新的
+#   CMakeCache.txt，CMake 只把 CMAKE_TRY_COMPILE_PLATFORM_VARIABLES 表里的变量
+#   复制过去，Apple 平台上该表含 CMAKE_OSX_ARCHITECTURES / CMAKE_OSX_SYSROOT /
+#   CMAKE_OSX_DEPLOYMENT_TARGET，**而自定义的 -DRECON_IOS_SIMULATOR=ON 不在表里**。
+#   只认自定义变量 → 子工程里回落到 OFF → 把模拟器 slice 误判成真机 slice →
+#   撞上下面「真机只允许 arm64」的断言 → 配置直接失败。CI 上的实际表现就是
+#   「配置模拟器 slice」这一步报 ios.cmake 真机分支的错（第一次 configure 的前
+#   两行 -- The C compiler identification / -- Detecting C compiler ABI info 正常，
+#   失败发生在 ABI 探测的 try_compile 里）。
+#
+#   CMAKE_OSX_SYSROOT 是被转发的那一类，且 docs/12 §4.7 给模拟器的标准命令本来就是
+#   直接传 -DCMAKE_OSX_SYSROOT=iphonesimulator（根本不传 RECON_IOS_SIMULATOR）——
+#   以 sysroot 为判定源即与该文档的正式接口对齐。
+#
+#   优先级：显式 -DRECON_IOS_SIMULATOR=... 优先；未显式给定时，由 CMAKE_OSX_SYSROOT
+#   推断。子工程里自定义变量不可见 → 走推断；主工程里用户传了 -D → 走显式值
+#   （主工程 configure 开头 CMAKE_OSX_SYSROOT 还没设置，不能反过来以它为准，
+#   否则会把用户显式传的 ON 冲掉）。
+if(NOT DEFINED RECON_IOS_SIMULATOR)
+  if(DEFINED CMAKE_OSX_SYSROOT AND CMAKE_OSX_SYSROOT STREQUAL "iphonesimulator")
+    set(_recon_ios_simulator_default ON)
+  else()
+    set(_recon_ios_simulator_default OFF)
+  endif()
+  set(RECON_IOS_SIMULATOR "${_recon_ios_simulator_default}" CACHE BOOL
+      "构建 iphonesimulator slice（未显式指定时由 CMAKE_OSX_SYSROOT 推断）")
+  unset(_recon_ios_simulator_default)
+endif()
 
 if(RECON_IOS_SIMULATOR)
   set(CMAKE_OSX_SYSROOT iphonesimulator CACHE STRING "" FORCE)
