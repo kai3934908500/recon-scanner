@@ -79,6 +79,33 @@ object NativeBridge {
     // 采集                                                                    //
     // --------------------------------------------------------------------- //
 
+    /**
+     * 对应 recon_set_probe_data()（缺口 AC）。
+     *
+     * 上报平台能力**事实**。与 [probeCapability] 的分工：本方法是
+     * `平台 → core`（事实上报），[probeCapability] 是 `core → 平台`
+     * （core 判定后的结果，多出 branch / depthTier / depthSource 派生字段）。
+     *
+     * ⚠️ **必须在首次 [probeCapability] 之前调用**：core 的
+     * `Context::ProbeCapability()` 有一次性缓存（`capability_probed_`），
+     * 第一次调用时读到的平台事实会被固化 —— 之后再上报就改不动结果了。
+     * 修复前平台层从未上报（C ABI 上没有入口）→ 内核恒读全零 →
+     * `has_camera=0` → 一进扫描被误判 T-03「相机不可用」。本方法即那个入口。
+     *
+     * 语义：**全局**（不绑 context）/ **幂等**（后一次覆盖前一次）。
+     * 故本方法**不接收 `context` 参数** —— 设备能力与「哪个会话」无关，
+     * 加上参数会诱使调用方以为「每个会话要配置一次」。
+     *
+     * @return recon_status；RECON_OK(0) 为成功。非 0 应记日志（上报失败意味着
+     *         后续探测会读到全零事实）。
+     */
+    external fun setProbeData(
+        hasCamera: Boolean, hasImu: Boolean, hasLidar: Boolean, hasTof: Boolean,
+        hasAlgoDepth: Boolean, supportsGpu: Boolean,
+        maxImageWidth: Int, maxImageHeight: Int, maxFps: Int, imuMaxRateHz: Int,
+        totalMemoryBytes: Long, availableMemoryBytes: Long
+    ): Int
+
     /** 对应 recon_start_session()。 */
     external fun startSession(context: Long, sessionId: String): Int
 
@@ -147,7 +174,12 @@ object NativeBridge {
     // 导出与控制                                                              //
     // --------------------------------------------------------------------- //
 
-    /** 对应 recon_export()。format: 0=GLB, 1=OBJ_MTL, 2=PLY。 */
+    /**
+     * 对应 recon_export()。
+     *
+     * format 取值与 `recon_export_format` 一一对应，**不得重排**：
+     * `0=GLB, 1=OBJ_MTL, 2=PLY, 3=STL, 4=3MF`。
+     */
     external fun export(context: Long, format: Int, outPath: String, applyScale: Boolean, embedTexture: Boolean): Int
 
     /** 对应 recon_cancel()。线程安全，可在任意线程调用。 */

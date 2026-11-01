@@ -84,7 +84,31 @@ targets:
         excludes:
           - "Info.plist"
           - "Recon-Bridging-Header.h"   # 由 SWIFT_OBJC_BRIDGING_HEADER 指定
-      - path: ui/ios/Recon/Resources    # locales/*.json
+      # ⚠️ locale 必须是 **folder reference**（`type: folder`），且路径要落到
+      #    `locales` 这一层 —— 这两件事**都不能改**，理由如下（2026-11-01 实测）：
+      #
+      #    `Localization.swift` 的 `LocaleCatalog.loadAll` 用
+      #        bundle.url(forResource: locale.rawValue, withExtension: "json",
+      #                   subdirectory: "locales")
+      #    查找，即它**要求**包内存在 `Recon.app/locales/<locale>.json`。
+      #
+      #    而 XcodeGen 的 source 若用默认的 `type: group`，资源会被**展平到
+      #    bundle 根**（group = 黄色组，只保留"逻辑分组"不保留磁盘层级；
+      #    folder = 蓝色文件夹引用，整棵子树原样拷入）。于是 20 个 json 会落到
+      #    `Recon.app/zh-CN.json` 之类的位置，`subdirectory: "locales"` 一个都
+      #    匹配不上 → `LocaleCatalog` 把 20 个 locale **全部**记进
+      #    `missingFiles` → UI 整体回退到键名，**且编译、链接、运行都不报错**。
+      #    这与 G15 的 metallib 落位、缺口 J/P 的 RGB 丢弃是同一类「静默失效」。
+      #
+      #    `type: folder` 时，Xcode 把该目录**连同目录名**拷进包，故路径写到
+      #    `.../Resources/locales` 才能在包里得到 `locales/` 这一层。
+      #    （写成 `.../Resources` 会得到 `Recon.app/Resources/locales/`，又多
+      #      一层，同样匹配不上。）
+      #
+      #    本条由闸门 **G17** 看管（生成物 + 生成器源头 + 与 Swift 的
+      #    `subdirectory:` 交叉对账），负向注入见 verify_ios_contract_negative.py。
+      - path: ui/ios/Recon/Resources/locales
+        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: "cn.qingfeng.recon"
@@ -134,10 +158,28 @@ targets:
       - sdk: libz.tbd
     # 「Compile Metal Shaders」Build Phase（docs/12 §4.4 的挂载表）。
     # 用 preBuildScripts → 位于「Compile Sources」之前，符合该表要求。
-    # 脚本自己按 OUT_DIR(=BUILT_PRODUCTS_DIR/Contents/Resources) 定位产物，
+    # 脚本自己按 RECON_METALLIB_OUT_DIR 定位产物，
     # 并由 `RECON_REQUIRE_METAL=1` 保证「缺工具链即硬失败」而**不伪造空产物**
     # （空 default.metallib 会被 makeDefaultLibrary() 当作「库在但无函数」，
     #  比「找不到库」更难查 —— 见 MEMORY.md「静默丢弃最难查」）。
+    #
+    # ⚠️ 落位变量必须是 UNLOCALIZED_RESOURCES_FOLDER_PATH，**不是**
+    #    `${CONTENTS_FOLDER_PATH}/Resources`（2026-11-01 实测修正，一次真实缺口）：
+    #    · iOS 的 bundle 是**扁平**结构：非本地化资源位于包**根**
+    #      （`Recon.app/default.metallib`），**不存在** `Contents/` 这一层
+    #      （Apple《Bundle Structures》原文：iOS "uses a relatively flat
+    #        structure"；非本地化资源直接放在 top-level bundle directory）。
+    #    · 而 `MTLDevice.makeDefaultLibrary()` 与
+    #      `newDefaultLibraryWithBundle:error:` **都只在包根找**
+    #      `default.metallib`。
+    #    · 于是 `${CONTENTS_FOLDER_PATH}/Resources` 在 iOS 上展开为
+    #      `Recon.app/Recon.app/Resources`（CONTENTS_FOLDER_PATH 在扁平 bundle
+    #      里取到的最后一段就是 bundle 名自身）—— 产物**永远加载不到**，
+    #      且**编译期与 CI 全绿**（MetalProbe() 会在运行期诚实地报
+    #      "找不到 default.metallib"，GPU 路径永久降级）。
+    #    · `UNLOCALIZED_RESOURCES_FOLDER_PATH` 的语义正是「非本地化资源目录」，
+    #      由 Xcode 按平台展开：iOS = 包根（.app/），macOS = .app/Contents/Resources/。
+    #      两端都对，且不需要在脚本里写平台分支（单一实现）。
     preBuildScripts:
       - name: Compile Metal Shaders
         script: |
@@ -158,10 +200,16 @@ targets:
           if [ -n "${IPHONEOS_DEPLOYMENT_TARGET:-}" ]; then
             export RECON_IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET}"
           fi
-          export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"
+          # ⚠️ 该变量为空时**硬失败**，不回落到任何猜测值：
+          #    它为空意味着构建设置语义变了，此时"猜一个目录"就会把产物写到
+          #    不会被加载的位置（即上面那段论证的事故形态）。
+          if [ -z "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" ]; then
+            echo "FAIL: UNLOCALIZED_RESOURCES_FOLDER_PATH 为空 —— 无法确定 metallib 落位" >&2
+            exit 1
+          fi
+          export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
           export RECON_METAL_AIR_DIR="${DERIVED_FILE_DIR}/metal-air"
           bash "${SRCROOT}/tools/build_metal_shaders.sh"
-        basedOnDependencyAnalysis: false
 
 # 显式 scheme：`xcodebuild -scheme Recon` 需要有共享 scheme。
 # XcodeGen 会为 application target 自动生成 scheme，但**显式声明**才能保证

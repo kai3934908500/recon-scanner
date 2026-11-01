@@ -315,10 +315,63 @@ public final class ReconSessionController: ObservableObject {
     /// 最近一次导出/标定的真实状态（**不静默吞错**）。
     @Published public private(set) var lastExportStatus: ReconStatus = .ok
 
+    /// 相机权限被拒（§5.7 P-01 / P-02）。
+    ///
+    /// 为什么是 `@Published` 而不是让 ScanView 自己查 `AVCaptureDevice`：
+    /// 这条状态有**两个写入时机**（本次申请的结果、用户去设置页改完回前台
+    /// 后的重查）。若让每个视图各查一次，就会出现「U-03 说被拒、U-04 说没被拒」
+    /// —— 同一事实两个答案。故收敛到控制器一处发布。
+    @Published public private(set) var cameraPermissionDenied = false
+
+    /// 是否正在进行能力探测（U-01「正在检测设备能力」与 U-02 按钮禁用态）。
+    ///
+    /// 与 `HomeView` 原先靠 `capability == nil` 推断的区别：`nil` 无法区分
+    /// 「还没开始探测」与「探测完成但失败」—— 前者按钮该灰，后者**不该**灰
+    /// （用户应当能进 U-03 看到失败原因，而不是面对一个永不激活的按钮）。
+    @Published public private(set) var isProbing = false
+
+    /// AR 位置跟踪不可用（docs/09 §3.3 预览元素的「AR 不可用」提示）。
+    ///
+    /// ── 为什么提升到控制器（原先是 `ScanView` 的 `@State`）───────────────────
+    ///
+    /// 这条状态有**两个来源**：① 探测期的 `ARCapability.worldTrackingSupported`
+    /// （设备级事实，`open()` 内一次判定）；② 运行期的
+    /// `ARCamera.TrackingState.notAvailable`（会话中途失效，由 ARKit 回调）。
+    /// 若留在视图的 `@State` 里，② 永远写不进去 —— 回调发生在 `CaptureSession`
+    /// 的串行队列上，与视图之间**没有通路**，那这个 `@State` 就恒为初始值
+    /// （即 #110 登记的「死状态」形态）。
+    ///
+    /// 这与 `cameraPermissionDenied` 的「两个写入时机」完全同构，故同样收敛到
+    /// 控制器一处发布，视图只读。
+    ///
+    /// ⚠️ 本状态**不**承载 `TrackingState.limited`：那需要 §4.3 的
+    /// 「3 s 等待 / 10 s 降级」迟滞策略与一个真实的降级动作，见回调处注释。
+    @Published public private(set) var arTrackingUnavailable = false
+
+    /// 当前会话在 `records` 中的记录 id（`open()` 登记时赋值）。
+    ///
+    /// ── 为什么必须由控制器发布，而不是视图自己造 ──────────────────────────
+    ///
+    /// `ScanView` 结束采集时要 `router.replaceTop(with: .rebuild(sessionID:))`。
+    /// 此前该处写的是 `UUID()` —— **每次求值都在造一个新的随机 id**，与内核里
+    /// 的 `session_id`、与 `records` 中的记录**都无关**。后果是 U-06 / U-07 /
+    /// U-10 拿不到本次会话（`RebuildView.sessionID` 声明后**从未被使用**，
+    /// 正是这个假 id 的静默症状）。
+    ///
+    /// 会话的真实标识只有一处来源：`open()` 登记记录时生成的那个 `UUID`。
+    /// 故由控制器持有并发布，视图只读。
+    @Published public private(set) var currentSessionID: UUID?
+
     // MARK: 依赖
 
     private var core: ReconCore?
     private let capture = CaptureSession()
+    /// 权限协调器（IOS-P-1：只在用户触发相关功能时申请）。
+    ///
+    /// 与 `capture` 同为控制器的**长期依赖**，而非每次申请时临时新建 ——
+    /// 理由同 `ScanSessionModel` 的单例：权限这条链只能有一个发起者，
+    /// 出现第二份实例就意味着「谁在申请」有两个来源。
+    private let permissions = PermissionCoordinator()
     private var sessionDir: String?
     /// 当前会话在 `records` 中的下标（用于重建成功后回填摘要）。
     private var currentRecordIndex: Int?
@@ -360,12 +413,102 @@ public final class ReconSessionController: ObservableObject {
         // 表现为「采集中但一帧都不投」—— 正是缺口 J 的静默形态之一）。
         framePipeline.setCore(c)
         framePipeline.reset()
+
+        // ── 平台能力事实上报（缺口 AC），**顺序不可交换** ──────────────────
+        //
+        // 必须在下一行的 `c.probeCapability()` **之前**：core 的
+        // `Context::ProbeCapability()` 有**一次性缓存**（`capability_probed_`，
+        // `core/src/util/context.cpp:108`），第一次调用时读到的平台事实会被固化，
+        // 事后再调 `recon_set_probe_data` 就**改不动** `recon_capability` 了。
+        //
+        // 在修复前，平台层从未上报过任何事实（C ABI 上没有入口，
+        // `SetPlatformProbeProvider` 又只对 core 内部可见）→ 内核恒读全零 →
+        // `has_camera=0` → 真机一进扫描被 `handleCapabilityProbe` 判成 T-03
+        // 「相机不可用」。这一行就是那条断了的链路的重新接通点。
+        //
+        // AR 能力探测**不需要权限**（docs/11 §1.3），故放在此处无副作用；
+        // 原实现把它排在 `probeCapability()` 之后 —— 那只是顺序偶然，
+        // 现在为了上报时机把它提前，语义未变（`arCapability` 仍是设备级事实）。
+        let ar = ARCapability.probe()
+        arCapability = ar
+        ReconCore.reportProbeData(ar.probeData())
+
         lastStatus = .ok
         capability = c.probeCapability()
-        arCapability = ARCapability.probe()
         // 登记一条真实会话记录（U-01 列表的数据来源）。
         registerRecord(dir: sessionDir)
         return true
+    }
+
+    // =======================================================================
+    // MARK: - 启动路径（U-01「开始扫描」→ 探测 → 权限 → Previewing）
+    // =======================================================================
+    //
+    //  ── 为什么必须补这一层（2026-11-01 iOS 深度检查，缺口 U/V/W）────────────
+    //
+    //  `open()` / `startScan()` / `onPermissionsGranted()` 三者**全部零调用点**：
+    //  UI 只调 `router.pushScan(guided:)` 改路由，没有任何东西创建内核上下文、
+    //  探测能力或申请权限。真机表现是首页主按钮恒灰（`capability` 恒 nil）。
+    //
+    //  但**不能**把这三步塞进 `HomeView` 的按钮闭包 —— 那样「启动一个会话需要
+    //  做哪些事」就有了第二处实现（Android 侧还要再写一份 Kotlin）。
+    //  故收敛成**唯一入口** `beginLaunch(guided:)`，两端视图层只调它。
+    //
+    //  ── 时序（docs/11 §1.3，逐步对应）────────────────────────────────────────
+    //    ① open()                    —— 建上下文（不需要任何权限）
+    //    ② recon_probe_capability    —— U-02 数据（不需要任何权限）
+    //    ③ 路由 → U-03/U-04          —— 进入 Previewing 前的界面
+    //    ④ requestCamera()           —— IOS-P-1：用户触发后才申请
+    //    ⑤ onPermissionsGranted()    —— T-05 → capture.start()
+    //
+    //  ⚠️ ②③④ 的**顺序不可交换**：探测不需权限，若先申请权限再探测，
+    //     权限弹窗会出现在用户还没看到能力报告之前（与 §1.3 的时序图不符）。
+
+    /// 启动扫描的**唯一入口**（U-01「开始扫描」按钮调用）。
+    ///
+    /// - Parameter guided: `true` 走 U-04 定点引导（默认），`false` 走 U-03。
+    public func beginLaunch(guided: Bool) {
+        isProbing = true
+        // ① 建上下文。目录按 docs/01 §7.1 的 `sessions/<session_id>/` 约定命名。
+        let dir = Self.makeSessionDir()
+        guard open(sessionDir: dir) else {
+            // 建上下文失败：状态机走 T-04（探测失败）→ Failed。
+            // **不静默**：lastStatus 已由 open() 写入。
+            isProbing = false
+            session.send(.startScan)
+            session.send(.probeInternalError)
+            return
+        }
+        // ② 状态机 T-01 → CapabilityProbe；探测已在 open() 内完成（见其注释）。
+        startScan(guided: guided)
+    }
+
+    /// 构造一个新会话目录路径（`<Documents>/sessions/<session_id>/`）。
+    ///
+    /// 命名规则来自 docs/01 §7.1 / docs/02 §5.1：
+    /// `session_id = "YYYYMMDDTHHMMSS_xxxx"`（UTC 时间戳 + 4 位随机）。
+    ///
+    /// ⚠️ 这里**只构造路径字符串，不创建目录**。理由（已核实）：
+    /// 内核 `recon_create` 对 `session_dir` **不做任何 IO**（`context.cpp:58`
+    /// 仅赋值给 `session_dir_`），落盘（`manifest.json` 等）**尚未实现**
+    /// —— 全仓 `grep "frames.bin\|manifest.json" core/src/` 零命中。
+    /// 唯一会用到该目录的是检查点写入，而它**自己 `fopen` 且失败时只记日志**
+    /// （`orchestrator.cpp:1656` 返回 `RECON_ERR_IO`，不崩溃）。
+    /// 故此处若创建目录，反而会造出一个「内核从不写、UI 以为有数据」的空壳。
+    ///
+    /// 待内核真正实现落盘时，此处再补 `createDirectory(withIntermediateDirectories:)`。
+    static func makeSessionDir() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyyMMdd'T'HHmmss"
+        // 4 位十六进制随机后缀（与 §5.1 的 `a7f3` 同形）。
+        let suffix = String(format: "%04x", UInt16.random(in: 0...0xFFFF))
+        let id = "\(f.string(from: Date()))_\(suffix)"
+        let docs = FileManager.default.urls(for: .documentDirectory,
+                                            in: .userDomainMask).first
+        let root = docs?.path ?? NSTemporaryDirectory()
+        return "\(root)/sessions/\(id)"
     }
 
     /// 关闭并释放内核上下文。
@@ -381,6 +524,9 @@ public final class ReconSessionController: ObservableObject {
         progress = nil
         outcome = .running
         result = nil
+        // 会话标识随之作废：留着会让下一次「完成扫描」把 U-06 指向**上一个**
+        // 已关闭的会话（跨会话串号）。
+        currentSessionID = nil
         stopStatsTimer()
     }
 
@@ -458,6 +604,7 @@ public final class ReconSessionController: ObservableObject {
             presetLabel: preset.label)
         records.insert(rec, at: 0)
         currentRecordIndex = 0
+        currentSessionID = id          // 发布真实会话标识（见其声明处注释）
         return id
     }
 
@@ -493,11 +640,15 @@ public final class ReconSessionController: ObservableObject {
             return .invalidArgument
         }
         // 格式序号与 `recon_export_format` 一致。**显式映射**，不靠 rawValue 撞运气。
+        // 追加格式时这里必须同步加 case —— 不加会编译失败（穷举 switch），
+        // 这正是「显式映射」相对 rawValue 的价值。
         let fmt: Int32
         switch format {
-        case .glb:    fmt = 0
-        case .objMtl: fmt = 1
-        case .ply:    fmt = 2
+        case .glb:     fmt = 0
+        case .objMtl:  fmt = 1
+        case .ply:     fmt = 2
+        case .stl:     fmt = 3
+        case .threeMf: fmt = 4
         }
         let st = core.export(format: fmt, outPath: outPath,
                              applyScale: applyScale, embedTexture: embedTexture)
@@ -677,10 +828,15 @@ public final class ReconSessionController: ObservableObject {
     /// 开始扫描：走状态机 `StartScan`，并按新状态启动 ARKit。
     ///
     /// 副作用分工：状态机只回答「去哪」，本层按目标状态执行（docs/09 §4.2 注释）。
+    ///
+    /// ⚠️ iOS 侧**不申请运动权限**：`CMDeviceMotion`/`CMGyro` 无需授权
+    /// （docs/11 §1.2）。故 T-07 在本端不可达，这不是遗漏。
     public func startScan(guided: Bool) {
         let next = session.send(.startScan)
         switch next {
         case .capabilityProbe:
+            // T-01 已接受。本层立即做 T-02 的判定：
+            // 探测已在 open() 内由 `recon_probe_capability` 完成，此处只据结果分流。
             handleCapabilityProbe()
         default:
             break
@@ -688,20 +844,63 @@ public final class ReconSessionController: ObservableObject {
         _ = guided   // U-04 定点引导由 ScanView 的引导点序列承载，与内核无关
     }
 
-    /// 能力探测完成/失败的迁移入口（由 `handleCapabilityProbe` 或 UI 调用）。
+    /// 能力探测完成/失败的迁移入口（由 `startScan` 调用）。
+    ///
+    /// T-02 `ProbeComplete` → `RequestingPermission`，随后**立即**申请相机权限
+    /// （docs/11 §1.3：权限只在用户触发相关功能时申请 —— 此刻正是「用户点了
+    /// 开始扫描」这一触发点）。
     private func handleCapabilityProbe() {
-        guard let cap = arCapability else {
+        // 与 `startScan` 的 `session.send(.startScan)` 配对：此处读的是
+        // `ARKit` 侧探测结果（设备级事实），内核侧结果在 `capability` 里。
+        guard let ar = arCapability else {
             session.send(.probeInternalError)
             return
         }
-        if !cap.worldTrackingSupported {
+        // `arTrackingUnavailable` 的**第一个写入时机**（设备级事实）。
+        //
+        // 依据 docs/09 §4.3：「ARKit / ARCore 不可用」→「T-02 但分支强制
+        // `BRANCH_MONO`」→「U-03 预览上方提示 `该设备不支持位置跟踪，请手动环绕物体`」。
+        // 定位在 T-03 判断**之前**：走 T-03（相机也不可用）时该提示同样成立
+        // —— 不说谎比「只在 T-02 路径显示」更重要。
+        arTrackingUnavailable = !ar.worldTrackingSupported
+
+        // T-03：相机不可用（无 world tracking 且无摄像头）。
+        if !ar.worldTrackingSupported && !(capability?.hasCamera ?? false) {
             session.send(.probeCameraUnavailable)
+            cameraPermissionDenied = false
             return
         }
-        session.send(.probeComplete)
+        // T-02：进入 RequestingPermission。
+        guard session.send(.probeComplete) == .requestingPermission else { return }
+        isProbing = false
+        requestCameraThenProceed()
+    }
+
+    /// 申请相机权限，并按结果驱动 T-05 / T-06。
+    ///
+    /// 为什么是 `async` 却不在调用点 `await`：权限弹窗是系统行为，UI 不应阻塞。
+    /// 用 `Task` 挂起后回到 `@MainActor` 再写状态 —— 与 `confirmReconstruct()`
+    /// 的后台队列用法同一模式（本类 `@MainActor`，跨挂起点必须显式弹回）。
+    private func requestCameraThenProceed() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.permissions.requestCamera()
+            switch outcome {
+            case .granted:
+                self.cameraPermissionDenied = false
+                self.onPermissionsGranted()
+            case .denied:
+                // T-06：相机被拒 → Failed，UI 显示 P-01 + P-02「去设置」。
+                self.cameraPermissionDenied = true
+                self.session.send(.cameraPermissionDenied)
+            }
+        }
     }
 
     /// 权限全部授予后：启动 ARKit 会话（`enableDepth` 取决于探测结果）。
+    ///
+    /// T-05 → `Previewing`：启动采集会话但**不采帧**（`capture.start` 后
+    /// ARKit 开始喷帧，`setPaused` 由 `beginCapturing` 控制开始投递）。
     public func onPermissionsGranted() {
         let next = session.send(.permissionsGranted)
         if next == .previewing {
@@ -709,12 +908,44 @@ public final class ReconSessionController: ObservableObject {
         }
     }
 
+    /// 打开系统设置页（P-02「去设置」按钮）。
+    ///
+    /// 为什么经控制器转发而不是让视图自己 `PermissionCoordinator()`：权限这条链
+    /// 只能有**一个发起者**（见 `permissions` 声明处的注释）。视图每次新建实例
+    /// 虽然功能上等价，但会让「谁在管权限」出现第二个来源 —— 与本项目反复踩过的
+    /// 「同一逻辑两处实现必然漂移」同构，故收敛到此处。
+    public func openAppSettings() {
+        permissions.openAppSettings()
+    }
+
+    /// 回到前台时重查相机权限（`cameraPermissionDenied` 的**第二个写入时机**）。
+    ///
+    /// ── 为什么必须有这条路径 ───────────────────────────────────────────────
+    ///
+    /// P-02 的唯一动作是「去设置」。若回前台后不重查，用户在设置里打开权限、
+    /// 切回 App，界面**仍然**显示「没有相机权限」—— 该状态会一直骗人到重启
+    /// 为止。这不是可选优化，而是 P-01/P-02 这条链的闭合条件。
+    ///
+    /// 只**清除**已修复的拒绝态，不反向置位：权限在回前台时若被撤销，走的是
+    /// 下一次 `requestCamera()` 的 `.denied` 分支（有明确的触发点），
+    /// 而此处静默置位会让「设成被拒」出现在用户毫无动作的时刻。
+    public func refreshPermissionStateOnForeground() {
+        if cameraPermissionDenied && permissions.cameraAuthorizationGranted() {
+            cameraPermissionDenied = false
+        }
+    }
+
     /// 用户按下「开始采集」：状态机 `UserStart`，恢复帧投递。
+    ///
+    /// T-09 的副作用（docs/09 §4.2）：
+    /// `recon_start_session(ctx, session_id)` + 开始落盘 + manifest 写 recording。
+    /// 其中落盘由内核负责（尚未实现，见 `makeSessionDir()` 注释），本层只发指令。
     public func beginCapturing() {
         let next = session.send(.userStart)
         if next == .capturing {
             capture.setPaused(false)
-            // 通知内核开始采集会话（sessionId 用会话目录名）。
+            // 通知内核开始采集会话（sessionId 用会话目录名，与 §5.1 的
+            // `session_id` 即目录名一致）。
             if let dir = sessionDir {
                 _ = core?.startSession((dir as NSString).lastPathComponent)
             }
@@ -736,6 +967,45 @@ public final class ReconSessionController: ObservableObject {
         _ = session.send(.finishScan)
         _ = core?.finishCapture()
         refreshStats()                 // 冻结最终统计值（帧数 / 覆盖方位）
+    }
+
+    // =======================================================================
+    // MARK: - 自检清单（Reviewing → Capturing / Cancelled）
+    // =======================================================================
+
+    /// T-18：自检清单页点「继续扫描」→ 回到 `Capturing`（**不清空已采帧**）。
+    ///
+    /// 与 `beginCapturing()` 的区别（不要合并成一个）：
+    ///   · `beginCapturing()` 走 `UserStart`（T-09），其副作用含
+    ///     `recon_start_session` 与**开始落盘 / 写 manifest**——那是**新会话**
+    ///     的起点，在 `Reviewing → Capturing` 上重跑会把同一次会话"再开一次"；
+    ///   · 本方法走 `UserContinueScan`（T-18），规格（§4.2）对该迁移只要求
+    ///     `paused_ = false` 并回 `Capturing`，**帧不清空、统计不归零**。
+    ///   · 共同点只是「恢复帧投递 + 恢复统计轮询」，故这两个副作用在此显式
+    ///     重做（不抽公共函数：两者的**前置状态与内核指令**都不同，
+    ///     硬抽会把差异藏进参数里，反而更容易写错）。
+    public func continueScanFromReview() {
+        let next = session.send(.userContinueScan)
+        guard next == .capturing else { return }
+        capture.setPaused(false)
+        startStatsTimer()
+    }
+
+    /// T-19：自检清单页点 ✕ 并确认删除 → `Cancelled`。
+    ///
+    /// 与 `ScanView` 的「结束扫描」（T-12）走**不同**出口，故**不能**复用
+    /// `finishCapture()`：T-12 的语义是"带着数据往下走"（`Reviewing`），
+    /// 而 T-19 是"丢掉数据退出"（`Cancelled`）。
+    ///
+    /// 数据清理由内核承担（docs/03 §7.2.2 的 8 步顺序，含删帧 / 删临时文件 /
+    /// 释放 GPU 资源）——本层**不自己删目录**，否则会出现两份清理逻辑
+    /// 在同一次会话上竞争同一批文件。C ABI 侧对应 `recon_cancel`（线程安全，
+    /// 可在任意线程调用）。
+    public func cancelFromReview() {
+        capture.setPaused(true)
+        stopStatsTimer()
+        _ = session.send(.reviewCancel)
+        _ = core?.cancel()
     }
 
     /// 应用切后台（T-14）。返回是否已接受。
@@ -905,6 +1175,36 @@ public final class ReconSessionController: ObservableObject {
             // 先入环形缓冲；帧到达时按时间戳切出「本帧之前的窗口」一并投递
             // （实现见 FramePipeline.handleFrame 与 IMUWindow.swift）。
             self?.framePipeline.appendIMU(sample)
+        }
+        // AR 跟踪状态（`cameraDidChangeTrackingState` 回调）。
+        //
+        // ── 为什么只接 `.notAvailable`，**不**接 `.limited` ───────────────────
+        //
+        // `.notAvailable` —— 设备/会话**确实**无法提供位置跟踪。这与
+        // `ARCapability.worldTrackingSupported == false` 是同一枚事实的两种
+        // 表现（后者是探测期、前者是运行期），故直接写入 `arTrackingUnavailable`，
+        // 显示 §3.3 那行既定文案（`该设备不支持位置跟踪，请手动环绕物体`）。
+        //
+        // `.limited` —— docs/09 §4.3 对它规定了**带迟滞的状态迁移**：
+        // 「停止采帧 3 s 等待恢复；超过 10 s 未恢复则降级为纯视觉并提示
+        // `已切换为纯视觉跟踪，位姿精度会下降`」。这不是一个可以直接照抄的
+        // 展示量 —— 它要求：① 一个 3 s/10 s 的计时器；② 「停止采帧」的真实
+        // 动作（`capture.setPaused(true)`）；③ 「降级为纯视觉」后写入内核的
+        // 等效参数变更。而 ③ 在当前 C ABI 表面上**没有出口**：
+        // `recon_config` 无「跟踪模式」字段、21 个导出函数无对应 setter
+        // （与缺口 AC 同构的契约层缺口）。
+        //
+        // 按铁律「不静默降级 / 不伪造」——**宁可先只做能真实做到的那一半**，
+        // 也不写一个「显示已降级但内核并不知道」的假提示。`limited` 的完整
+        // 处理（含 C ABI 出口）已登记，见下方回调处注释与 docs/14 §5.1.3。
+        capture.onTrackingStateChange = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if case .notAvailable = state {
+                    self.arTrackingUnavailable = true
+                }
+                // `.limited` / `.normal`：此处**刻意不写**，理由见上。
+            }
         }
     }
 }

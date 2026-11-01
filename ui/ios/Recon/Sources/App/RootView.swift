@@ -62,6 +62,8 @@ public struct RootView: View {
             ScanView(mode: .freeOrbit)
         case .scanGuided:
             ScanView(mode: .guided)
+        case .reviewing(let id):
+            ReviewingView(sessionID: id)
         case .rebuild(let id):
             RebuildView(sessionID: id)
         case .result(let id):

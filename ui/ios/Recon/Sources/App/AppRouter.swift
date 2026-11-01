@@ -23,6 +23,19 @@ public enum AppRoute: Hashable {
     case scanFree
     /// U-04 定点引导扫描界面（默认）
     case scanGuided
+    /// 自检清单界面（`Reviewing` 态）。
+    ///
+    /// ⚠️ docs/09 §2 的界面清单**未列本页**（缺口 AF，与已修的缺口 AD
+    ///    「`Previewing` 元素表漏登记」同构）。其存在性由四处规格共同要求：
+    ///    ① §4.1 状态图画它为节点（`│ │ Reviewing │ │ 自检清单 │`）；
+    ///    ② §4.2 有五条迁移落在它身上（T-11 进入 / T-16 severe 禁用 /
+    ///       T-17 确认重建 / T-18 继续扫描 / T-19 ✕ 取消）；
+    ///    ③ docs/03 §7.1.2 给出 CK-1..CK-7 完整呈现规则；
+    ///    ④ §5.6 Q-05 给出确认框文案。
+    ///    缺了本路由 → `Capturing → Reviewing` 之后的四条出边**没有承载者**，
+    ///    状态机彻底卡死、`confirmReconstruct()`（重建唯一入口）零调用。
+    ///    判定为「规格表缺一行」（补登记），非「两份契约冲突」（不擅自裁决）。
+    case reviewing(sessionID: UUID)
     /// U-06 重建进度界面
     case rebuild(sessionID: UUID)
     /// U-07 重建结果预览
@@ -37,7 +50,9 @@ public enum AppRoute: Hashable {
     /// 该路由是否要求「返回前必须弹 §5.6 的纯文字确认」（U-NAV-3）。
     public var requiresConfirmOnPop: Bool {
         switch self {
-        case .scanFree, .scanGuided, .rebuild:
+        // `.reviewing` 归入本组：此时采集数据**尚未落盘**（T-19 ✕ 走 §5.6 Q-02
+        // 的删帧确认），与 U-03/U-04 同属「返回即可能丢数据」的一类。
+        case .scanFree, .scanGuided, .reviewing, .rebuild:
             return true
         case .home, .capability, .result, .params, .calibration, .export:
             // U-NAV-4：U-07 与 U-01 之间允许直接返回（会话已落盘）。

@@ -41,9 +41,12 @@
 
 import Foundation
 import ARKit
+import AVFoundation
 import CoreMotion
+import Metal
 import UIKit
 import simd
+import os
 
 // ===========================================================================
 // MARK: - 采集能力探测（对应 U-02 与 recon_probe_capability）
@@ -83,6 +86,132 @@ public struct ARCapability {
             accelerometerAvailable: motion.isAccelerometerAvailable,
             videoResolution: nil,      // 需在会话运行的 `ARFrame.camera.imageResolution` 读取
             thermalState: ProcessInfo.processInfo.thermalState
+        )
+    }
+}
+
+// ===========================================================================
+// MARK: - 平台能力事实组装（缺口 AC：上报给内核）
+// ===========================================================================
+
+extension ARCapability {
+
+    /// 组装给内核的 `recon_probe_data`（**平台事实**，方向 平台 → core）。
+    ///
+    /// ── 为什么必须有这一步（缺口 AC）────────────────────────────────────
+    ///
+    /// 在此之前，平台层从未把设备事实送进内核：`SetPlatformProbeProvider` 在
+    /// core 内部头里、平台层不许 include，而 C ABI 上**没有任何数据入口**
+    /// → `ProbePlatform()` 恒返回全零 → `has_camera=0` → 真机一进扫描被
+    /// `handleCapabilityProbe` 判成 T-03「相机不可用」。本函数就是那个入口。
+    ///
+    /// ── 字段逐项来源（**不编造**；能真取到就取，取不到的写 0 并在注释里说明）
+    ///
+    /// | 字段 | 来源 | 依据 |
+    /// |---|---|---|
+    /// | `has_camera` | `AVCaptureDevice.default(for: .video) != nil` | 设备级事实；不涉及权限，`default(for:)` 只查设备存在性 |
+    /// | `has_imu` | `deviceMotionAvailable \|\| gyroAvailable` | docs/11 §3.1.5 IOS-IMU-2：预积分输入是「陀螺 + 加计」，任一可用即具备 IMU 能力 |
+    /// | `has_lidar` | `sceneDepthSupported` | ARKit 的 `.sceneDepth` 在 iPhone 上**只**由 LiDAR 提供（ToF 为部分 Android 机型），见 `pipeline` 的既有注释 |
+    /// | `has_tof` | `false`（常量） | iOS 设备无独立 ToF 深度传感器；**刻意写 0 而不是留未定义**，见本函数末尾「不谎报」说明 |
+    /// | `has_algo_depth` | `false` | iOS 无 ARCore 运动推断深度；与 `has_tof` 同 |
+    /// | `supports_gpu` | `MTLCreateSystemDefaultDevice() != nil` | Metal 可用性；iOS 15 起全机型可用，探测一次成交互式回退 |
+    /// | `max_image_width/height` | ARKit 给定格式的 `imageResolution` | **取不到时写 0**（见下） |
+    /// | `max_fps` | ARKit 视频格式的 `framesPerSecond` 上限 | **取不到时写 0** |
+    /// | `imu_max_rate_hz` | `1 / maximumGyroUpdateInterval`（钳到机型上限） | docs/11 §3.1.5 的速率表：`CMGyro` 典型 100–200 Hz。**不写 `cap_imu_rate_hz` 期望值** —— 那个是用户期望，不是事实 |
+    /// | `total/available_memory_bytes` | `ProcessInfo.physicalMemory` / `os_proc_available_memory()` | 见下 |
+    ///
+    /// ── 关于三个「取不到就写 0」的字段（**必须诚实，不能填一个像真的数**）──
+    ///
+    /// `max_image_width/height` 与 `max_fps` 的**真实来源**是 ARKit 会话启动后
+    /// `ARFrame.camera.imageResolution` / `ARConfiguration` 的 `videoFormat`。
+    /// 但能力探测（docs/11 §1.3）**必须不申请权限、不启动会话** —— 我们此刻
+    /// 拿不到任何 `ARFrame`。唯一能在无会话状态下读到格式列表的
+    /// `ARWorldTrackingConfiguration.supportedVideoFormats` 在**部分机型**上
+    /// 返回空数组（格式可用性受当前设备/系统状态影响，Apple 未承诺非空）。
+    ///
+    /// 因此：**能读到就填真值，读不到就写 0**。写 0 的下游影响是
+    /// `recon_capability.max_image_width = 0`，而该字段当前**无任何内核消费者**
+    /// （实测：`core/src/` 中只有 `context.cpp` 从 `PlatformProbe` 拷进
+    /// `recon_capability`，再无第二处读取）。填一个编造的分辨率会让 U-02 显示出
+    /// 一个用户设备上并不存在的规格 —— 那是造假，比留 0 更坏。
+    ///
+    /// ── 关于内存字段（`available_memory_bytes` 的取值口径）──────────────
+    ///
+    /// `total_memory_bytes` = `ProcessInfo.processInfo.physicalMemory`（设备物理内存）。
+    /// `available_memory_bytes` = `os_proc_available_memory()`（**本进程**还能申请到的
+    /// 上限，iOS 13+ 公开 API，`<os/proc.h>`）。
+    ///
+    /// 为什么用「本进程可申请上限」而不是「系统剩余内存」：iOS **不提供**系统级
+    /// 剩余物理内存（那会让 App 推断其他 App 的占用）。`os_proc_available_memory()`
+    /// 是 Apple 为「我还能不能分配」这个用途提供的**唯一**公开口径，也正是
+    /// 内核 `MemoryGuard` 关心的问题（「这次重建还放得下吗」）。
+    ///
+    /// ⚠️ 口径登记：内核 `MemoryGuard::Update(rss_mb, budget_mb, now_ms)` 的
+    /// `budget_mb` 是**由调用方传入**的预算，并非直接读本字段 —— 本字段的消费者
+    /// 是平台层自己（决定预算）。**此处不声称内核会读它**；若将来内核要用，
+    /// 必须先明确「available 是进程上限」这个口径（否则会被误当成系统剩余内存）。
+    public func probeData() -> ReconProbeData {
+        // 相机存在性：`default(for:)` 是设备级查询，不触发权限弹窗，也不要求
+        // 已授权（docs/11 §1.3：能力探测不需要权限）。
+        let hasCamera = AVCaptureDevice.default(for: .video) != nil
+
+        // IMU 能力：IOS-IMU-2 规定预积分输入是「陀螺 + 加计」组合。
+        // 任一可用即认为设备具备 IMU 能力（部分模拟器/老设备只有加计）。
+        let hasImu = deviceMotionAvailable || gyroAvailable
+
+        // GPU：探测一次即释放（`MTLCreateSystemDefaultDevice` 返回的对象
+        // 不持有到函数外；`MetalComputeBackend.mm` 会自行再取一次）。
+        let supportsGpu = MTLCreateSystemDefaultDevice() != nil
+
+        // 分辨率 / 帧率：优先从 ARKit 支持的视频格式里取上限。
+        // 读不到就保持 0（见上方长注释：填编造值比留 0 更坏）。
+        var maxW: Int32 = 0
+        var maxH: Int32 = 0
+        var maxFps: Int32 = 0
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        if let best = formats.max(by: { a, b in
+            let pa = a.imageResolution.width * a.imageResolution.height
+            let pb = b.imageResolution.width * b.imageResolution.height
+            return pa == pb ? a.framesPerSecond < b.framesPerSecond : pa < pb
+        }) {
+            maxW = Int32(best.imageResolution.width)
+            maxH = Int32(best.imageResolution.height)
+            maxFps = Int32(best.framesPerSecond)
+        }
+
+        // IMU 硬件上限（IOS-IMU-2：以陀螺上限为准，因为它才是预积分输入）。
+        // `maximumGyroUpdateInterval` 是**最小间隔**（秒），其倒数为最大速率。
+        let motion = CMMotionManager()
+        var imuMaxRate: Int32 = 0
+        let minInterval = motion.maximumGyroUpdateInterval
+        if minInterval > 0, minInterval.isFinite {
+            // 钳到 Int32 域：该值理论上不会超过几千 Hz，但除零/NaN 已在上行排除。
+            let rate = 1.0 / minInterval
+            if rate.isFinite, rate > 0, rate < Double(Int32.max) {
+                imuMaxRate = Int32(rate.rounded())
+            }
+        }
+
+        // 内存：物理内存总量 + 本进程可申请上限（见上方口径说明）。
+        let total = ProcessInfo.processInfo.physicalMemory
+        let available = UInt64(max(0, os_proc_available_memory()))
+
+        return ReconProbeData(
+            hasCamera: hasCamera,
+            hasImu: hasImu,
+            // LiDAR：ARKit 的 sceneDepth 在 iPhone 上只由 LiDAR 提供。
+            hasLidar: sceneDepthSupported,
+            // iOS 无独立 ToF 深度传感器 —— 写 false 是**事实**，不是「未知」。
+            hasTof: false,
+            // iOS 无 ARCore 运动推断深度。
+            hasAlgoDepth: false,
+            supportsGpu: supportsGpu,
+            maxImageWidth: maxW,
+            maxImageHeight: maxH,
+            maxFps: maxFps,
+            imuMaxRateHz: imuMaxRate,
+            totalMemoryBytes: total,
+            availableMemoryBytes: available
         )
     }
 }

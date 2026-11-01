@@ -44,6 +44,11 @@ public struct HomeView: View {
     ///
     /// 由「内核能力 + ARKit 能力」现算 —— 与 U-02 同一转换点
     /// （`CapabilityReport.make`），不另写一套判定。
+    ///
+    /// ⚠️ 判据落在 `controller.isProbing` 而**不是** `capability == nil`
+    /// （2026-11-01 修正）：探测**失败**时 `capability` 同样为 nil，若按 nil
+    /// 判「未完成」，按钮就永远灰着 —— 用户既进不去、也看不到失败原因。
+    /// 探测结束后一律放行，让 U-02 / U-03 呈现真实结果（U-D-7 不隐藏失败）。
     private var capability: CapabilitySummary? {
         let report = CapabilityReport.make(capability: controller.capability,
                                            ar: controller.arCapability)
@@ -51,6 +56,9 @@ public struct HomeView: View {
         return CapabilitySummary(pipelineName: report.pipeline.displayName,
                                  depthTier: report.pipeline.depthTier)
     }
+
+    /// 「开始扫描」是否可用：仅在**探测进行中**禁用（§3.1 状态列）。
+    private var canStartScan: Bool { !controller.isProbing }
 
     /// 全部项目数 = 已知记录数。无持久化层时为 0（按钮隐藏，§3.1）。
     private var allProjectsCount: Int { controller.records.count }
@@ -133,9 +141,17 @@ public struct HomeView: View {
     // --- 开始扫描（§3.1）--------------------------------------------------
 
     private var startScanButton: some View {
-        // 能力探测未完成时置灰（文案不变）。
-        PrimaryButton(L10n.t(.homeStartScan), enabled: capability != nil) {
+        // 探测进行中禁用（文案不变）；探测结束后**无论成败**都放行 ——
+        // 失败路径由 U-02 / U-03 承载，不能用灰按钮把用户挡在门外。
+        PrimaryButton(L10n.t(.homeStartScan), enabled: canStartScan) {
             // 默认模式为 MODE_GUIDED（docs/09 §2）。
+            //
+            // ⚠️ 必须走 `controller.beginLaunch`（唯一入口），**不能**只改路由。
+            //    只 push 不建上下文 = 缺口 U/V/W 的原始形态：界面进去了，
+            //    但内核句柄为 nil、能力未探测、ARKit 从不启动。
+            //    `beginLaunch` 内部完成 open → 探测 → 申请权限 → 路由推进会由
+            //    SessionRouterLink 依状态机新状态触发。
+            controller.beginLaunch(guided: true)
             router.pushScan(guided: true)
         }
     }

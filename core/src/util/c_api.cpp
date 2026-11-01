@@ -116,6 +116,30 @@ RECON_API void recon_free_buffer(void* buffer, size_t size) {
   }
 }
 
+RECON_API recon_status recon_set_probe_data(const recon_probe_data* in) {
+  if (in == nullptr) {
+    // 不变量：NULL 时**不清空**已上报数据。一次误调用不应把可用状态打回
+    // 全零（那会让设备「突然失去相机」，属静默降级）。
+    return RECON_ERR_INVALID_ARGUMENT;
+  }
+  recon::PlatformProbe p{};
+  p.has_camera = in->has_camera != 0;
+  p.has_imu = in->has_imu != 0;
+  p.has_lidar = in->has_lidar != 0;
+  p.has_tof = in->has_tof != 0;
+  p.has_algo_depth = in->has_algo_depth != 0;
+  p.supports_gpu = in->supports_gpu != 0;
+  // 负的分辨率/帧率是无效事实，钳到 0（而不是留负数让下游算出负的缓冲区）。
+  p.max_image_width = in->max_image_width > 0 ? in->max_image_width : 0;
+  p.max_image_height = in->max_image_height > 0 ? in->max_image_height : 0;
+  p.max_fps = in->max_fps > 0 ? in->max_fps : 0;
+  p.imu_max_rate_hz = in->imu_max_rate_hz > 0 ? in->imu_max_rate_hz : 0;
+  p.total_memory_bytes = in->total_memory_bytes;
+  p.available_memory_bytes = in->available_memory_bytes;
+  recon::SetPlatformProbeData(p);
+  return RECON_OK;
+}
+
 RECON_API recon_status recon_probe_capability(void* context, recon_capability* out_capability) {
   if (context == nullptr || out_capability == nullptr) {
     return RECON_ERR_INVALID_ARGUMENT;
@@ -378,6 +402,12 @@ RECON_API recon_status recon_export(void* context, const recon_export_options* o
       case RECON_EXPORT_PLY:
         fmt = recon::ExportFormat::kPly;
         break;
+      case RECON_EXPORT_STL:
+        fmt = recon::ExportFormat::kStl;
+        break;
+      case RECON_EXPORT_3MF:
+        fmt = recon::ExportFormat::k3mf;
+        break;
       default:
         return RECON_ERR_EXPORT_UNSUPPORTED_FORMAT;
     }
@@ -423,9 +453,18 @@ RECON_API recon_status recon_export(void* context, const recon_export_options* o
     recon::ValidationResult validation;
     if (!recon::ExportModel(mesh, eo, &main_content, &secondary_content,
                             &validation)) {
-      // 区分「校验不过」与「编码失败」：前者是模型的问题（非流形 / 边界环），
-      // 后者是内部错误，两者的处置完全不同，不能混成一个错误码。
-      return validation.ok ? RECON_ERR_IO : RECON_ERR_EXPORT_VALIDATION_FAILED;
+      // 区分三种情形，它们的处置完全不同，不能混成一个错误码：
+      //   · 校验不过 → 模型本身的问题（非流形 / 退化包围盒 / 尺度非法）；
+      //   · STL/3MF 的面数不足 → **格式的硬约束**（3MF 规范要求 model 类型
+      //     网格至少 4 个三角形），不是因为模型"坏"，而是它太小；
+      //   · 其余 → 内部编码失败。
+      if (!validation.ok) return RECON_ERR_EXPORT_VALIDATION_FAILED;
+      if ((fmt == recon::ExportFormat::kStl ||
+           fmt == recon::ExportFormat::k3mf) &&
+          mesh.triangle_count() < 4) {
+        return RECON_ERR_EXPORT_UNSUPPORTED_FORMAT;
+      }
+      return RECON_ERR_IO;
     }
 
     if (!recon::WriteFileAtomic(out_path, main_content)) {

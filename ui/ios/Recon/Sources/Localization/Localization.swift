@@ -259,6 +259,12 @@ public enum L10nKey: String, CaseIterable {
     //     注意 `msg.notice.motion_denied` 与 `msg.perm.motion_denied` 是**两条
     //     独立文案**（前者是采集期轻提示、后者是权限页说明），此处取权限页那条。
     case permCameraDenied       = "msg.perm.camera_denied"
+    /// P-02「去设置」按钮（权限被拒后的唯一出口）。
+    ///
+    /// 键**早已存在于 zh/en 两个 JSON**（`msg.perm.go_settings`），但此前未在
+    /// `L10nKey` 声明 —— 与缺口 G 同形：只能靠 `L10n.s("裸中文")` 调用，
+    /// G9 反查能过却**失去编译期检查**。此处补齐。
+    case permGoSettings         = "msg.perm.go_settings"
     case permMotionDenied       = "msg.perm.motion_denied"
     case permPhotoDenied        = "msg.perm.photo_denied"
     /// 无深度传感器（归属「设备能力」域，不是「权限」域 —— 它不是被拒而是不存在）。
@@ -396,6 +402,47 @@ public enum L10nKey: String, CaseIterable {
     case capPipelineRgbd        = "msg.capability.pipeline_rgbd"
     case capPipelineMono        = "msg.capability.pipeline_mono"
 
+    // --- 自检清单（`Reviewing` 态；§4.2 T-11/T-16/T-17/T-18/T-19）--------
+    //
+    // ── 域为什么叫 `review` 而不是并入 `scan`（缺口 AF 补登记）────────────
+    //
+    // docs/09 §6.1 的键名规范是 `msg.<域>.<编号>`，域按**界面**划。而 `Reviewing`
+    // （自检清单）在 §2 界面清单里**没有编号**（§3 小节从 3.5 U-05 直接跳到
+    // 3.6 U-06），故它没有可借用的既有域。此处按语义新开 `review` 域，并在
+    // docs/09 §3.3 后**补登记该界面的元素表**（与 §3.3 的 `Previewing` 补登记
+    // 同一处置：**同一契约体系内的元素表漏登记**，非两份契约冲突）。
+    //
+    // ── 这些键的文案来源（不是自造）────────────────────────────────────
+    //  · `title` / `item.*`（S1..S14 项名）取自 docs/03 §7.1.1 表的「检查项」列，
+    //    逐字对齐，不缩写；
+    //  · `cannot_confirm` 取自 §7.1.2 CK-4「确认按钮禁用，按钮文案"无法确认"」；
+    //  · `few_keyframes` 取自 §7.1.1 S1 的「未通过时的提示文案」列
+    //    （`有效帧数过少（当前 N）`，`N` 即 `%d`）；
+    //  · `not_wired` 是**本项目的诚实占位**（无规格出处）：S2..S14 的判据在内核
+    //    尚未实现，界面必须如实说明，而不是伪造 `✓`。措辞与既有先例
+    //    `msg.result.preview_pending`（`线框预览尚未接入（需 Metal 渲染层）`）
+    //    同一方针。
+    case reviewTitle            = "msg.review.title"
+    case reviewCannotConfirm    = "msg.review.cannot_confirm"
+    case reviewNotWiredNotice   = "msg.review.not_wired"
+    /// S1 未通过时的补充信息（`%d` = 当前关键帧数）。
+    case reviewFewKeyframes     = "msg.review.few_keyframes"
+    // S1..S14 的项名（顺序与 docs/03 §7.1.1 表一致）
+    case reviewItemKeyframes    = "msg.review.item.keyframes"        // S1
+    case reviewItemViewpoints   = "msg.review.item.viewpoints"       // S2
+    case reviewItemAzimuth      = "msg.review.item.azimuth"          // S3
+    case reviewItemElevation    = "msg.review.item.elevation"        // S4
+    case reviewItemBlindSectors = "msg.review.item.blind_sectors"    // S5
+    case reviewItemQualityMedian = "msg.review.item.quality_median"  // S6
+    case reviewItemLowQuality   = "msg.review.item.low_quality"      // S7
+    case reviewItemTexture      = "msg.review.item.texture"          // S8
+    case reviewItemTimeSync     = "msg.review.item.time_sync"        // S9
+    case reviewItemOnDisk       = "msg.review.item.on_disk"          // S10
+    case reviewItemDiskWritable = "msg.review.item.disk_writable"    // S11
+    case reviewItemBottomFace   = "msg.review.item.bottom_face"      // S12
+    case reviewItemSpecular     = "msg.review.item.specular"         // S13
+    case reviewItemPoseConverged = "msg.review.item.pose_converged"  // S14
+
     // --- 采集（§3.3/§3.4）-----------------------------------------------
     case scanPause              = "msg.scan.pause"
     // --- 扫描模式与操作（§3.3 U-04）-------------------------------------
@@ -411,6 +458,27 @@ public enum L10nKey: String, CaseIterable {
     case scanEndConfirmTitle2   = "msg.confirm.end_scan_title"
 
     case scanResume             = "msg.scan.resume"
+    /// `Previewing` 态的「开始」主按钮（§4.2 T-09 / docs/01 A-05）。
+    ///
+    /// ── 为什么原规格没有它，以及为什么现在必须有 ────────────────────────────
+    ///
+    /// docs/09 §3.3/§3.4 的元素表**只画了 `Capturing` 态**（线框图里是
+    /// 「暂停 / 完成扫描」），没有为 `Previewing` 态列出任何元素。但同一文档
+    /// §4.1 状态图与 §4.2 `T-09`、以及 docs/01 §A-05 都规定：
+    /// **「用户点「开始」」是进入 `Capturing` 的唯一事件**。
+    ///
+    /// 缺了它，采集状态机在 `Previewing` 就是**死状态** —— 用户能看到预览、
+    /// 却没有任何按钮把会话推进到采集。这不是「两种口径冲突需裁决」，而是
+    /// 同一契约体系内的**元素表漏登记**（先例见 §5.5 的 R-15 / D-7 修订：
+    /// 均为「状态迁移表要求存在、元素表未列」的补登记）。
+    ///
+    /// 故此处新增 `msg.scan.start`，与 docs/09 §3.3 元素表补行的键名一致。
+    case scanStart              = "msg.scan.start"
+    /// 进入 `Previewing` 的放置提示（§5.3 `G-01`）。
+    ///
+    /// 规格 §5.3 早已给出该文案（`请将物体放在画面中央`），但此前**没有对应
+    /// 键**，`ScanView` 也无法显示它。本次一并对齐到键。
+    case scanCenterObject       = "msg.scan.center_object"
     /// §3.3 采集界面其余文案。
     ///
     /// 带占位符的三条**不在此声明**：复用已有的 `fmtCapturedFrames` /
@@ -589,6 +657,11 @@ public enum L10nKey: String, CaseIterable {
     case exportNormals          = "msg.export.normals"
     case exportUv               = "msg.export.uv"
     case exportTangents         = "msg.export.tangents"
+    /// 写出单位说明（§3.10 格式区块）。STL **无单位字段**，必须如实告诉
+    /// 用户它按毫米写出、且这一约定不在文件内可达 —— 否则用户会按米读。
+    case exportUnitNoteMeter    = "msg.export.unit_note.meter"
+    case exportUnitNoteStl      = "msg.export.unit_note.stl"
+    case exportUnitNote3mf      = "msg.export.unit_note.3mf"
 
     // --- 带占位符的格式串（§6.1 `fmt.*` 命名空间）------------------------
     case fmtCapturedFrames      = "fmt.captured_frames"

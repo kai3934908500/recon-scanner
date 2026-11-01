@@ -196,7 +196,11 @@ message(STATUS "recon: 许可清单 → ${RECON_THIRD_PARTY_LICENSES_FILE}")
 
 # ---- 平台化嵌入位置（docs/12 §2.7「嵌入位置」）-----------------------------
 if(RECON_PLATFORM_IOS)
-  set(RECON_LICENSES_EMBED_DEST "Recon.app/Contents/Resources")
+  # ⚠️ iOS bundle 是**扁平**结构：非本地化资源在**包根**，无 `Contents/` 一层
+  #    （2026-11-01 修正；Apple《Bundle Structures》：iOS bundle 是 flat
+  #      structure，非本地化资源位于 top-level bundle directory）。
+  #    写 `Recon.app/Contents/Resources` 会让许可清单落到设备上不存在的层级。
+  set(RECON_LICENSES_EMBED_DEST "Recon.app")
 elseif(RECON_PLATFORM_ANDROID)
   set(RECON_LICENSES_EMBED_DEST "assets")
 else()

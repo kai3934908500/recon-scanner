@@ -66,6 +66,35 @@ G12 ReconStageMap 自洽
    （总段数 / 可达段集合 / 缺口段集合）必须满足
    `可达 ⊎ 缺口 = 1...总段数`（不相交、无越界、无遗漏）。
 
+G16 未签名 IPA 打包链纪律
+   `.github/workflows/ios.yml` 的 build-app job 必须真正走「device 归档 →
+   手工 Payload 打包 → 产物结构校验」这条链，且：
+     G16-a 归档目标必须是 device（`generic/platform=iOS`），不得是模拟器
+           （模拟器 slice 不得进入交付包，docs/12 §4.7 XC-3）；
+     G16-b 打包与校验必须**调用** `tools/stage_ios_ipa.py`（判据的单一实现），
+           而不是在 YAML 里就地重写 `zip` 三行；
+     G16-c 不得出现 `-exportArchive`（它强制签名，而 CI 无 Apple 凭据 ——
+           看到它就说明有人把带签名流程混进了未签名 job）；
+     G16-d 必须把 IPA 作为 artifact 上传（否则这条链白跑）。
+
+G17 locale 资源落位纪律（folder reference + 与 Swift 查找方式交叉对账）
+   `LocaleCatalog.loadAll` 用 `subdirectory:` 指定目录查找 locale JSON，
+   故包内必须有同名目录层。XcodeGen 默认 `type: group` 会把资源**展平到
+   bundle 根** → 20 个 locale 全部落入 `missingFiles`、UI 整体回退到键名，
+   **且无任何编译/运行期报错**。故：
+     G17-a 生成物 project.yml 里 locale 资源必须 `type: folder`，且路径
+           以 `/locales` 结尾；
+     G17-b 生成器源头 gen_ios_project.py 同禁（否则重生成即回退）；
+     G17-c **交叉对账**：`Localization.swift` 的 `subdirectory:` 实参必须
+           等于 folder reference 的最后一段目录名（改任一侧即失败）。
+     G17-d **隐私清单的落位前提**：`PrivacyInfo.xcprivacy` 在
+           `platform/ios/Recon/Resources/` 下，它必须落在**包根**。当前是靠
+           该 source 的默认 `group` 类型**展平**实现的 —— 故该 source 一旦被
+           改成 `type: folder`，隐私清单会落到
+           `Recon.app/Recon/Resources/`，而 Apple 要求它在包根（上架校验项，
+           ITMS 类错误）。本判据守住"不要为了统一而把资源 source 全改成
+           folder"这条边界。
+
 退出码：0 = 全部通过；1 = 有违规；2 = 工具自身错误（文件缺失等）。
 """
 
@@ -1780,6 +1809,397 @@ def gate_status_mapping(rep: Report) -> None:
                  f"全部在 messageKey(for:) 中出现 ✓")
 
 
+# ===========================================================================
+# G15 iOS bundle 落位纪律（非本地化资源在包根，无 `Contents/` 一层）
+# ===========================================================================
+#
+# 为什么需要这一关（2026-11-01 实测发现的真实缺口）：
+#
+#   iOS 的 bundle 是**扁平**结构 —— 非本地化资源位于**包根**
+#   （`Recon.app/default.metallib`），**不存在** `Contents/` 这一层。
+#   Apple《Bundle Structures》原文：iOS bundle
+#   "uses a relatively flat structure with few extraneous directories"，
+#   非本地化资源 "in the top-level bundle directory"；
+#   而 macOS 的 bundle 才是 `MyApp.app/Contents/Resources/` 那种层级结构。
+#
+#   `tools/gen_ios_project.py` 生成 Build Phase 时曾写
+#       export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"
+#   该表达式在 iOS 上会展开到 `Recon.app/Recon.app/Resources`（扁平 bundle 里
+#   `CONTENTS_FOLDER_PATH` 取到的最后一段就是 bundle 名自身）。
+#   而 `MTLDevice.makeDefaultLibrary()` 与 `newDefaultLibraryWithBundle:error:`
+#   **都只在包根找** `default.metallib`（Apple Developer Forums thread/52287、
+#   多份 Apple 示例一致）。
+#
+#   后果是最难查的那一类：**着色器编得过、CI 全绿、产物也在包里，但运行期
+#   永远加载不到** → `MetalComputeBackend.MetalProbe()` 诚实报
+#   "找不到 default.metallib"，GPU 路径永久降级为 CPU 回退。没有任何编译期
+#   信号、也没有任何运行期崩溃。
+#
+# 判据（落在**生成物与生成器**上，不落脚本自述）：
+#   G15-a  `platform/ios/Container/project.yml` 里凡是把产物放进
+#          `$(BUILT_PRODUCTS_DIR)/...` 的落位表达式，**不得**出现
+#          `${CONTENTS_FOLDER_PATH}`（iOS 上该变量会引入不存在的 `Contents`
+#          层级）。正确变量是 `${UNLOCALIZED_RESOURCES_FOLDER_PATH}`
+#          ——它的语义正是「非本地化资源目录」，由 Xcode 按平台展开
+#          （iOS = 包根，macOS = Contents/Resources），两端都对且无需分支。
+#   G15-b  生成器 `tools/gen_ios_project.py` 里同样不得再出现该错误表达式
+#          —— 否则"手改生成物"会被下一次 `gen_ios_project.py` 覆盖回去，
+#          而判据只盯生成物就会漏掉真正的源头（**判据必须落在源头**）。
+#   G15-c  `cmake/Licenses.cmake` 的 iOS 嵌入位置不得写成
+#          `Recon.app/Contents/Resources`（同一扁平结构问题）。
+#
+# 负向注入见 `tools/verify_ios_contract_negative.py --case bundle-layout`。
+# ===========================================================================
+
+def gate_bundle_layout(rep: Report) -> None:
+    gate = "G15/bundle-layout"
+    checked = 0
+
+    # --- G15-a：生成物（project.yml）--------------------------------------
+    container_yml = os.path.join(IOS_DIR, "Container", "project.yml")
+    if not os.path.isfile(container_yml):
+        rep.err(gate, f"缺少 {rel(container_yml)}")
+    else:
+        text = read_text(container_yml)
+        # 只查"落位表达式"所在的**代码行**（去掉注释行）：
+        # 上面那段论证的注释里**刻意**提到 `${CONTENTS_FOLDER_PATH}`（作为
+        # 反例说明），若连带注释一起判就会误报 —— 这正是"判据范围要跟上
+        # 代码位置"的要求。故先剥掉整行注释。
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.split("#", 1)[0]
+            if "CONTENTS_FOLDER_PATH" in line:
+                rep.err(gate,
+                        f"{rel(container_yml)}:{lineno} 落位表达式用了 "
+                        f"`${{CONTENTS_FOLDER_PATH}}` —— iOS 是扁平 bundle，"
+                        f"该变量会引入不存在的 `Contents` 层级，产物将无法被 "
+                        f"`makeDefaultLibrary()` 加载（运行期静默降级）。"
+                        f"应改用 `${{UNLOCALIZED_RESOURCES_FOLDER_PATH}}`。")
+            if "BUILT_PRODUCTS_DIR" in line:
+                checked += 1
+
+    # --- G15-b：生成器（源头）---------------------------------------------
+    gen = os.path.join(ROOT, "tools", "gen_ios_project.py")
+    if os.path.isfile(gen):
+        for lineno, raw in enumerate(read_text(gen).splitlines(), 1):
+            line = raw.split("#", 1)[0]
+            if "CONTENTS_FOLDER_PATH" in line:
+                rep.err(gate,
+                        f"{rel(gen)}:{lineno} 生成器里仍有 "
+                        f"`CONTENTS_FOLDER_PATH` 落位表达式 —— 它是生成物的**源头**，"
+                        f"只改生成物会被下一次重生成覆盖回错误值。")
+
+    # --- G15-c：许可清单嵌入位置 ------------------------------------------
+    lic = os.path.join(ROOT, "cmake", "Licenses.cmake")
+    if os.path.isfile(lic):
+        for lineno, raw in enumerate(read_text(lic).splitlines(), 1):
+            line = raw.split("#", 1)[0]
+            if re.search(r'"Recon\.app/Contents/', line):
+                rep.err(gate,
+                        f"{rel(lic)}:{lineno} 许可清单嵌入位置写成 "
+                        f"`Recon.app/Contents/...` —— iOS 无 `Contents/` 层，"
+                        f"设备上该目录不存在。应写 `Recon.app`（包根）。")
+
+    if not any(gate in e for e in rep.errors):
+        rep.note(f"iOS bundle 落位纪律：检查落位表达式 {checked} 处、"
+                 f"生成器与 Licenses.cmake 各 1 处，均未出现 iOS 上不存在的 "
+                 f"`Contents/` 层级 ✓")
+
+
+# ===========================================================================
+# G16 未签名 IPA 打包链纪律
+# ===========================================================================
+#
+# 为什么需要这一关（2026-11-01 补，与 G15 同源的一类风险）：
+#
+#   G15 管的是「metallib 落位」这一个**事实**，而把产物交到用户手上的是
+#  构造它之后的一整条链：`xcodebuild archive` → `Payload/` → `zip` → artifact。
+#   这条链有三处只有"读 workflow 全文"才能发现的风险，且都不会让任何编译
+#   或测试变红：
+#
+#     · **归档到了模拟器**：`-destination 'generic/platform=iOS Simulator'`
+#       能编过、能产出 `.app`，但那是 x86_64/arm64 的模拟器 slice ——
+#       XC-3 明文禁止它进入提包，而它照样能被打进 IPA 并"看起来成功"。
+#       真实事故形态：用户拿到 IPA 却装不上（架构不符），而 CI 全绿。
+#     · **把打包逻辑就地写进 YAML**：`mkdir Payload && cp -R ... && zip`
+#       表面上等价，但它把「IPA 结构判据」的实现体变成了 YAML 里的几行
+#       shell —— 与 `tools/stage_ios_ipa.py` 成为**两处事实来源**（必然漂移），
+#       且 YAML 里没有地方能读回 IPA 做校验（判据落不到目标对象上）。
+#     · **混入 `-exportArchive`**：它**强制**要 exportOptions plist 且强制
+#       签名 —— CI 上必然失败（无凭据）。更糟的是有人在本地手工改成
+#       "先 exportArchive 再上传"，于是 CI 与手工路径分叉，而 CI 那段仍写着
+#       未签名开关，形成自相矛盾的记录。
+#
+#   这三条都不是"代码 bug"，而是**流程纪律**；纪律只能靠闸门守。
+#   判据落在 `.github/workflows/ios.yml` 的**具体行**上，不落注释自述
+#   （注释里刻意提到 `-exportArchive`、模拟器 destination 作为反例说明，
+#    故必须先剥掉行注释再判 —— 与 G15-a 同一处理）。
+#
+# 负向注入见 `tools/verify_ios_contract_negative.py` 的 G16-a/b/c/d 四项。
+# ===========================================================================
+
+def gate_ipa_pipeline(rep: Report) -> None:
+    gate = "G16/ipa-pipeline"
+    wf = os.path.join(ROOT, ".github", "workflows", "ios.yml")
+    if not os.path.isfile(wf):
+        rep.err(gate, f"缺少 {rel(wf)}")
+        return
+
+    # 只留下 build-app job 的正文（其后到文件末即该 job；本项目该 job 是
+    # 文件里最后一个，故用「从 `build-app:` 到末尾」切片是安全的）。
+    # ⚠️ 若将来在它之后追加了新 job，这段切片会连带把新 job 判进来 ——
+    #   故显式断言「切片里确实含归档命令」，否则 fail-closed。
+    raw = read_text(wf)
+    marker = "\n  build-app:"
+    idx = raw.find(marker)
+    if idx < 0:
+        rep.err(gate, f"{rel(wf)} 里找不到 `build-app:` job（本闸门的目标对象）")
+        return
+    body = raw[idx:]
+
+    # 剥掉整行注释（保留缩进结构），再逐行判 —— 注释里刻意提到反例。
+    code_lines = [ln.split("#", 1)[0] for ln in body.splitlines()]
+    code = "\n".join(code_lines)
+    # 行号（相对整个文件）便于定位
+    base_line = raw[:idx].count("\n") + 1
+
+    def line_of(needle: str) -> int:
+        for i, ln in enumerate(code_lines):
+            if needle in ln:
+                return base_line + i + 1
+        return -1
+
+    # --- 先确认这条链**真的存在**（否则下面全是"没东西可查所以通过"）-------
+    has_archive = "xcodebuild archive" in code
+    if not has_archive:
+        rep.err(gate,
+                "build-app job 里没有 `xcodebuild archive` —— 未签名 IPA 链"
+                "不存在（或已被删）。若这是有意的，请同步删除本闸门与 "
+                "docs/12 §4.8 的对应小节，不要让判据对着空气判定。")
+        return
+
+    # --- G16-a：归档目标必须是 device ------------------------------------
+    # ⚠️ 判据写成「archive 那一段里不得出现 iphonesimulator / iOS Simulator」，
+    #    而不是「必须出现 generic/platform=iOS」—— 后者能被"顺便写个注释"骗过，
+    #    且本 job 里**确实存在**另一条 simulator 构建（那是模拟器校验轮，
+    #    合法）。故取"archive 命令及其续行"这一段来判。
+    arch_idx = code.find("xcodebuild archive")
+    # 续行：从 archive 起连续的行（以 `\` 结尾或缩进继续），到第一个空行/新 step
+    tail = code[arch_idx:].splitlines()
+    arch_block: list[str] = []
+    for ln in tail:
+        if ln.strip() == "" and arch_block:
+            break
+        arch_block.append(ln)
+        if "-destination" in ln and "\\" not in ln:
+            # destination 之后还有几行开关，继续收几行
+            continue
+        if len(arch_block) > 30:
+            break
+    arch_text = "\n".join(arch_block)
+    if "generic/platform=iOS Simulator" in arch_text or "iphonesimulator" in arch_text:
+        rep.err(gate,
+                f"{rel(wf)}:{line_of('xcodebuild archive')} 归档目标是**模拟器** "
+                f"—— 模拟器 slice 不得进入交付包（docs/12 §4.7 XC-3）。"
+                f"应写 `-destination 'generic/platform=iOS'`。")
+    elif "generic/platform=iOS" not in arch_text:
+        rep.err(gate,
+                f"{rel(wf)}:{line_of('xcodebuild archive')} 归档命令里找不到 "
+                f"`-destination 'generic/platform=iOS'` —— 无法确认归档到了设备。")
+    # 未签名三开关必须齐
+    for key in ("CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO",
+                'CODE_SIGN_IDENTITY=""'):
+        if key not in arch_text:
+            rep.err(gate,
+                    f"{rel(wf)}:{line_of('xcodebuild archive')} 归档命令缺少 "
+                    f"`{key}` —— 未签名链会在有凭据的机器上变成签名产物的"
+                    f"另一形态（判据与产物不匹配）。")
+
+    # --- G16-b：打包/校验必须调用单一实现 ---------------------------------
+    if "tools/stage_ios_ipa.py" not in code:
+        rep.err(gate,
+                f"{rel(wf)} 的 build-app job 没有调用 "
+                f"`tools/stage_ios_ipa.py` —— IPA 结构与打包的判据必须在**一处**"
+                f"实现（否则与脚本成为两处事实来源，必然漂移，且判据落不到产物上）。")
+    else:
+        # ⚠️ 反向判据：既然调了脚本，就**不得**在 YAML 里另写一份 zip 打包。
+        #    （曾担心"有人既调脚本又补一段 cp"——那正是两处事实来源。）
+        for pat, why in ((re.compile(r"\bzip\s+-r\b"), "就地写 `zip -r` 打包"),
+                         (re.compile(r"mkdir\s+-p\s+Payload"), "就地建 `Payload/`")):
+            m = pat.search(code)
+            if m:
+                rep.err(gate,
+                        f"{rel(wf)} 出现{why} —— 打包逻辑应只在 "
+                        f"`tools/stage_ios_ipa.py` 里有一份实现，YAML 只负责调用。")
+
+    # --- G16-c：不得出现 exportArchive（强制签名）-------------------------
+    if "-exportArchive" in code:
+        rep.err(gate,
+                f"{rel(wf)}:{line_of('-exportArchive')} 出现 `-exportArchive` —— "
+                f"它强制要求 exportOptions plist 且**强制签名**，CI 无 Apple "
+                f"凭据必然失败。未签名路径只走 Payload 手工打包。")
+
+    # --- G16-d：IPA 必须上传为 artifact -----------------------------------
+    if not re.search(r"name:\s*Recon-unsigned\.ipa", code):
+        rep.err(gate,
+                f"{rel(wf)} 未把 `Recon-unsigned.ipa` 上传为 artifact —— "
+                f"这条链产出的包没有出口等于白跑（用户要的是能下载的包）。")
+
+    if not any(gate in e for e in rep.errors):
+        rep.note("未签名 IPA 链纪律：device 归档 + 调用 stage_ios_ipa.py + "
+                 "无 exportArchive + 产物上传 artifact，四项齐备 ✓")
+
+
+# ===========================================================================
+# G17 locale 资源落位纪律（folder reference + 与 Swift 查找方式交叉对账）
+# ===========================================================================
+#
+# 为什么需要这一关（2026-11-01 补，与 G15 同源的第三例「静默失效」）：
+#
+#   `Localization.swift` 的 `LocaleCatalog.loadAll` 用
+#       bundle.url(forResource: locale.rawValue, withExtension: "json",
+#                  subdirectory: "locales")
+#   查找文案 —— 它**要求包内存在 `locales/` 这一层目录**。
+#
+#   而 XcodeGen 的 target source 若用默认的 `type: group`（黄色组），资源会被
+#   **展平到 bundle 根**（group 只保留工程内的逻辑分组，不保留磁盘层级；
+#   `folder` 才是蓝色文件夹引用、整棵子树原样拷入）。
+#   于是 20 个 json 落到 `Recon.app/zh-CN.json` 之类位置，`subdirectory:`
+#   一个都匹配不上 → `LocaleCatalog` 把 20 个 locale **全部**记入
+#   `missingFiles` → 所有界面回退显示键名（如 `msg.export.title`）。
+#
+#   为什么此前无人发现：**编译、链接、签名、安装、启动全部正常**，UI 也不崩
+#   —— 只是所有文案变成键名。属本项目第三次踩到的同一形态（前两次：缺口 J/P
+#   的 RGB 帧被静默丢弃、G15 的 metallib 落位）。这三例的共同教训是：
+#   **凡是"运行时按路径查找资源"的代码，都必须有一条闸门把「代码查找方式」与
+#   「包内实际落位」对账** —— 只看工程配置、或只看代码，都看不出来。
+#
+# 判据（三条，G17-c 是真正抓得住漂移的那条）：
+#   G17-a  生成物 `project.yml` 的 locale 资源条目必须带 `type: folder`，
+#          且路径最后一段为 `locales`。
+#   G17-b  生成器 `tools/gen_ios_project.py` 同禁（源头；否则重生成即回退）。
+#   G17-c  **交叉对账**：从 `Localization.swift` 解析出的 `subdirectory:` 实参
+#          必须等于该 folder reference 目录的最后一段。任一侧被改（代码改成
+#          不再带 subdirectory，或路径改成别的目录名）都立即失败。
+#          —— 这条是"判据落在目标对象上"的落地：判据不是"有没有写 type: folder"，
+#             而是"包的落位与代码的查找**是不是同一件事**"。
+#
+# 产物面的对应判据是 `tools/stage_ios_ipa.py` 的 **P-8**（读回 IPA 验证
+# `Payload/Recon.app/<subdir>/<locale>.json` 齐全）。二者一静（本闸门）一动
+# （读产物），互补而非重复。
+#
+# 负向注入见 `tools/verify_ios_contract_negative.py` 的 G17-a/b/c 三项。
+# ===========================================================================
+
+def gate_locale_resource_layout(rep: Report) -> None:
+    gate = "G17/locale-layout"
+
+    # --- G17-c 的右侧：Swift 的查找方式（先解析，供 a/b 共用）--------------
+    swift = os.path.join(ROOT, "ui", "ios", "Recon", "Sources",
+                         "Localization", "Localization.swift")
+    subdir: str | None = None
+    if not os.path.isfile(swift):
+        rep.err(gate, f"缺少 {rel(swift)}（无法交叉对账 locale 查找方式）")
+    else:
+        m = re.search(r'subdirectory:\s*"([^"]*)"', read_text(swift))
+        if not m:
+            rep.err(gate,
+                    f"{rel(swift)} 里找不到 `subdirectory: \"...\"` —— locale 的"
+                    f"查找方式已变（或改成非字面量）。本闸门无法交叉对账，"
+                    f"须同步更新它，或改回带 subdirectory 的查找。")
+        elif not m.group(1):
+            rep.err(gate,
+                    f"{rel(swift)} 的 `subdirectory:` 为空字符串 —— 那就不再要求"
+                    f"包内有独立目录层，与 folder reference 的落位不符。")
+        else:
+            subdir = m.group(1)
+
+    def check_source(path: str, label: str) -> None:
+        if not os.path.isfile(path):
+            rep.err(gate, f"缺少 {rel(path)}（{label}）")
+            return
+        text = read_text(path)
+        # 找 `- path: .../locales` 这一条，取出其紧随的 `type:`。
+        m = re.search(
+            r'-\s*path:\s*(\S+?)\s*#?[^\n]*\n((?:[ \t]+[^\n]*\n)*?)(?:[ \t]*-|$)',
+            text)
+        # 上面这条对"下一个条目"的边界不稳，改用逐行状态机（更可读也更稳）。
+        lines = text.splitlines()
+        found_path: str | None = None
+        found_type: str | None = None
+        for i, raw in enumerate(lines):
+            s = raw.strip()
+            if s.startswith("- path:") and s.split(":", 1)[1].strip().rstrip("/").endswith("/locales"):
+                found_path = s.split(":", 1)[1].strip().split()[0].rstrip("/")
+                # 向下最多 3 行找同级的 type:
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    sj = lines[j].strip()
+                    if sj.startswith("- path:") or sj.startswith("settings:"):
+                        break
+                    if sj.startswith("type:"):
+                        found_type = sj.split(":", 1)[1].strip()
+                        break
+                break
+            # 兼容朴素写法：路径就是 `.../Resources`（缺 locales 段）
+            if s.startswith("- path:") and s.split(":", 1)[1].strip().rstrip("/").endswith("/Resources"):
+                found_path = s.split(":", 1)[1].strip().split()[0].rstrip("/")
+                break
+        if found_path is None:
+            rep.err(gate,
+                    f"{rel(path)}（{label}）里找不到 locale 资源条目"
+                    f"（`- path: .../locales`）—— 若资源声明被删，则包内不会"
+                    f"有任何 locale，UI 全部回退到键名。")
+            return
+        if found_type != "folder":
+            rep.err(gate,
+                    f"{rel(path)}（{label}）的 locale 资源 `{found_path}` 未声明 "
+                    f"`type: folder`（实际 type={found_type!r}）—— XcodeGen 默认的 "
+                    f"`type: group` 会把资源**展平到 bundle 根**，"
+                    f"`subdirectory: \"{subdir or 'locales'}\"` 将全部匹配不上。")
+        if subdir is not None and os.path.basename(found_path) != subdir:
+            rep.err(gate,
+                    f"{rel(path)}（{label}）的 locale 目录名为 "
+                    f"`{os.path.basename(found_path)}`，而 {rel(swift)} 的 "
+                    f"`subdirectory:` 是 `{subdir}` —— 二者不一致，包内落位与"
+                    f"代码查找不是同一件事。")
+
+    # --- G17-a：生成物 ----------------------------------------------------
+    check_source(os.path.join(IOS_DIR, "Container", "project.yml"), "生成物")
+    # --- G17-b：生成器源头 ------------------------------------------------
+    check_source(os.path.join(ROOT, "tools", "gen_ios_project.py"), "生成器源头")
+
+    # --- G17-d：隐私清单的落位前提（不得把 platform/ios/Recon 改成 folder）--
+    #   它与 G17-a 的诉求**方向相反**：locales 要 folder 才不丢目录层，
+    #   PrivacyInfo 要靠 group 展平才落到包根。两条同时成立才是当前正确状态。
+    for path, label in ((os.path.join(IOS_DIR, "Container", "project.yml"), "生成物"),
+                        (os.path.join(ROOT, "tools", "gen_ios_project.py"), "生成器源头")):
+        if not os.path.isfile(path):
+            continue
+        lines = read_text(path).splitlines()
+        for i, raw in enumerate(lines):
+            s = raw.strip()
+            if s.startswith("- path:") and s.split(":", 1)[1].strip().rstrip("/") == "platform/ios/Recon":
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    sj = lines[j].strip()
+                    if sj.startswith("- path:") or sj.startswith("excludes:") \
+                            or sj.startswith("settings:"):
+                        break
+                    if sj == "type: folder":
+                        rep.err(gate,
+                                f"{rel(path)}（{label}）把 `platform/ios/Recon` 声明为 "
+                                f"`type: folder` —— 那会让它与它下面的 "
+                                f"`Resources/PrivacyInfo.xcprivacy` 一起保留目录层，"
+                                f"隐私清单落到 `Recon.app/Recon/Resources/` 而非**包根**"
+                                f"（docs/11 §1.5 要求包根；上架校验项）。"
+                                f"该 source 必须保持默认 group 以展平到包根。")
+                break
+
+    # --- G17-c 已在 check_source 内完成交叉对账 ----------------------------
+    if not any(gate in e for e in rep.errors):
+        rep.note(f"locale 资源落位纪律：locales 为 folder reference，与 "
+                 f"Localization.swift 的 subdirectory=\"{subdir}\" 一致，"
+                 f"且 platform/ios/Recon 保持 group（PrivacyInfo 落包根）✓")
+
+
 def main() -> int:
     rep = Report()
     if not os.path.isdir(UI_IOS):
@@ -1800,6 +2220,9 @@ def main() -> int:
     gate_stage_map(rep)
     gate_status_mapping(rep)
     gate_platform_plane_discipline(rep)
+    gate_bundle_layout(rep)
+    gate_ipa_pipeline(rep)
+    gate_locale_resource_layout(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -1821,7 +2244,9 @@ def main() -> int:
     print("结论：G1 locale / G2 玻璃白名单 / G3 禁令 / G4 权限 / G5 ABI / "
           "G6 键集合 / G7 混编接线 / G8 回退链 / G9 去硬编码 / "
           "G10 ABI 边界 / G11 错误码逐值对等 / G12 阶段映射自洽 / "
-          "G13 错误码映射穷举 / G14 平台平面缓冲纪律 全部通过。")
+          "G13 错误码映射穷举 / G14 平台平面缓冲纪律 / "
+          "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
+          "G17 locale 资源落位纪律 全部通过。")
     return 0
 
 

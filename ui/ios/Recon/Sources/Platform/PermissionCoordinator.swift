@@ -105,4 +105,21 @@ public final class PermissionCoordinator {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
     }
+
+    // =======================================================================
+    // MARK: - 状态重查（P-01/P-02 这条链的闭合条件）
+    // =======================================================================
+
+    /// 当前相机授权是否已生效（不弹窗、不申请，只读）。
+    ///
+    /// 用途：用户从设置页改完权限回到 App 时重查一次 —— 否则界面会停在
+    /// 「没有相机权限」的陈旧状态，一直骗到重启为止（详见
+    /// `ReconSessionController.refreshPermissionStateOnForeground()`）。
+    ///
+    /// `nonisolated`：`AVCaptureDevice.authorizationStatus` 是**线程安全**的
+    /// 纯查询，不触碰本类的任何 MainActor 状态，故不引入 actor 跳转；
+    /// 这与本项目在 `MonoNumber` 上用过同一手法（见 Components.swift）。
+    nonisolated public func cameraAuthorizationGranted() -> Bool {
+        AVCaptureDevice.authorizationStatus(for: .video) == .authorized
+    }
 }

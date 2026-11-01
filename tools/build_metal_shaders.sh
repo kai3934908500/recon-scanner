@@ -21,9 +21,22 @@
 #   `RECON_IOS_SDK`（iphoneos / iphonesimulator）共同决定。
 #
 # 运行时加载（docs/12 MT-1 / MT-2）：
-#   `MTLDevice.makeDefaultLibrary()` 自动在 `Recon.app/Contents/Resources/`
-#   找 `default.metallib`；**不得**用 `makeDefaultLibrary(bundle:)` 指定自定义
-#   bundle 名（会让 App Extension 等场景失效）。
+#   `MTLDevice.makeDefaultLibrary()` 自动在**包根**（iOS 扁平 bundle：
+#   `Recon.app/default.metallib`）找 `default.metallib`；**不得**用
+#   `makeDefaultLibrary(bundle:)` 指定自定义 bundle 名（会让 App Extension
+#   等场景失效）。
+#
+#   ⚠️ 为什么默认 OUT_DIR 里**没有** `Contents/`（2026-11-01 实测修正）：
+#     iOS 的 bundle 是扁平结构，非本地化资源位于包根，**不存在** `Contents/`
+#     这一层（Apple《Bundle Structures》原文：iOS "uses a relatively flat
+#     structure ... in the top-level bundle directory"）。写成
+#     `Recon.app/Contents/Resources/` 会在**编译期与 CI 全绿**的情况下把产物
+#     放到一个永远不会被 `makeDefaultLibrary()` 读取的位置 —— 运行期 GPU 路径
+#     永久降级（属最难的"静默失效"）。
+#     真正的调用方（Xcode build phase / CMake）都应显式传
+#     `RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"`
+#     （iOS = 包根，macOS = Contents/Resources，由 Xcode 按平台展开）。
+#     此处默认值是**没有调用方传参时**的兜底，按 iOS 口径给。
 #
 # ---------------------------------------------------------------------------
 # ⚠️ 本脚本在 Windows 上**无法运行**（无 xcrun / 无 iPhoneOS SDK）。
@@ -46,8 +59,9 @@ cd "${ROOT}"
 
 # --- 参数 / 环境 -----------------------------------------------------------
 SDK="${RECON_IOS_SDK:-iphoneos}"
-# 产物目录：默认对齐 docs/12 §4.4 的 iOS bundle 结构
-OUT_DIR="${RECON_METALLIB_OUT_DIR:-build/ios/Recon.app/Contents/Resources}"
+# 产物目录：默认对齐 iOS 扁平 bundle 的真实结构（非本地化资源在**包根**，
+# 无 `Contents/` 一层，见文件头论证）。调用方应显式传 RECON_METALLIB_OUT_DIR。
+OUT_DIR="${RECON_METALLIB_OUT_DIR:-build/ios/Recon.app}"
 AIR_DIR="${RECON_METAL_AIR_DIR:-build/ios/metal-air}"
 REQUIRE="${RECON_REQUIRE_METAL:-0}"
 # 最低部署目标（docs/12 §4.6：iOS 15.0）。**它不是可有可无的元数据** ——

@@ -30,8 +30,10 @@
 #
 # 选择器（= 能力点，每个对应恰好一条命令）：
 #   generate  生成 iOS 工程描述（其余 iOS 类闸门的**前置**）
-#   ios       iOS 静态契约 G1..G14
+#   ios       iOS 静态契约 G1..G16
 #   neg-ios   上条的负向注入
+#   ipa       未签名 IPA 打包器的判据本体自检（stage_ios_ipa.py 的 P-1..P-9）
+#             —— 合成产物 + 逐条证伪，**不需要 macOS 与任何 Apple 工具**
 #   parity    双端功能对等（1..9）
 #   neg-parity
 #   shaders   着色器两端一致性（P1..P15）
@@ -50,6 +52,7 @@
 # 组合选择器（便于一次选一组，避免手抄长列表）：
 #   all       = 全部能力点（默认）
 #   ios       = generate,ios,neg-ios        ← 同时是能力点名，故会顺带补生成器
+#   ipa       = ipa                         ← 单点
 #   parity    = generate,parity,neg-parity
 #   shaders   = shaders,neg-shaders
 #   android   = android,neg-android
@@ -84,7 +87,7 @@ cd "${ROOT}"
 # ---------------------------------------------------------------------------
 # 能力点全集（顺序 = 执行顺序，且与并入本脚本之前的 YAML step 顺序逐条对应）
 # ---------------------------------------------------------------------------
-CAPS_ALL="generate ios neg-ios parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license xcodegen"
+CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license xcodegen"
 
 # 互为「组合选择器 → 能力点」的展开表。
 # 键与值都只用空格分隔的普通字符串（bash 3.2 无关联数组，macOS 上也能跑）。
@@ -97,7 +100,7 @@ selector_expand() {
     android)    echo "android neg-android" ;;
     toolchain)  echo "toolchain neg-toolchain" ;;
     negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-toolchain" ;;
-    generate | neg-ios | neg-parity | neg-shaders | neg-android | neg-toolchain | \
+    generate | neg-ios | ipa | neg-parity | neg-shaders | neg-android | neg-toolchain | \
     elf | abi | params | license | xcodegen)
                 echo "$1" ;;
     *)          return 1 ;;
@@ -168,7 +171,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ⚠️ 本列表必须与 `selector_expand` 的分支**逐项一致**（含组合选择器）。
   #    漏一个组合选择器 → 它的展开结果不参与下面的 ③ 并集断言，
   #    于是"该选择器指向已被删除的能力点"这类错误不会被发现。
-  for s in generate ios parity shaders android toolchain elf negative abi params license xcodegen; do
+  for s in generate ios ipa parity shaders android toolchain elf negative abi params license xcodegen; do
     caps="$(parse_selector "${s}")" || { echo "::error::选择器 ${s} 解析失败"; fail=1; continue; }
     n="$(echo "${caps}" | wc -w | tr -d ' ')"
     echo "  - ${s} → ${n} 个：${caps}"
@@ -187,7 +190,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ③ 并集 == all，且每个能力点都可达（有选择器能选到它）
   #    ⚠️ 同上：列表必须与 selector_expand 的分支逐项一致。
   union=""
-  for s in generate ios parity shaders android toolchain elf negative abi params license xcodegen; do
+  for s in generate ios ipa parity shaders android toolchain elf negative abi params license xcodegen; do
     union="${union} $(parse_selector "${s}")"
   done
   for c in ${CAPS_ALL}; do
@@ -256,11 +259,20 @@ if wants generate; then
 fi
 
 if wants ios; then
-  step "iOS 静态契约闸门（G1..G14）" "${PY}" tools/check_ios_contract.py
+  step "iOS 静态契约闸门（G1..G17）" "${PY}" tools/check_ios_contract.py
 fi
 if wants neg-ios; then
   step "iOS 静态契约负向注入（证明 G 判据非假闸门）" \
     "${PY}" tools/verify_ios_contract_negative.py
+fi
+
+# --- 未签名 IPA 打包器（P-1..P-9）的判据本体自检 ----------------------------
+# 为什么放在这里而不是 macOS job：它是**纯 Python 标准库**实现（zipfile +
+# 自研 Mach-O 解析），合成产物即可证伪 —— 不需要 Xcode / lipo / zip。
+# 这与 `elf` 能力点的理由一致：核心资源的**判据实现本体**必须先于产物被验证。
+if wants ipa; then
+  step "未签名 IPA 打包器自检（P-1..P-9，合成产物 + 逐条证伪）" \
+    "${PY}" tools/stage_ios_ipa.py --self-test
 fi
 
 if wants parity; then

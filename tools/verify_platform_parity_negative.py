@@ -31,6 +31,12 @@
       · 把 JNI 导出名改名而 Kotlin 不同步 → 须报「未声明」（反向漏网）
       · 把 imu-bridge.cpp 从根 CMakeLists 的 target 源列表移除 → 须报「未注册进
         根 CMakeLists」（闸门 9 的上游成因，不查它会「闸门 9 说闭合但真机仍崩」）
+  闸门 10 能力事实上报的**字段级**三端对等（第四十轮新增，缺口 AC）
+      · iOS `cValue` 漏一个字段 → 须报「iOS 上报**漏字段**」
+      · Android JNI 实现漏一个字段 → 须报「Android 上报**漏字段**」
+      · 两端**同时**漏同一字段 → 仍须报（闸门 4 只查「函数被调过」，对
+        「两端一起漏」完全无覆盖 —— 这正是本闸门存在的理由）
+      · iOS 上报一个 C ABI 不存在的字段 → 须报「iOS 上报**多字段**」
 
 ⚠️ 本脚本会**临时修改** `platform/android/.../CoreTypes.kt`、
    `platform/android/.../cpp/native-lib.cpp`、`platform/ios/Recon/ReconCore.swift`、
@@ -80,6 +86,16 @@ C_API_HEADER = os.path.join(ROOT, "core", "include", "recon", "recon_c_api.h")
 # 故判据必须覆盖 .mm —— 只扫 Swift/Kotlin 会漏掉真正的目标对象。
 IOS_METAL_BACKEND = os.path.join(ROOT, "platform", "ios", "Recon",
                                  "MetalComputeBackend.mm")
+
+
+# 闸门 11 注入目标：导出格式三端映射（C ABI / iOS 枚举 / iOS 映射 / Kotlin 注释）。
+IOS_EXPORT_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens",
+                               "ExportView.swift")
+IOS_SESSION_CONTROLLER = os.path.join(ROOT, "ui", "ios", "Recon", "Sources",
+                                      "State", "ReconSessionController.swift")
+ANDROID_NATIVE_KT = os.path.join(ROOT, "platform", "android", "app", "src",
+                                 "main", "java", "com", "recon", "scan",
+                                 "NativeBridge.kt")
 
 
 def slurp(path: str) -> str:
@@ -264,13 +280,101 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "RECON_API recon_status recon_get_preview_blob(void* context,\n"
           "                                               uint8_t** out_buffer);")],
     ),
+    # --- 闸门 10：能力事实上报的**字段级**三端对等（缺口 AC，第四十轮新增）----
+    #
+    # 为什么必须为它写注入：闸门 4 只保证「两端都调了 recon_set_probe_data」这个
+    # **动作**存在；而缺口 AC 的真实危险形态是**字段漏写** —— 一端写了、
+    # 另一端忘了，两端在**同一台设备**上会得出不同的分支判定，且闸门 4 全绿。
+    # 这正是 #109 式的检测盲区，必须用注入证明闸门 10 真的会拒收。
+    (
+        "P10-a-ios-field-missing",
+        "iOS `ReconProbeData.cValue` 漏写一个字段（has_algo_depth）",
+        "iOS 上报**漏字段**",
+        [(IOS_CORE_SWIFT,
+          "        d.has_algo_depth = hasAlgoDepth ? 1 : 0\n",
+          "")],
+    ),
+    (
+        "P10-b-android-field-missing",
+        "Android `setProbeData` 的 JNI 实现漏写一个字段（imu_max_rate_hz）",
+        "Android 上报**漏字段**",
+        [(NATIVE_CPP,
+          "  d.imu_max_rate_hz = (imu_max_rate_hz > 0) ? imu_max_rate_hz : 0;\n",
+          "")],
+    ),
+    (
+        "P10-c-both-field-missing",
+        "两端**同时**漏同一字段（total_memory_bytes）—— 闸门 4 抓不到的那一类",
+        "漏字段",
+        [(IOS_CORE_SWIFT,
+          "        d.total_memory_bytes = totalMemoryBytes\n",
+          ""),
+         (NATIVE_CPP,
+          "  d.total_memory_bytes =\n"
+          "      (total_memory_bytes > 0) ? static_cast<uint64_t>(total_memory_bytes) : 0u;\n",
+          "")],
+    ),
+    (
+        "P10-d-ios-extra-field",
+        "iOS 上报一个 `recon_probe_data` 不存在的字段（C ABI 改名后 Swift 没跟）",
+        "iOS 上报**多字段**",
+        [(IOS_CORE_SWIFT,
+          "        d.has_algo_depth = hasAlgoDepth ? 1 : 0\n",
+          "        d.has_algo_depth = hasAlgoDepth ? 1 : 0\n"
+          "        d.has_neg_inject_bogus = 1\n")],
+    ),
+    # --- 闸门 11（第四十五轮新增）：导出格式三端映射对等 ---
+    #
+    # 每一条都对应一种**真实会发生的漂移**，而不是为了凑数：
+    #   P11-a 加格式只改 C ABI     → 两端都漏（典型「先写内核，忘了 UI」）
+    #   P11-b 两端 case 都在但顺序反 → 序号互换，导出格式错位但不报错
+    #   P11-c 只改一处序号映射     → Swift 枚举有 5 项但映射少一项
+    #   P11-d 只改 Kotlin 注释     → Android 侧文档先于内核漂移
+    (
+        "P11-a-cabi-only",
+        "只在 C ABI 加一个导出格式（iOS 枚举与映射都不动）",
+        "未登记进真源表的格式",
+        [(C_API_HEADER,
+          "    RECON_EXPORT_3MF      = 4   /**< 3MF。OPC/ZIP 容器，`unit=\"millimeter\"` */\n"
+          "} recon_export_format;\n",
+          "    RECON_EXPORT_3MF      = 4,  /**< 3MF。OPC/ZIP 容器，`unit=\"millimeter\"` */\n"
+          "    RECON_EXPORT_USDZ     = 5   /**< 注入：未经三端同步的新格式 */\n"
+          "} recon_export_format;\n")],
+    ),
+    (
+        "P11-b-ios-case-order-swapped",
+        "iOS 枚举交换 stl / threeMf 的顺序（SWIFT 侧序号与 C ABI 错位）",
+        "iOS `ExportFormat` 的 case 列表与真源表**不一致**",
+        [(IOS_EXPORT_VIEW,
+          "    case stl       // STL（打印）\n"
+          "    case threeMf   // 3MF（打印，带单位声明）\n",
+          "    case threeMf   // 3MF（打印，带单位声明）\n"
+          "    case stl       // STL（打印）\n")],
+    ),
+    (
+        "P11-c-ios-map-drift",
+        "iOS 枚举保留 5 个 case，但显式序号映射里少写一项（漏了 3MF）",
+        "iOS 显式序号映射与 C ABI 不一致",
+        [(IOS_SESSION_CONTROLLER,
+          "        case .threeMf: fmt = 4\n",
+          "")],
+    ),
+    (
+        "P11-d-kotlin-doc-drift",
+        "只改 Kotlin 文档注释里的某个格式序号（Android 侧约定先漂移）",
+        "Android NativeBridge.kt 的格式序号注释与真源不一致",
+        [(ANDROID_NATIVE_KT,
+          "     * `0=GLB, 1=OBJ_MTL, 2=PLY, 3=STL, 4=3MF`。\n",
+          "     * `0=GLB, 1=OBJ_MTL, 2=PLY, 3=3MF, 4=STL`。\n")],
+    ),
 ]
 
 
 def main() -> int:
     for p in (GATE, CORE_TYPES, NATIVE_CPP, IOS_CORE_SWIFT, C_API_HEADER,
               IOS_IMU_WINDOW, ANDROID_CAPTURE_ACTIVITY, ANDROID_IMU_BRIDGE,
-              ROOT_CMAKE, IOS_METAL_BACKEND):
+              ROOT_CMAKE, IOS_METAL_BACKEND, IOS_EXPORT_VIEW,
+              IOS_SESSION_CONTROLLER, ANDROID_NATIVE_KT):
         if not os.path.isfile(p):
             print(f"[negative] 环境错误：找不到 {p}", file=sys.stderr)
             return 1
@@ -339,7 +443,7 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 5 / 6 / 7 / 8 / 9 均有效）")
+          f"（闸门 5 / 6 / 7 / 8 / 9 / 10 / 11 均有效）")
     return 0
 
 

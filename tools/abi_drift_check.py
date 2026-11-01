@@ -54,8 +54,15 @@ KNOWN_DRAFT_ONLY_STRUCTS = {
     "recon_param_issue",
     "recon_calibration_request",
 }
-# 实现独占结构体（草案中不存在）—— 当前为空
-KNOWN_REAL_ONLY_STRUCTS: set[str] = set()
+# 实现独占结构体（草案中不存在）
+# `recon_probe_data`：2026-11-01 缺口 AC 新增（见 docs/01 §2 追加裁定）。
+#   它是**平台层上报事实**的 POD（平台 → core），与 `recon_capability`
+#   （core 判定结果，core → 平台）方向相反、字段不同，两者不得混用。
+#   不递增 RECON_ABI_VERSION：属「新增函数/结构体（追加）」，未改动任何
+#   已存在 POD 布局与函数签名（docs/01 §1.3）。
+KNOWN_REAL_ONLY_STRUCTS: set[str] = {
+    "recon_probe_data",
+}
 
 # 实现独占函数（真实头文件有、草案无）—— 锚点 §2 裁定表格：
 KNOWN_ONLY_REAL_FUNCS = {
@@ -66,6 +73,11 @@ KNOWN_ONLY_REAL_FUNCS = {
     "recon_get_param",
     "recon_probe_capability",
     "recon_set_param",
+    # 2026-11-01 缺口 AC：平台层上报能力事实（全局 / 幂等）。
+    #   **它必须保持在 only-real 一侧** —— 因为草案里没有对应函数，这个
+    #   「不对称」正是缺口 AC 的存在证据。若哪天它进了交集，说明有人
+    #   往草案里补了同名函数，那时应改为递增 ABI 版本并走完整流程。
+    "recon_set_probe_data",
 }
 # 草案独占函数（真实头文件无）—— 锚点 §2 裁定 A/B/C 三类：
 KNOWN_ONLY_DOC_FUNCS = {
@@ -251,6 +263,15 @@ def extract_anchor_numbers(doc01: pathlib.Path) -> dict[str, int]:
     m = re.search(r"草案独占的\s*\*\*(\d+)\s*个函数\*\*", text)
     if m:
         got["only_doc"] = int(m.group(1))
+    # 结构体侧（缺口 AC 追加：让「新增跨语言边界」除集合级对照外，还有一条
+    # 独立的锚点数字交叉核对 —— 集合级基线两侧同源，单靠它无法证明「人确实
+    # 在 docs/01 里登记过」；这两条数字来自锚点正文，改代码不改锚点即失败）。
+    m = re.search(r"真实头文件定义\s*\*\*(\d+)\s*个\*\*", text)
+    if m:
+        got["real_struct_total"] = int(m.group(1))
+    m = re.search(r"草案\*\*另独占\s*(\d+)\s*个\*\*结构体", text)
+    if m:
+        got["draft_only_struct"] = int(m.group(1))
     return got
 
 
@@ -386,6 +407,24 @@ def run(args: argparse.Namespace) -> int:
         warnings.append(
             f"基线中的实现独占结构体已消失 {gone_only_real} —— 若已删除请更新基线常量"
         )
+
+    # --- 检查 3b：结构体数量与锚点声明一致（集合级基线两侧同源，需独立交叉核对）--
+    # 为什么必须有这一条：`KNOWN_REAL_ONLY_STRUCTS` 是**脚本内**常量，若允许它
+    # 无声跟随实现变化，则「在头文件里塞一个新结构体 + 往白名单里抄一遍」
+    # 就能让闸门全绿 —— 那就等于闸门不存在。锚点数字在 docs/01 正文里，
+    # 改代码不改锚点必然对不上。
+    if declared:
+        if "real_struct_total" in declared and declared["real_struct_total"] != len(real_structs):
+            errors.append(
+                f"锚点声明的真实头文件结构体总数 = {declared['real_struct_total']}，"
+                f"实测 = {len(real_structs)}（锚点与代码不一致，要么代码漂移、"
+                f"要么锚点待更新）"
+            )
+        if "draft_only_struct" in declared and declared["draft_only_struct"] != len(s_only_doc):
+            errors.append(
+                f"锚点声明的草案独占结构体数 = {declared['draft_only_struct']}，"
+                f"实测 = {len(s_only_doc)}（锚点与代码不一致）"
+            )
     if not (new_only_real or new_only_doc):
         print(
             f"[abi-drift] POD 结构体对照基线通过（共有 {len(real_structs & doc_structs)} 个；"

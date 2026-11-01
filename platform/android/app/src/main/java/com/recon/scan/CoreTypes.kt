@@ -139,6 +139,57 @@ object PipelineBranch {
 }
 
 /**
+ * 平台能力**事实**上报载荷（对应 `recon_probe_data`，缺口 AC）。
+ *
+ * 与 [Capability] 的分工（**不要混用**）：本类型是平台层**报上去**的事实
+ * （`平台 → core`），[Capability] 是 core **判定后**的结果（`core → 平台`，
+ * 多出 branch / depthTier / depthSource 三个派生字段）。
+ *
+ * 与 iOS `ReconProbeData` 对等（`platform/ios/Recon/ReconCore.swift`）。
+ *
+ * ⚠️ 为什么 `Capability` 里已有 `maxImageWidth`，这里还要再报一遍：
+ * 因为「相机最大分辨率」是**设备事实**，而 `recon_capability` 里那个字段是
+ * 平台报上去后被 core **原样带回来**的。真机上若不上报，core 读到全零，
+ * `recon_capability.max_image_width` 也是 0 —— 那才是缺口 AC 的表象。
+ */
+data class ProbeData(
+    val hasCamera: Boolean,
+    val hasImu: Boolean,
+    val hasLidar: Boolean,
+    val hasTof: Boolean,
+    /** 算法 / 运动推断深度（ARCore Depth API）。 */
+    val hasAlgoDepth: Boolean,
+    val supportsGpu: Boolean,
+    val maxImageWidth: Int,
+    val maxImageHeight: Int,
+    val maxFps: Int,
+    val imuMaxRateHz: Int,
+    val totalMemoryBytes: Long,
+    val availableMemoryBytes: Long,
+) {
+    /**
+     * 上报给 core。**不接受 context**：`recon_set_probe_data` 是全局的
+     * （设备能力与哪个会话无关），见 [NativeBridge.setProbeData] 的说明。
+     *
+     * @return core 的 `recon_status`；非 [ReconStatus.OK] 表示上报失败。
+     */
+    fun report(): Int = NativeBridge.setProbeData(
+        hasCamera = hasCamera,
+        hasImu = hasImu,
+        hasLidar = hasLidar,
+        hasTof = hasTof,
+        hasAlgoDepth = hasAlgoDepth,
+        supportsGpu = supportsGpu,
+        maxImageWidth = maxImageWidth,
+        maxImageHeight = maxImageHeight,
+        maxFps = maxFps,
+        imuMaxRateHz = imuMaxRateHz,
+        totalMemoryBytes = totalMemoryBytes,
+        availableMemoryBytes = availableMemoryBytes,
+    )
+}
+
+/**
  * 设备能力（对应 `recon_capability`）。
  *
  * 由 [NativeBridge.probeCapability] 返回的 `IntArray` 经 [fromArray] 解包。

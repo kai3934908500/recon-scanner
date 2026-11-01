@@ -72,6 +72,12 @@ public struct ReconApp: App {
             if controller.session.isPaused {
                 controller.appWillForeground()
             }
+            // P-01/P-02 的闭合条件：用户可能刚在设置里打开相机权限再切回来，
+            // 此时必须重查一次，否则界面会停在「没有相机权限」的陈旧状态
+            // （详见 `refreshPermissionStateOnForeground()` 的注释）。
+            // 放在 `isPaused` 判断**之外** —— 权限被拒时状态机处于 `Failed`，
+            // 不会有暂停标志，两者互不覆盖。
+            controller.refreshPermissionStateOnForeground()
         default:
             break
         }

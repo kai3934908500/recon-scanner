@@ -35,10 +35,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <vector>
+
+#if RECON_HAVE_ZLIB
+#include <zlib.h>
+#endif
 
 namespace recon {
 namespace {
@@ -498,6 +504,354 @@ bool ExportGlb(const TriangleMesh& mesh, const ExportOptions& options,
 }
 
 // ---------------------------------------------------------------------------
+// STL（二进制）
+// ---------------------------------------------------------------------------
+//
+// 契约：docs/06 §3.2「STL」。
+//
+// **单位（STL 最大的坑）**：STL 规范**没有单位字段** —— 原文是
+//   `Coordinates are unitless floating-point numbers, and the units of the
+//    coordinates are not specified by the format.`
+// 因此它无法在文件内声明单位，只能靠行业约定。3D 打印世界的约定是**毫米**
+// （切片器的层高、喷嘴直径、打印床尺寸全以毫米计），故本函数把导出坐标
+// （米）乘以 1000 写出。
+//
+// **为什么不提供 ASCII STL**：ASCII 版体积约为二进制的 6 倍（每个 float 写
+// 成十进制文本），而本格式的消费者是切片器（拓竹 Bambu Studio / PrusaSlicer），
+// 两者对二进制 STL 都是首选支持。ASCII 唯一的好处是可读，对切片无价值。
+//
+// **为什么法线要自己算**：STL 每面显式存 3 个 float 的法线。若网格已有
+// 逐顶点法线，逐顶点法线是**平滑**的，而 STL 要的是**面法线**（几何法线）——
+// 用顶点法线会写出同一面上的三个不同值，切片器会按第一/最后一个面法线取元，
+// 导致切片方向错乱。故此处一律由顶点坐标右手叉积重算并单位化。
+
+namespace {
+
+// 米 → 毫米。STL 与 3MF 的写出单位。
+constexpr double kMmPerMeter = 1000.0;
+
+// 计算第 t 个三角形的面法线（右手叉积，已单位化）。
+// 退化面（零面积）返回 (0,0,0) —— 这是 STL 规范允许的表示。
+Vec3d FaceNormal(const TriangleMesh& mesh, size_t t) {
+  const Vec3d& a = mesh.positions[mesh.indices[t * 3 + 0]];
+  const Vec3d& b = mesh.positions[mesh.indices[t * 3 + 1]];
+  const Vec3d& c = mesh.positions[mesh.indices[t * 3 + 2]];
+  return (b - a).cross(c - a).normalized();
+}
+
+void AppendU16(std::string* out, uint16_t v) {
+  out->push_back(static_cast<char>(v & 0xFF));
+  out->push_back(static_cast<char>((v >> 8) & 0xFF));
+}
+
+}  // namespace
+
+bool ExportStl(const TriangleMesh& mesh, const ExportOptions& options,
+               std::string* out_stl) {
+  if (out_stl == nullptr) return false;
+  if (mesh.positions.empty() || mesh.indices.empty()) return false;
+
+  const size_t tri_count = mesh.indices.size() / 3;
+  // 面数必须能装进 uint32：80 + 4 + 50×N 的头部约定。
+  if (tri_count > 0xFFFFFFFFull) return false;
+
+  out_stl->clear();
+  out_stl->reserve(84 + tri_count * 50);
+
+  // ---- 80 字节 header ----
+  // 规范说 header 内容任意但**不得**以 "solid" 开头（否则会被误判为 ASCII STL）。
+  // 这里写自述文字，既满足约束又便于 `strings` 排查来源。
+  const std::string header = "recon binary STL / unit=millimeter / Y-up";
+  out_stl->append(header);
+  out_stl->append(80 - header.size(), ' ');
+
+  // ---- 面数（uint32 LE）----
+  AppendU32(out_stl, static_cast<uint32_t>(tri_count));
+
+  // ---- 每面 50 字节 ----
+  for (size_t t = 0; t < tri_count; ++t) {
+    const Vec3d n = FaceNormal(mesh, t);
+    AppendF32(out_stl, static_cast<float>(n(0)));
+    AppendF32(out_stl, static_cast<float>(n(1)));
+    AppendF32(out_stl, static_cast<float>(n(2)));
+    for (int k = 0; k < 3; ++k) {
+      const Vec3d& v = mesh.positions[mesh.indices[t * 3 + k]];
+      AppendF32(out_stl, static_cast<float>(v(0) * kMmPerMeter));
+      AppendF32(out_stl, static_cast<float>(v(1) * kMmPerMeter));
+      AppendF32(out_stl, static_cast<float>(v(2) * kMmPerMeter));
+    }
+    // attribute byte count：规范要求置 0。
+    AppendU16(out_stl, 0);
+  }
+
+  (void)options;  // STL 无材质 / 无 UV / 无纹理；选项对本格式无定义语义。
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3MF（OPC / ZIP 容器）
+// ---------------------------------------------------------------------------
+//
+// 契约：docs/06 §3.2「3MF」。规范依据：3MF Consortium《Core Specification》
+// v1.4.0（2023-07），本节涉及的条款：
+//   §3.1  包 = OPC 容器（ZIP），必需部件只有 `3D Model`，其余全 OPTIONAL；
+//   §3.2.1 模型部件的 content type = `application/vnd.ms-package.3dmanufacturing-3dmodel+xml`；
+//   §3.2.2 StartPart 关系类型 = `.../2013/01/3dmodel`；
+//   §3.3.1 `<model unit>` 默认 `millimeter`，允许 micron..meter 七档；
+//   §3.3.2 `<mesh>` = `<vertices>`（≥3 个 `<vertex x y z>`）+ `<triangles>`（≥1 个）；
+//   §3.4.1 `model` 类型网格 MUST 流形、绕序一致、法线朝外，且**至少 4 个三角形**。
+//
+// 「≥4 个三角形」不是排版问题：3 个三角形只能构成非闭合的四面体缺一面，
+// 而规范要求的是**闭合实体**。所以 `<3 个面>` 与 `<4 个面>` 是同一类错误，
+// 一个都不允许 —— 这是 `Export3mf` 有独立最小面数返回 false 的原因。
+
+namespace {
+
+// ZIP 条目。method：0=STORE、8=Deflate。
+struct ZipEntry {
+  std::string name;
+  const std::string* data = nullptr;
+  uint16_t method = 0;
+  uint32_t crc = 0;
+  uint32_t comp_size = 0;
+  uint32_t uncomp_size = 0;
+  uint32_t local_offset = 0;
+};
+
+// CRC-32（IEEE 802.3，反射多项式 0xEDB88320）。
+// 自实现而不调 zlib 的 crc32()：ZIP 是 STORE 回退路径也要用的，
+// 而无 zlib 时 crc32() 不可用 —— 同一逻辑写两份会漂移。
+uint32_t Crc32(const uint8_t* data, size_t len) {
+  static uint32_t table[256];
+  static bool built = false;
+  if (!built) {
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) {
+        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      }
+      table[i] = c;
+    }
+    built = true;
+  }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; ++i) {
+    c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+  }
+  return c ^ 0xFFFFFFFFu;
+}
+
+// raw deflate（ZIP 用的那条，**不带** zlib 头与 Adler-32）。
+// 无 zlib 时返回 false，调用方回退 STORE。
+bool DeflateRaw(const std::string& in, std::string* out) {
+#if RECON_HAVE_ZLIB
+  z_stream zs;
+  std::memset(&zs, 0, sizeof(zs));
+  // windowBits = -15 → raw deflate（RFC 1951）。
+  // 正的 windowBits 会加 zlib 头（RFC 1950），那不是 ZIP 要的东西。
+  if (deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, -15, 8,
+                   Z_DEFAULT_STRATEGY) != Z_OK) {
+    return false;
+  }
+  zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+  zs.avail_in = static_cast<uInt>(in.size());
+  std::string buf;
+  buf.resize(deflateBound(&zs, static_cast<uLong>(in.size())));
+  zs.next_out = reinterpret_cast<Bytef*>(&buf[0]);
+  zs.avail_out = static_cast<uInt>(buf.size());
+  const int rc = deflate(&zs, Z_FINISH);
+  const size_t produced = buf.size() - zs.avail_out;
+  deflateEnd(&zs);
+  if (rc != Z_STREAM_END) return false;
+  buf.resize(produced);
+  *out = std::move(buf);
+  return true;
+#else
+  (void)in;
+  (void)out;
+  return false;
+#endif
+}
+
+// 组装 ZIP（含 local header / central directory / EOCD）。
+// entries 的 data 指针须在调用期间保持有效。
+std::string BuildZip(std::vector<ZipEntry>* entries) {
+  std::string out;
+  std::vector<std::string> compressed(entries->size());
+
+  for (size_t i = 0; i < entries->size(); ++i) {
+    ZipEntry& e = (*entries)[i];
+    const std::string& raw = *e.data;
+    e.crc = Crc32(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    e.uncomp_size = static_cast<uint32_t>(raw.size());
+    e.comp_size = e.uncomp_size;
+
+    // Deflate 只在**确实变小**时采用。3MF 规范明确允许两种 method 混用，
+    // 而压缩一个本来就极小的 XML 常常反而变大。
+    if (!raw.empty()) {
+      std::string def;
+      if (DeflateRaw(raw, &def) && def.size() < raw.size()) {
+        compressed[i] = std::move(def);
+        e.method = 8;
+        e.comp_size = static_cast<uint32_t>(compressed[i].size());
+      } else {
+        e.method = 0;
+        compressed[i] = raw;
+      }
+    } else {
+      e.method = 0;
+      compressed[i] = raw;
+    }
+  }
+
+  // ---- local file header + data ----
+  for (size_t i = 0; i < entries->size(); ++i) {
+    ZipEntry& e = (*entries)[i];
+    e.local_offset = static_cast<uint32_t>(out.size());
+    AppendU32(&out, 0x04034B50u);          // 签名 'PK\3\4'
+    AppendU16(&out, 20);                   // version needed = 2.0
+    AppendU16(&out, 0);                    // flags：不设 UTF-8 位，名字全 ASCII
+    AppendU16(&out, e.method);
+    AppendU16(&out, 0);                    // 修改时间 = 0（可复现构建）
+    AppendU16(&out, 0x21);                 // 修改日期 = 1980-01-01（DOS 纪元零点）
+    AppendU32(&out, e.crc);
+    AppendU32(&out, e.comp_size);
+    AppendU32(&out, e.uncomp_size);
+    AppendU16(&out, static_cast<uint16_t>(e.name.size()));
+    AppendU16(&out, 0);                    // extra field 长度
+    out.append(e.name);
+    out.append(compressed[i]);
+  }
+
+  // ---- central directory ----
+  const uint32_t cd_start = static_cast<uint32_t>(out.size());
+  for (const ZipEntry& e : *entries) {
+    AppendU32(&out, 0x02014B50u);          // 签名 'PK\1\2'
+    AppendU16(&out, 20);                   // version made by
+    AppendU16(&out, 20);                   // version needed
+    AppendU16(&out, 0);                    // flags
+    AppendU16(&out, e.method);
+    AppendU16(&out, 0);                    // 时间
+    AppendU16(&out, 0x21);                 // 日期
+    AppendU32(&out, e.crc);
+    AppendU32(&out, e.comp_size);
+    AppendU32(&out, e.uncomp_size);
+    AppendU16(&out, static_cast<uint16_t>(e.name.size()));
+    AppendU16(&out, 0);                    // extra
+    AppendU16(&out, 0);                    // comment
+    AppendU16(&out, 0);                    // disk number start
+    AppendU16(&out, 0);                    // internal attrs
+    AppendU32(&out, 0);                    // external attrs
+    AppendU32(&out, e.local_offset);
+    out.append(e.name);
+  }
+  const uint32_t cd_size = static_cast<uint32_t>(out.size()) - cd_start;
+
+  // ---- end of central directory ----
+  AppendU32(&out, 0x06054B50u);            // 签名 'PK\5\6'
+  AppendU16(&out, 0);                      // 本盘号
+  AppendU16(&out, 0);                      // 中央目录起始盘号
+  AppendU16(&out, static_cast<uint16_t>(entries->size()));
+  AppendU16(&out, static_cast<uint16_t>(entries->size()));
+  AppendU32(&out, cd_size);
+  AppendU32(&out, cd_start);
+  AppendU16(&out, 0);                      // 注释长度
+  return out;
+}
+
+// `<vertex>` / `<triangle>` 的整数写法。3MF 的顶点索引是 0 基。
+std::string I32(uint32_t v) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%u", v);
+  return std::string(buf);
+}
+
+// 3MF 的浮点写法：定点 6 位小数，与 OBJ 同口径。
+// 不用 %g：%g 会产出 `1e-05` 这类写法，部分 3MF 解析器的 strtod 实现
+// 对指数形式处理不一致（规范只保证 XML Schema 的 double 词法）。
+std::string F(double v) { return FormatFloat(v, 6); }
+
+}  // namespace
+
+bool Export3mf(const TriangleMesh& mesh, const ExportOptions& options,
+               std::string* out_3mf) {
+  if (out_3mf == nullptr) return false;
+  if (mesh.positions.empty() || mesh.indices.empty()) return false;
+
+  // 3MF 规范 §3.4.1：`model` 类型的网格至少 4 个三角形（闭合实体下限）。
+  // 3 个面只能是缺一面的四面体 —— 非闭合，不是合法实体模型。
+  if (mesh.triangle_count() < 4) return false;
+
+  // ---- 3D/3dModel.model ----
+  std::ostringstream m;
+  m << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+  m << "<model unit=\"millimeter\" xml:lang=\"en-US\" "
+       "xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">\n";
+  // metadata 是可选的，但写上便于切片器显示来源与单位。
+  m << " <metadata name=\"Title\">recon model</metadata>\n";
+  m << " <metadata name=\"Application\">recon</metadata>\n";
+  m << " <resources>\n";
+  m << "  <object id=\"1\" type=\"model\">\n";
+  m << "   <mesh>\n";
+  m << "    <vertices>\n";
+  for (const auto& p : mesh.positions) {
+    m << "     <vertex x=\"" << F(p(0) * kMmPerMeter) << "\" y=\""
+      << F(p(1) * kMmPerMeter) << "\" z=\"" << F(p(2) * kMmPerMeter)
+      << "\"/>\n";
+  }
+  m << "    </vertices>\n";
+  m << "    <triangles>\n";
+  const size_t tri_count = mesh.indices.size() / 3;
+  for (size_t t = 0; t < tri_count; ++t) {
+    m << "     <triangle v1=\"" << I32(mesh.indices[t * 3 + 0]) << "\" v2=\""
+      << I32(mesh.indices[t * 3 + 1]) << "\" v3=\""
+      << I32(mesh.indices[t * 3 + 2]) << "\"/>\n";
+  }
+  m << "    </triangles>\n";
+  m << "   </mesh>\n";
+  m << "  </object>\n";
+  m << " </resources>\n";
+  m << " <build>\n";
+  m << "  <item objectid=\"1\"/>\n";
+  m << " </build>\n";
+  m << "</model>\n";
+  const std::string model_xml = m.str();
+
+  // ---- [Content_Types].xml ----
+  // 必须声明 `.model` 扩展名 → 3D Model 部件类型（OPC 的扩展名映射）。
+  const std::string content_types =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/"
+      "content-types\">\n"
+      " <Default Extension=\"rels\" ContentType=\"application/vnd."
+      "openxmlformats-package.relationships+xml\"/>\n"
+      " <Default Extension=\"model\" ContentType=\"application/vnd.ms-package."
+      "3dmanufacturing-3dmodel+xml\"/>\n"
+      "</Types>\n";
+
+  // ---- _rels/.rels（StartPart 关系）----
+  const std::string rels =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/"
+      "relationships\">\n"
+      " <Relationship Target=\"/3D/3dModel.model\" Id=\"rel0\" Type=\"http://"
+      "schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n"
+      "</Relationships>\n";
+
+  std::vector<ZipEntry> entries(3);
+  entries[0].name = "[Content_Types].xml";
+  entries[0].data = &content_types;
+  entries[1].name = "_rels/.rels";
+  entries[1].data = &rels;
+  entries[2].name = "3D/3dModel.model";
+  entries[2].data = &model_xml;
+
+  *out_3mf = BuildZip(&entries);
+  (void)options;  // 3MF 的材质/纹理需另建部件，当前导出不涉及（见 docs/06）。
+  return !out_3mf->empty();
+}
+
+// ---------------------------------------------------------------------------
 // 统一入口
 // ---------------------------------------------------------------------------
 
@@ -524,6 +878,10 @@ bool ExportModel(const TriangleMesh& mesh, const ExportOptions& options,
       return ExportPly(mesh, options, out_main);
     case ExportFormat::kGlb:
       return ExportGlb(mesh, options, out_main);
+    case ExportFormat::kStl:
+      return ExportStl(mesh, options, out_main);
+    case ExportFormat::k3mf:
+      return Export3mf(mesh, options, out_main);
     default:
       return false;
   }

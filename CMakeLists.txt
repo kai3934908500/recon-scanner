@@ -221,17 +221,22 @@ target_link_libraries(recon_core PUBLIC Threads::Threads)
 # 说明：以下依赖通过 third_party/ 内联源码或系统包引入。
 # 具体版本与许可见 docs/12_构建与打包.md §2。
 
-# zlib（Zlib 许可，宽松）—— PNG 纹理导出的压缩后端。
+# zlib（Zlib 许可，宽松）—— PNG 纹理导出的压缩后端，以及 **3MF 的 ZIP 容器**。
 #
 # 优先用系统 zlib；没有就用 PoissonRecon vendor 的那份纯 C 源码
 # （third_party/PoissonRecon-master/ZLIB，1.3.1，许可已在 docs/10 登记）。
-# 两者都拿不到时，PNG 编码器自动退到「存储型 deflate」——文件仍然合法，
-# 只是体积大（见 core/include/recon/png_encoder.h 的说明）。
+# 两者都拿不到时，PNG 编码器退到「存储型 deflate」、3MF 的 ZIP 条目退到
+# STORE（只存不压）—— **两种降级产物都仍然是合法文件**，只是体积大
+# （见 core/include/recon/png_encoder.h 与 docs/06 §3.2）。
+#
+# 注意 `RECON_HAVE_ZLIB` 是本文件 PRIVATE 定义的，而单测要独立验证 3MF 的
+# 压缩条目（必须能解压），所以这里额外定义一个 **PUBLIC** 的开关给测试用。
 find_package(ZLIB QUIET)
 if(ZLIB_FOUND)
   target_link_libraries(recon_core PUBLIC ZLIB::ZLIB)
   target_compile_definitions(recon_core PRIVATE RECON_HAVE_ZLIB=1)
-  message(STATUS "recon: 使用系统 zlib ${ZLIB_VERSION_STRING}（PNG 压缩）")
+  target_compile_definitions(recon_core PUBLIC RECON_TEST_HAVE_ZLIB=1)
+  message(STATUS "recon: 使用系统 zlib ${ZLIB_VERSION_STRING}（PNG/3MF 压缩）")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB/zlib.h")
   set(_recon_zlib_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB")
   add_library(recon_zlib STATIC
@@ -239,7 +244,11 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB/
       "${_recon_zlib_dir}/compress.c"
       "${_recon_zlib_dir}/crc32.c"
       "${_recon_zlib_dir}/deflate.c"
+      "${_recon_zlib_dir}/inflate.c"
+      "${_recon_zlib_dir}/inftrees.c"
+      "${_recon_zlib_dir}/inffast.c"
       "${_recon_zlib_dir}/trees.c"
+      "${_recon_zlib_dir}/uncompr.c"
       "${_recon_zlib_dir}/zutil.c")
   target_include_directories(recon_zlib PUBLIC "${_recon_zlib_dir}")
   target_compile_definitions(recon_zlib PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -251,9 +260,10 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB/
   # 第三方源码不参与本项目的告警口径（它不是我们的代码），故降为 /w。
   target_link_libraries(recon_core PUBLIC recon_zlib)
   target_compile_definitions(recon_core PRIVATE RECON_HAVE_ZLIB=1)
-  message(STATUS "recon: 使用 vendor zlib 1.3.1（PNG 压缩）")
+  target_compile_definitions(recon_core PUBLIC RECON_TEST_HAVE_ZLIB=1)
+  message(STATUS "recon: 使用 vendor zlib 1.3.1（PNG/3MF 压缩）")
 else()
-  message(STATUS "recon: 无 zlib，PNG 走存储型 deflate（合法但体积大）")
+  message(STATUS "recon: 无 zlib，PNG 走存储型 deflate、3MF 走 STORE（合法但体积大）")
 endif()
 
 # Ceres Solver (BSD-3-Clause) —— BA 与 VIO 优化求解器
@@ -362,13 +372,21 @@ option(RECON_COMPILE_SHADERS
 
 if(RECON_COMPILE_SHADERS AND RECON_PLATFORM_IOS)
   # Metal 着色器：必须 macOS + Xcode（docs/12 §4.4）。
+  #
+  # ⚠️ 这里是 CMake 侧的 **staging 目录**（仅为给 add_custom_command 一个 OUTPUT
+  #    路径、让 ninja/make 有依赖可追踪），**不是**最终加载位置。
+  #    路径按 iOS 扁平 bundle 写：非本地化资源在**包根**，**没有** `Contents/`
+  #    一层（2026-11-01 实测修正；Apple《Bundle Structures》：iOS bundle 是
+  #    flat structure，非本地化资源位于 top-level bundle directory）。
+  #    真正决定运行期能否加载的是 Xcode 侧 `project.yml` 的落位
+  #    （`${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}`）。
   set(RECON_METALLIB_OUT_DIR
-      "${CMAKE_BINARY_DIR}/ios/Recon.app/Contents/Resources")
+      "${CMAKE_BINARY_DIR}/ios/Recon.app")
   set(RECON_METALLIB_AIR_DIR
       "${CMAKE_BINARY_DIR}/ios/metal-air")
   set(RECON_METALLIB_OUT "${RECON_METALLIB_OUT_DIR}/default.metallib")
   # ⚠️ 必须把产物目录**显式传给脚本**（RECON_METALLIB_OUT_DIR / _AIR_DIR）。
-  #    脚本的默认 OUT_DIR 是 `build/ios/Recon.app/Contents/Resources`（相对**仓库根**），
+  #    脚本的默认 OUT_DIR 是 `build/ios/Recon.app`（相对**仓库根**），
   #    而这里的 CMAKE_BINARY_DIR 在 CI 里是 `build/ios/device` —— 两者不一致时，
   #    本命令声明的 OUTPUT 永远不会被生成，`ninja`/`make` 会以
   #    "missing output" 或反复重跑收场（只有真在 macOS 上配置才会暴露）。

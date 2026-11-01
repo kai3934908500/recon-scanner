@@ -156,6 +156,42 @@ Java_com_recon_scan_NativeBridge_destroy(JNIEnv*, jobject, jlong context) {
   if (context != 0) recon_destroy(reinterpret_cast<void*>(context));
 }
 
+JNIEXPORT jint JNICALL
+Java_com_recon_scan_NativeBridge_setProbeData(
+    JNIEnv*, jobject,
+    jboolean has_camera, jboolean has_imu, jboolean has_lidar, jboolean has_tof,
+    jboolean has_algo_depth, jboolean supports_gpu,
+    jint max_w, jint max_h, jint max_fps, jint imu_max_rate_hz,
+    jlong total_memory_bytes, jlong available_memory_bytes) {
+  // 与 iOS 侧 `ReconProbeData.cValue` 逐字段对应（缺口 AC）。
+  // 这里**没有**数组往返：C ABI 收的是 `const recon_probe_data*`，JNI 侧
+  // 只需把 Kotlin 的基本类型填进一个栈上 POD 即可 —— 比能力探测的
+  // `IntArray` 更直接（后者是 core → 平台的 out 参数，必须在堆上分配）。
+  recon_probe_data d;
+  std::memset(&d, 0, sizeof(d));
+  // jboolean 在 JNI 里已保证是 0/1（JNI_FALSE=0 / JNI_TRUE=1），但显式写
+  // `? 1 : 0` 能在阅读时立刻看出「这是 int32_t 字段，不是 bool」。
+  d.has_camera = (has_camera == JNI_TRUE) ? 1 : 0;
+  d.has_imu = (has_imu == JNI_TRUE) ? 1 : 0;
+  d.has_lidar = (has_lidar == JNI_TRUE) ? 1 : 0;
+  d.has_tof = (has_tof == JNI_TRUE) ? 1 : 0;
+  d.has_algo_depth = (has_algo_depth == JNI_TRUE) ? 1 : 0;
+  d.supports_gpu = (supports_gpu == JNI_TRUE) ? 1 : 0;
+  // 负值是无效事实，钳到 0（与 c_api.cpp 的钳位规则一致；此处提前钳是为了
+  // 让「Kotlin 传了负数」这件事在端上有迹可循，而不是被 c_api 静默吃掉）。
+  d.max_image_width = (max_w > 0) ? max_w : 0;
+  d.max_image_height = (max_h > 0) ? max_h : 0;
+  d.max_fps = (max_fps > 0) ? max_fps : 0;
+  d.imu_max_rate_hz = (imu_max_rate_hz > 0) ? imu_max_rate_hz : 0;
+  // jlong 是**有符号** 64 位，而字段是 uint64_t。负值（不应出现，但 ABI 上
+  // 可达）直接归零 —— 一个负的内存量会让下游的「够不够」比较得出反直觉结果。
+  d.total_memory_bytes =
+      (total_memory_bytes > 0) ? static_cast<uint64_t>(total_memory_bytes) : 0u;
+  d.available_memory_bytes =
+      (available_memory_bytes > 0) ? static_cast<uint64_t>(available_memory_bytes) : 0u;
+  return static_cast<jint>(recon_set_probe_data(&d));
+}
+
 JNIEXPORT jintArray JNICALL
 Java_com_recon_scan_NativeBridge_probeCapability(JNIEnv* env, jobject, jlong context) {
   if (context == 0) return nullptr;

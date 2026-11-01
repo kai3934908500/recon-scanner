@@ -14,21 +14,39 @@ using ProbeProvider = PlatformProbe (*)();
 
 ProbeProvider g_probe_provider = nullptr;
 
+// 平台层通过 C ABI `recon_set_probe_data` 上报的事实（缺口 AC）。
+// `g_probe_data_set` 区分「上报过全零」与「从未上报」—— 后者必须走
+// kFallback 且**不伪造**能力，前者是平台层的真实陈述（全零也是事实）。
+PlatformProbe g_probe_data{};
+bool g_probe_data_set = false;
+
 }  // namespace
 
 void SetPlatformProbeProvider(PlatformProbe (*fn)()) {
   g_probe_provider = fn;
 }
 
+void SetPlatformProbeData(const PlatformProbe& p) {
+  g_probe_data = p;
+  g_probe_data_set = true;
+}
+
+bool PlatformProbeDataReported() { return g_probe_data_set; }
+
 const PlatformProbe& ProbePlatform() {
   static const PlatformProbe kFallback{};
-  if (g_probe_provider == nullptr) {
-    return kFallback;
+  // 优先级：进程内注册的回调 > C ABI 上报的数据 > 全零兜底。
+  // 回调优先是为了兼容测试与将来的嵌入式用法（它们能直接给函数）。
+  if (g_probe_provider != nullptr) {
+    // 探测结果按值返回后存入静态存储，避免返回临时对象的引用。
+    static thread_local PlatformProbe cached;
+    cached = g_probe_provider();
+    return cached;
   }
-  // 探测结果按值返回后存入静态存储，避免返回临时对象的引用。
-  static thread_local PlatformProbe cached;
-  cached = g_probe_provider();
-  return cached;
+  if (g_probe_data_set) {
+    return g_probe_data;
+  }
+  return kFallback;
 }
 
 Context::Context(const recon_config* config) {

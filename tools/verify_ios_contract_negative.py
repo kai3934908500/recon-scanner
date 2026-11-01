@@ -85,6 +85,14 @@ BRIDGING_HEADER = os.path.join(ROOT, "platform", "ios", "Recon",
 # 与桥接层 include 纪律真正的发生地）。
 METAL_BACKEND = os.path.join(ROOT, "platform", "ios", "Recon",
                              "MetalComputeBackend.mm")
+# G15 的三个目标对象：生成物（project.yml）、生成器源头（gen_ios_project.py）、
+# 以及许可清单嵌入位置（Licenses.cmake）。三者都要能各自拒收 —— 只改生成物
+# 会被下一次重生成覆盖回错误值（判据必须落在源头）。
+CONTAINER_YML = os.path.join(ROOT, "platform", "ios", "Container", "project.yml")
+GEN_IOS_PROJECT = os.path.join(ROOT, "tools", "gen_ios_project.py")
+LICENSES_CMAKE = os.path.join(ROOT, "cmake", "Licenses.cmake")
+# G16 的目标对象：未签名 IPA 打包链所在的 workflow，以及其判据实现本体。
+IOS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios.yml")
 
 
 def slurp(path: str) -> str:
@@ -282,13 +290,138 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           '#include "gpu_algo.h"\n',
           '#include "../../shaders/common/gpu_algo.h"\n')],
     ),
+    # --- G15：iOS bundle 落位纪律（2026-11-01 补的真实缺口）----------------
+    #     目标：iOS 是**扁平** bundle，非本地化资源在包根，无 `Contents/` 一层。
+    #     而 `MTLDevice.makeDefaultLibrary()` 只在包根找 default.metallib。
+    #     写成 `${CONTENTS_FOLDER_PATH}/Resources` 会落到 `Recon.app/Recon.app/Resources`
+    #     → 编得过、CI 全绿、运行期永久加载不到（GPU 路径静默降级）。
+    #     故**生成物**与**生成器源头**两处都要注入：只盯生成物会漏掉
+    #     「下次重生成又改回去」这条路径。
+    (
+        "G15-a-container-contents-layer",
+        "在生成的 project.yml 里把 metallib 落位改回 ${CONTENTS_FOLDER_PATH}/Resources"
+        "（iOS 上该层级不存在 → 运行期加载不到）",
+        "iOS 是扁平 bundle",
+        [(CONTAINER_YML,
+          'export RECON_METALLIB_OUT_DIR='
+          '"${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"',
+          'export RECON_METALLIB_OUT_DIR='
+          '"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"')],
+    ),
+    (
+        "G15-b-generator-contents-layer",
+        "在生成器 gen_ios_project.py 源头里恢复 ${CONTENTS_FOLDER_PATH} 落位"
+        "（判据必须落在源头，否则重生成即回退）",
+        "生成器里仍有",
+        [(GEN_IOS_PROJECT,
+          'export RECON_METALLIB_OUT_DIR='
+          '"${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"',
+          'export RECON_METALLIB_OUT_DIR='
+          '"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources"')],
+    ),
+    (
+        "G15-c-licenses-contents-layer",
+        "在 Licenses.cmake 里把 iOS 许可清单嵌入位置改回 Recon.app/Contents/Resources"
+        "（iOS 无该层级，设备上目录不存在）",
+        "iOS 无 `Contents/` 层",
+        [(LICENSES_CMAKE,
+          '  set(RECON_LICENSES_EMBED_DEST "Recon.app")\n',
+          '  set(RECON_LICENSES_EMBED_DEST "Recon.app/Contents/Resources")\n')],
+    ),
+    # --- G16：未签名 IPA 打包链纪律（2026-11-01 补）------------------------
+    #     目标：`.github/workflows/ios.yml` 的 build-app job。
+    #     四条各自独立，故必须**分四项注入**（当场把某一条写错才知它是否真被看管）。
+    #     ⚠️ 注入片段必须落在**代码行**上，不能落进注释 —— G16 会先剥行注释再判
+    #        （注释里刻意提到 `-exportArchive` 与模拟器 destination 作反例）。
+    (
+        "G16-a-archive-to-simulator",
+        "把 device 归档改成模拟器归档（模拟器 slice 混进交付包，XC-3）",
+        "归档目标是**模拟器**",        [(IOS_WORKFLOW,
+          "            -destination 'generic/platform=iOS' \\\n"
+          "            -archivePath build/ios/Recon.xcarchive \\",
+          "            -destination 'generic/platform=iOS Simulator' \\\n"
+          "            -archivePath build/ios/Recon.xcarchive \\")],
+    ),
+    (
+        "G16-b-bypass-staging-script",
+        "在 YAML 里就地写 zip 打包，绕过 tools/stage_ios_ipa.py"
+        "（判据变成两处事实来源，且落不到产物上）",
+        "打包逻辑应只在",
+        [(IOS_WORKFLOW,
+          "          python3 tools/stage_ios_ipa.py stage \\\n",
+          "          mkdir -p build/ios/Payload\n"
+          "          cp -R build/ios/Recon.app build/ios/Payload/\n"
+          "          (cd build/ios && zip -r Recon-unsigned.ipa Payload)\n"
+          "          python3 tools/stage_ios_ipa.py stage \\\n")],
+    ),
+    (
+        "G16-c-exportarchive-signed-path",
+        "在未签名 job 里混入 -exportArchive（强制签名，CI 无凭据必然失败）",
+        "出现 `-exportArchive`",
+        [(IOS_WORKFLOW,
+          "          xcodebuild archive \\\n",
+          "          xcodebuild -exportArchive -archivePath build/ios/Recon.xcarchive \\\n"
+          "          xcodebuild archive \\\n")],
+    ),
+    (
+        "G16-d-ipa-not-uploaded",
+        "删掉 IPA 的 artifact 上传（链路没出口 = 白跑）",
+        "没有出口",
+        [(IOS_WORKFLOW,
+          "          name: Recon-unsigned.ipa\n",
+          "          name: Recon-unsigned-renamed.ipa\n")],
+    ),
+    # --- G17：locale 资源落位纪律（2026-11-01 补的第三例「静默失效」）------
+    #     目标：`type: group` 把 locales 展平到包根 → subdirectory 查找全落空，
+    #     而编译/链接/启动全绿、UI 只是显示键名。
+    #     a/b 分打生成物与生成器源头；c 打**交叉对账**（改 Swift 的查找方式）。
+    (
+        "G17-a-container-group-not-folder",
+        "把生成物里的 locale 资源从 folder reference 改回默认 group"
+        "（资源被展平到 bundle 根，20 个 locale 全部加载不到）",
+        "未声明 `type: folder`",
+        [(CONTAINER_YML,
+          "      - path: ui/ios/Recon/Resources/locales\n"
+          "        type: folder\n",
+          "      - path: ui/ios/Recon/Resources/locales\n")],
+    ),
+    (
+        "G17-b-generator-group-not-folder",
+        "在生成器源头里去掉 type: folder（判据必须落在源头，否则重生成即回退）",
+        "生成器源头",
+        [(GEN_IOS_PROJECT,
+          "      - path: ui/ios/Recon/Resources/locales\n"
+          "        type: folder\n",
+          "      - path: ui/ios/Recon/Resources/locales\n")],
+    ),
+    (
+        "G17-c-subdir-crosscheck-mismatch",
+        "把 Swift 的 locale 查找目录从 locales 改成 Resources"
+        "（代码查找与包内落位不再指向同一目录）",
+        "二者不一致",
+        [(LOCALIZATION,
+          'subdirectory: "locales"',
+          'subdirectory: "Resources"')],
+    ),
+    (
+        "G17-d-platform-source-folder-breaks-privacy",
+        "把 platform/ios/Recon 声明为 type: folder（会让 PrivacyInfo.xcprivacy "
+        "落到 Recon.app/Recon/Resources/ 而非包根）",
+        "隐私清单落到",
+        [(CONTAINER_YML,
+          "      - path: platform/ios/Recon\n"
+          "        excludes:\n",
+          "      - path: platform/ios/Recon\n"
+          "        type: folder\n"
+          "        excludes:\n")],
+    ),
 ]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="check_ios_contract.py 的负向注入自检"
-                    "（G6 / G7 / G8 / G9 / G11 / G12 / G13 / G14）")
+                    "（G6 / G7 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17）")
     ap.add_argument("--keep-going", action="store_true",
                     help="全部跑完再汇总（默认也是全跑，此项保留语义）")
     args = ap.parse_args()
@@ -296,7 +429,8 @@ def main() -> int:
 
     for p in (GATE, SWIFT_CORE, STAGE_MAP, CONTROLLER, C_API_HEADER,
               LOCALIZATION, ZH_JSON, EN_JSON, CAPABILITY_VIEW,
-              FRAME_PIPELINE, FRAME_CONVERTER, BRIDGING_HEADER, METAL_BACKEND):
+              FRAME_PIPELINE, FRAME_CONVERTER, BRIDGING_HEADER, METAL_BACKEND,
+              CONTAINER_YML, GEN_IOS_PROJECT, LICENSES_CMAKE, IOS_WORKFLOW):
         if not os.path.isfile(p):
             print(f"[negative] 环境错误：找不到 {p}", file=sys.stderr)
             return 1
@@ -367,7 +501,7 @@ def main() -> int:
         return 3
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
-          f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 均有效）")
+          f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 均有效）")
     return 0
 
 

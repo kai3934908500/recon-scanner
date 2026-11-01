@@ -38,8 +38,18 @@ struct PlatformProbe {
 };
 
 // 全局平台探测提供者。platform 层在启动时注册。
+//
+// ⚠️ 仅限**进程内**调用方（单测、嵌入式）。平台层（iOS/Android）**不允许**
+//    include 本头（架构铁律：平台层只见 `recon_c_api.h`），故平台层用
+//    C ABI 的 `recon_set_probe_data`（缺口 AC），不走本函数。
 void SetPlatformProbeProvider(PlatformProbe (*fn)());
 const PlatformProbe& ProbePlatform();
+
+// C ABI `recon_set_probe_data` 的落点。平台层上报的事实存这里。
+// 与 SetPlatformProbeProvider 并存：回调优先，其次本数据，最后全零兜底。
+void SetPlatformProbeData(const PlatformProbe& p);
+// 是否已通过 C ABI 上报过（用于区分「上报全零」与「从未上报」）。
+bool PlatformProbeDataReported();
 
 // 核心上下文。跨语言边界背后的实现。
 class Context {

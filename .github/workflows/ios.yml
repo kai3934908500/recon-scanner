@@ -5,7 +5,7 @@
 #
 # 本工作流分四个 job：
 #   static-contract  —— **跑在 ubuntu 上**，零成本。它运行全部**不需要编译器**的
-#       契约闸门：iOS 静态契约（G1..G14）、双端功能对等、着色器两端一致性、
+#       契约闸门：iOS 静态契约（G1..G16）、双端功能对等、着色器两端一致性、
 #       C ABI 漂移、参数漂移、许可扫描、以及三份闸门的负向注入自检。
 #       这些检查与编译器无关，故不必耗 macOS 分钟数。
 #       （闸门 → 命令的映射集中在 tools/ci_run_gates.sh，可用 workflow_dispatch
@@ -15,8 +15,13 @@
 #       **真编译**为 SPIR-V。补的是"8 个 Vulkan 着色器从未过编译器"的盲区：
 #       shader_parity.py 只做两端源码层比对，查不出 GLSL 自身的语法错误。
 #       （Metal 侧相反，只能靠 `xcrun metal`，故在 macOS job 内。）
-#   build-app        —— 跑在 macos-15 上，编整机 App。手工触发时可关
-#       （`run_build_app=false`），push/PR 恒定执行。
+#   build-app        —— 跑在 macos-15 上，编整机 App。两轮编译：① simulator
+#       （验证 Swift/ObjC++ 可编译 + zlib 链入判据）；② device **归档** →
+#       手工打**未签名 IPA**（`Payload/` + zip，不用 `-exportArchive`：它强制
+#       签名，而 CI 无 Apple 凭据）→ 产物结构判据 P-1..P-9 → 上传 artifact。
+#       ⚠️ 这条链的**判据实现本体**是 `tools/stage_ios_ipa.py`；它的
+#          `--self-test` 在 static-contract job 里独立跑（不需要 macOS）。
+#       手工触发时可关（`run_build_app=false`），push/PR 恒定执行。
 #
 # 触发器：仅在 iOS / 着色器 / 契约相关路径变化时运行
 # （避免每次改 core/ 的无关文件都烧 macOS 分钟数）。
@@ -60,6 +65,7 @@ on:
       - "tools/gen_ios_project.py"
       - "tools/build_metal_shaders.sh"
       - "tools/build_vulkan_shaders.sh"
+      - "tools/stage_ios_ipa.py"
       - "tools/ci_run_gates.sh"
       - ".github/workflows/ios.yml"
   # ⚠️ pull_request 的白名单必须与 push **逐条一致**（含 tools/*.py 那一串）。
@@ -86,6 +92,7 @@ on:
       - "tools/gen_ios_project.py"
       - "tools/build_metal_shaders.sh"
       - "tools/build_vulkan_shaders.sh"
+      - "tools/stage_ios_ipa.py"
       - "tools/ci_run_gates.sh"
       - ".github/workflows/ios.yml"
   workflow_dispatch:
@@ -439,10 +446,16 @@ jobs:
           echo "OK: 两个切片的 minos 均为 15.0（与 docs/12 §4.6 一致）"
 
       # --- 产物层验证 default.metallib（此前从未真正编过）------------------
+      # ⚠️ 路径按 iOS **扁平** bundle 写：非本地化资源在包根，无 `Contents/`
+      #    一层（2026-11-01 修正；见 tools/build_metal_shaders.sh 文件头论证）。
+      #    这里校验的是 CMake staging 产物（RECON_METALLIB_OUT_DIR
+      #    = ${CMAKE_BINARY_DIR}/ios/Recon.app，CMAKE_BINARY_DIR=build/ios/device）。
+      #    真正决定运行期能否加载的是 build-app 里对 **App 包** 的断言 ——
+      #    两处不同层，缺任一层都会漏掉"编译通过但加载不到"这一类失败。
       - name: 校验 default.metallib
         run: |
           set -euo pipefail
-          MB=build/ios/device/ios/Recon.app/Contents/Resources/default.metallib
+          MB=build/ios/device/ios/Recon.app/default.metallib
           if [ ! -s "$MB" ]; then
             echo "::error::未生成 default.metallib（RECON_COMPILE_SHADERS=ON 已开）"
             find build/ios -name "*.metallib" -o -name "*.air" || true
@@ -450,6 +463,14 @@ jobs:
           fi
           echo "== metallib 大小 =="
           wc -c < "$MB"
+
+          # 反面判据：产物**不得**落在 `Contents/Resources/`（iOS 无此层，
+          # 落在这里 = 运行期 makeDefaultLibrary() 找不到 → GPU 路径永久降级）。
+          if [ -e "build/ios/device/ios/Recon.app/Contents" ]; then
+            echo "::error::metallib staging 目录出现了 Contents/ —— iOS bundle 是扁平结构，此层不存在"
+            find build/ios/device/ios/Recon.app -maxdepth 3 | sort
+            exit 1
+          fi
 
           # 算法函数覆盖判定收敛到 tools/check_metallib_symbols.py（**单一实现**）：
           # 该脚本的步骤 3b 调同一个工具，避免两处实现漂移。
@@ -473,7 +494,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: default.metallib
-          path: build/ios/device/ios/Recon.app/Contents/Resources/default.metallib
+          path: build/ios/device/ios/Recon.app/default.metallib
           if-no-files-found: error
           retention-days: 14
 
@@ -616,7 +637,7 @@ jobs:
   #   注意它**不改变 build-xcframework** —— 静态库与 xcframework 永远照常编，
   #   所以"关掉它 = 少验证一层"这件事在日志里是显式的（该 job 显示 skipped）。
   build-app:
-    name: 编译 Recon.app（不签名，验证 Swift/ObjC++ 可编译）
+    name: 编 Recon.app（simulator 校验 + device 归档）+ 打未签名 IPA
     runs-on: macos-15
     needs: build-xcframework
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_build_app }}
@@ -664,10 +685,31 @@ jobs:
           done
           echo "OK: xcframework 落位正确"
 
+      # ── metallib 产物：**只做完整性校验，不是本 job 的构建输入**（如实说明）──
+      #   App 包里的 `default.metallib` 由 target 的「Compile Metal Shaders」
+      #   preBuildScript 现场重编（见 project.yml），**不读**这份下载件。
+      #   故本步骤的价值只有一条：证明 build-xcframework 上传的 artifact
+      #   能完整下载且有内容 —— 若它缺失/为空，说明上游产物链已坏，
+      #   在这里早失败比在 build-app 末尾才发现要省一整轮。
+      #   ⚠️ 路径按 iOS **扁平** bundle 写（非本地化资源在包根，无 `Contents/`
+      #      一层；2026-11-01 修正）。此前写成 `.../Recon.app/Contents/Resources/`
+      #      是个**死目录**：全仓无任何工程配置引用它，下载成功与否都不影响构建，
+      #      属"看起来在做事的空步骤"。
       - uses: actions/download-artifact@v4
         with:
           name: default.metallib
-          path: platform/ios/build/Recon.app/Contents/Resources/
+          path: platform/ios/build/Recon.app/
+
+      - name: 校验下载到的 default.metallib（证明上游 artifact 链完好）
+        run: |
+          set -euo pipefail
+          MB=platform/ios/build/Recon.app/default.metallib
+          if [ ! -s "$MB" ]; then
+            echo "::error::artifact default.metallib 下载后为空或不存在：${MB}"
+            find platform/ios/build -maxdepth 3 | sort || true
+            exit 1
+          fi
+          echo "OK: 下载到的 default.metallib $(wc -c < "$MB") bytes"
 
       - name: 生成工程描述
         run: python tools/gen_ios_project.py
@@ -778,3 +820,104 @@ jobs:
             fi
           done
           echo "OK: zlib 已链入且 PNG 压缩未降级"
+
+      # =====================================================================
+      # 归档（device）→ 未签名 IPA
+      # =====================================================================
+      # ── 为什么还要再编一次（第二轮编译，约 +3–5 分钟，如实登记成本）──────
+      #   上面那一步编的是 **simulator** slice，它有两个不可替代的作用：
+      #   ① 证明 Swift/ObjC++ 在模拟器 SDK 下可编译；② 承载 zlib 链入判据
+      #   （已跑通若干轮，不删）。
+      #   但 simulator 产物**不是交付物**。用户要的是能在 iPhone 上装的包，
+      #   而 device 归档的产物形态与它有两个本质差异：
+      #     · 架构是 arm64（绕开 XC-3「模拟器 slice 不得进提审包」）；
+      #     · 会走 Installation 阶段，产出的 `.app` 才是打进 IPA 的那一个
+      #       （preBuildScript 写的 metallib 是否**留在**该产物里，只有读包
+      #        才知道 —— 这正是 P-4 的存在理由，见下）。
+      #
+      # ── 为什么不用 `xcodebuild -exportArchive` ──────────────────────────
+      #   `-exportArchive` 是 Apple 唯一官方 archive→IPA 途径，但它**强制**要
+      #   `-exportOptionsPlist` 且**强制走签名** —— 没有 Apple 证书时必然失败。
+      #   本项目 CI 上**没有也不应该有** Apple 凭据（零网络策略；CI 只做未签名
+      #   构建），故走**手工打包**：Payload/ + zip。docs/12 §4.8 给了带签名的
+      #   正式流程（含 `ExportOptions.plist` 与 `altool` 上传），二者并存：
+      #   带签名流程在**有凭据的机器**上跑，本 job 的未签名 IPA 供**免费账号
+      #   自签**（AltStore / Sideloadly）与结构回归用。
+      #   ⚠️ 判据 G16-c 禁止出现 `-exportArchive`，就是钉住这条分工。
+      #
+      # ── 为什么打包与校验都收敛到 tools/stage_ios_ipa.py ─────────────────
+      #   ① 判据必须落在**产物**上：YAML 里若只写 `zip` 三行，就没有任何机器
+      #      读回 IPA 验证结构 —— 而本项目已两次踩到「编译过、CI 全绿、产物
+      #      也在包里，但运行期永远加载不到」（metallib 落位 = G15；locale 被
+      #      展平 = P-8）。这两类**都没有编译期信号**。
+      #   ② 开发机是 Windows，没有 `zip`/`lipo`；而铁律要求每条判据都能**负向
+      #      注入证伪**，证伪必须在本机跑得起来 → 用标准库 zipfile 实现。
+      #   该脚本的 `--self-test` 在 static-contract job 里独立跑（见
+      #   tools/ci_run_gates.sh 的 `ipa` 能力点），不需要 macOS。
+      - name: 归档 device 产物（不签名）
+        run: |
+          set -euo pipefail
+          # ⚠️ 三个签名开关缺一不可；`-destination 'generic/platform=iOS'`
+          #    是 device 归档的写法（写 iphonesimulator 会得到模拟器产物，
+          #    绕开 XC-3 且 P-3 会拒收 —— 那是**正确**的拒收，不是误报）。
+          # ⚠️ 刻意**不加** `-allowProvisioningUpdates`：它会让 xcodebuild 尝试
+          #    联系 Apple 服务，而本 job 的契约是「未签名 + 零网络」。
+          xcodebuild archive \
+            -project Recon.xcodeproj \
+            -scheme Recon \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/ios/Recon.xcarchive \
+            -derivedDataPath build/ios/archive-dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          APP=build/ios/Recon.xcarchive/Products/Applications/Recon.app
+          if [ ! -d "$APP" ]; then
+            echo "::error::归档产物不在预期位置：$APP"
+            find build/ios/Recon.xcarchive -maxdepth 4 -name "*.app" | sort || true
+            exit 1
+          fi
+          echo "== 归档 .app 顶层（供人工核对；机器判据在下一步）=="
+          ls -la "$APP" | head -40
+
+      # ── 判据全部在 tools/stage_ios_ipa.py 里（**单一实现**，勿在 YAML 重写）──
+      #   该脚本同时承担「打包」与「校验」两件事，并用 P-1..P-9 覆盖：
+      #     P-1 容器结构（恰好 Payload/<name>.app，无 __MACOSX）
+      #     P-2 Info.plist 可解析且 CFBundleExecutable/Identifier 非空
+      #     P-3 架构**恰好 arm64**（XC-3；含自研 Mach-O 解析 + lipo 交叉验证）
+      #     P-4 default.metallib 存在且非空（**G15 修法在产物上的验证**）
+      #     P-5 无 `Contents/` 层（iOS 扁平 bundle）
+      #     P-6 Bundle ID 与 project.yml 对账（两份真源）
+      #     P-7 无 `_CodeSignature/`（这是「未签名」的正向定义）
+      #     P-8 locale 落位与 `Localization.swift` 的 `subdirectory:` 一致
+      #     P-9 PrivacyInfo.xcprivacy 在包根（docs/11 §1.5）
+      #
+      #   ⚠️ **若 P-4 在本 job 失败，那是一个真实缺口而非误报**，根因是
+      #      preBuildScript（「Compile Metal Shaders」）早于 Copy Bundle
+      #      Resources 执行，其产物在 archive 的 Installation 阶段可能被
+      #      重建的 `.app` 覆盖掉。修法是给该 phase 声明 outputFiles（让 Xcode
+      #      追踪依赖并保留产物）或改用 postBuildScript。**不要**改为「在 YAML
+      #      里补 cp 一条」—— 那会把 metallib 的落位事实来源变成两处。
+      - name: 打未签名 IPA 并校验产物结构（P-1..P-9）
+        run: |
+          set -euo pipefail
+          python3 tools/stage_ios_ipa.py stage \
+            --app build/ios/Recon.xcarchive/Products/Applications/Recon.app \
+            --out build/ios/Recon-unsigned.ipa
+          ls -l build/ios/Recon-unsigned.ipa
+          echo "SHA256=$(sha256sum build/ios/Recon-unsigned.ipa | cut -d' ' -f1)"
+
+      # 产物落 GitHub Actions artifact：公开仓库下载只需 GitHub 账号，便于
+      # 用免费 Personal Team 账号自行签名后在真机安装（7 天有效签名）。
+      # ⚠️ 这里**不创建 GitHub Release**：Release 是发布动作，须由 tag 触发并
+      #    人工决定（docs/12 §7.3 release-bundle），CI 每次 push 都发一个
+      #    Release 会把「构建通过」误当成「可发布」。
+      - name: 上传未签名 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Recon-unsigned.ipa
+          path: build/ios/Recon-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

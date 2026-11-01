@@ -137,6 +137,10 @@ public struct ExportView: View {
                     SpecText("\(L10n.t(.exportTangents)) \(L10n.t(.commonOn))",
                              spec: ReconFont.subhead, color: ReconColor.txtPrimary)
                 }
+                // 写出单位说明。**STL 无单位字段**是本格式最大的坑，必须
+                // 在 UI 上讲清楚，否则用户会按米读出一个 1/1000 的模型。
+                SpecText(format.unitNote, spec: ReconFont.footnote,
+                         color: ReconColor.txtSecondary, maxLines: 3)
             }
         }
     }
@@ -254,34 +258,75 @@ public struct ExportView: View {
 // MARK: - §3.10 导出格式
 // ===========================================================================
 
+/// 导出格式。**顺序与取值对应 `recon_export_format`**（docs/01 §2.2.7）。
+///
+/// 新增格式只能**追加**，不得插入或重排 —— 序号由
+/// `ReconSessionController.exportModel` 显式映射到 C ABI，重排会静默改掉
+/// 已发布的契约（与 `ExportFormat` 的 C++ 侧同一条铁律）。
 public enum ExportFormat: String, CaseIterable {
     case glb       // GLB
     case objMtl    // OBJ+MTL
     case ply       // PLY
+    case stl       // STL（打印）
+    case threeMf   // 3MF（打印，带单位声明）
 
     public var label: String {
         switch self {
-        case .glb:    return "GLB"
-        case .objMtl: return "OBJ+MTL"
-        case .ply:    return "PLY"
+        case .glb:     return "GLB"
+        case .objMtl:  return "OBJ+MTL"
+        case .ply:     return "PLY"
+        case .stl:     return "STL"
+        case .threeMf: return "3MF"
         }
     }
 
     /// `export_texture_format` 的呈现（线框图：`贴图 PNG`）。
+    ///
+    /// STL / 3MF **不携带纹理**：前者格式本身无 UV 与材质概念，
+    /// 后者的材质需要独立扩展部件（本导出未生成，见 docs/06 §3.2）。
+    /// 故这两项返回「无」而不是假称 PNG —— 显示 PNG 会是**伪造**。
     public var textureFormatLabel: String {
         switch self {
-        case .glb:    return "PNG"
-        case .objMtl: return "PNG"
-        case .ply:    return "PNG"
+        case .glb:     return "PNG"
+        case .objMtl:  return "PNG"
+        case .ply:     return "PNG"
+        case .stl:     return L10n.t(.commonOff)
+        case .threeMf: return L10n.t(.commonOff)
         }
     }
 
     /// 文件扩展名（供默认保存路径用）。
     public var fileExtension: String {
         switch self {
-        case .glb:    return "glb"
-        case .objMtl: return "obj"
-        case .ply:    return "ply"
+        case .glb:     return "glb"
+        case .objMtl:  return "obj"
+        case .ply:     return "ply"
+        case .stl:     return "stl"
+        case .threeMf: return "3mf"
+        }
+    }
+
+    /// 该格式是否携带 UV / 纹理。
+    ///
+    /// 用于 UI 决定是否显示「法线 / UV / 切线」三行 —— STL 与 3MF 均不写
+    /// 这三者中的 UV 与切线，显示出来是**假的**。
+    public var carriesTexture: Bool {
+        switch self {
+        case .glb, .objMtl, .ply: return true
+        case .stl, .threeMf:      return false
+        }
+    }
+
+    /// 该格式的写出单位说明（U-E 的诚实披露）。STL 无单位字段是本格式
+    /// 最大的坑，必须在 UI 上讲清楚。
+    ///
+    /// 三档文案均来自 locale（`L10nKey.exportUnitNote*`），不硬编码：
+    /// G9 禁止源码中出现不可反查的 UI 文案。
+    public var unitNote: String {
+        switch self {
+        case .stl:     return L10n.t(.exportUnitNoteStl)
+        case .threeMf: return L10n.t(.exportUnitNote3mf)
+        default:       return L10n.t(.exportUnitNoteMeter)
         }
     }
 }

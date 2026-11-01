@@ -81,6 +81,29 @@ class CaptureActivity : ComponentActivity() {
     private fun probeCapability() {
         lifecycleScope.launch {
             val cap = withContext(Dispatchers.IO) {
+                // ── 平台能力事实上报（缺口 AC），**必须在 probeCapability 之前** ──
+                //
+                // core 的 `Context::ProbeCapability()` 有一次性缓存
+                // （`capability_probed_`，`core/src/util/context.cpp:108`）：
+                // 第一次调用时读到的平台事实会被固化，之后再上报就改不动了。
+                //
+                // 修复前平台层从未上报（C ABI 上没有入口，
+                // `SetPlatformProbeProvider` 又只对 core 内部可见）→ 内核恒读
+                // 全零 → `has_camera=0` → 下方 `cap == null` 分支被走中 →
+                // 误判 T-03「相机不可用」。这一行就是那条断链的重新接通点。
+                //
+                // 探测**只读**：不申请权限、不打开相机（docs/11 §1.3）。
+                // 上报失败**不吞错**：写入日志，但仍继续探测（让 T-02/T-03
+                // 的依据是真实探测结果，而不是掩盖成「一切都好」）。
+                val probeStatus = DeviceProbe.report(applicationContext)
+                if (probeStatus != ReconStatus.OK) {
+                    android.util.Log.w(
+                        "ReconCapture",
+                        "recon_set_probe_data 失败 status=$probeStatus" +
+                            "；能力探测将读到全零事实（缺口 AC 回退）"
+                    )
+                }
+
                 if (captureContext == 0L) {
                     captureContext = NativeBridge.create(
                         sessionDir = filesDir.resolve("sessions/current").absolutePath,

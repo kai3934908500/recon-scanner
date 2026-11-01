@@ -95,11 +95,17 @@ typedef enum recon_depth_source {
     RECON_DEPTH_SRC_LIDAR  = 3
 } recon_depth_source;
 
-/** 导出格式。见 docs/06_网格化与后处理.md §3。 */
+/** 导出格式。见 docs/06_网格化与后处理.md §3。
+ *
+ * **不得重排既有取值**：这些整数是已发布的 ABI 契约，三端（核心 / iOS /
+ * Android）靠它对号。新增格式只能**追加**到末尾。
+ */
 typedef enum recon_export_format {
     RECON_EXPORT_GLB      = 0,
     RECON_EXPORT_OBJ_MTL  = 1,
-    RECON_EXPORT_PLY      = 2
+    RECON_EXPORT_PLY      = 2,
+    RECON_EXPORT_STL      = 3,  /**< 二进制 STL。**无单位字段**，业界约定毫米 */
+    RECON_EXPORT_3MF      = 4   /**< 3MF。OPC/ZIP 容器，`unit="millimeter"` */
 } recon_export_format;
 
 /** 重建阶段。进度回调按此上报。 */
@@ -347,6 +353,39 @@ typedef struct recon_capability {
     uint64_t total_memory_bytes;
 } recon_capability;
 
+/**
+ * 平台能力**事实**上报载荷（缺口 AC）。
+ *
+ * 与 `recon_capability` 的分工（**不要混用**）：
+ *   · `recon_probe_data` = 平台层**上报的事实**（「这台设备有什么」），
+ *     由平台层填、方向是 平台 → core；
+ *   · `recon_capability` = core **判定后的结果**（「所以该走哪条分支、
+ *     深度层级是什么」），由 core 填、方向是 core → 平台。
+ * 后者比前者多出**派生字段**：`branch` / `depth_tier` / `depth_source`。
+ *
+ * 字段与 `recon::PlatformProbe`（core 内部）一一对应 —— 两处必须同步改，
+ * `check_platform_parity.py` 的字段对等判据会守护这一点。
+ *
+ * ⚠️ 全部使用 `int32_t` 而非 `bool`：POD 跨语言边界上 `bool` 的宽度不保证
+ *    （C++ `bool` 为 1 字节，而 Swift `Bool` / Kotlin `Boolean` 经 JNI 传递时
+ *    按 1 字节读，某些 ABI 下按字节对齐会产生填充歧义）。本工程既有
+ *    `recon_capability` 已全用 `int32_t`，此处沿用同一约定。
+ */
+typedef struct recon_probe_data {
+    int32_t  has_camera;
+    int32_t  has_imu;
+    int32_t  has_lidar;
+    int32_t  has_tof;
+    int32_t  has_algo_depth;           /**< 算法/运动推断深度（如 ARCore） */
+    int32_t  supports_gpu;
+    int32_t  max_image_width;
+    int32_t  max_image_height;
+    int32_t  max_fps;
+    int32_t  imu_max_rate_hz;
+    uint64_t total_memory_bytes;
+    uint64_t available_memory_bytes;
+} recon_probe_data;
+
 /* ------------------------------------------------------------------------- */
 /* 生命周期                                                                  */
 /* ------------------------------------------------------------------------- */
@@ -370,6 +409,46 @@ RECON_API void recon_free_buffer(void* buffer, size_t size);
 /* ------------------------------------------------------------------------- */
 /* 能力探测与参数                                                            */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * 上报平台能力**事实**（缺口 AC）。
+ *
+ * ── 为什么需要这个函数（实测根因）────────────────────────────────────────
+ *
+ * 平台侧原先只能经 `recon::SetPlatformProbeProvider` 注册，而该声明在
+ * **内部头 `recon/context.h`**，而平台层的架构铁律是「只允许 include
+ * `recon_c_api.h`」（`platform/android/.../native-lib.cpp:6` 明文，G7-b 亦守）。
+ * 两条约束叠加的结果是：**双端都注册不了** → 提供者恒为空 → `ProbePlatform()`
+ * 恒返回 `kFallback{}`（全零）→ `has_camera=0` + `depth_tier=NONE` +
+ * `branch=MONO` → 真机一进扫描就被 `handleCapabilityProbe` 判成 T-03
+ * 「相机不可用」→ `Failed`。**装得上、起得来、点不动。**
+ *
+ * ── 为什么是「数据上报」而不是「函数指针注册」────────────────────────────
+ *
+ * 候选方案是在 C ABI 上暴露 `recon_set_probe_provider(fn)`（函数指针）。
+ * **否决**，三条理由：
+ *   ① 跨语言函数指针是 C ABI 上最容易出错的一类边界（调用约定、生命周期、
+ *      Swift `@convention(c)` 与 ObjC block、Kotlin JNI 桥各写一遍），
+ *      而本工程铁律要求「平台无关逻辑一份实现」—— 函数指针会把这套逻辑
+ *      变成**两端各写一份桥**；
+ *   ② `Context::ProbeCapability()` 有**一次性缓存**（`capability_probed_`），
+ *      探测语义就是「启动时取一次事实」，**不需要**可反复调用的回调；
+ *   ③ POD 数据过边界是本工程已建立的成熟模式（`recon_capability` /
+ *      `recon_scan_stats` / `recon_mesh_info` 全是 POD），复用同一模式
+ *      意味着三端字段对等判据（G10/闸门 7）能**直接覆盖**新入口，不需新机制。
+ *
+ * ── 语义与约束 ──────────────────────────────────────────────────────────
+ *
+ * · **全局**（不绑定 context）：能力是设备事实，与某个上下文实例无关；
+ *   平台层在 App 启动时调一次即可。绑定 context 会让「未 create 就无法
+ *   上报」这种无意义的顺序依赖出现。
+ * · **幂等**：可重复调用，后一次覆盖前一次（便于「重新探测」更新事实）。
+ * · **未上报时**：核心保持既有行为（`kFallback{}` 全零），**不伪造**能力。
+ *   平台层因此**必须**在 `recon_create` 之前或之后尽早调用本函数。
+ * · `in` 为 NULL 时返回 `RECON_ERR_INVALID_ARGUMENT`，**不清空**已上报数据
+ *   （避免一次误调用把可用状态打回全零）。
+ */
+RECON_API recon_status recon_set_probe_data(const recon_probe_data* in);
 
 /**
  * 探测设备能力，决定管线分支。

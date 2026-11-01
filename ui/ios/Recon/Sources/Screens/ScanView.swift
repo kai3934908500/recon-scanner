@@ -38,11 +38,47 @@ public struct ScanView: View {
     /// §5.6 确认框的显隐。
     @State private var showEndConfirm = false
     /// U-04 的引导提示（`请移到物体右前方 · 距离较远`）。
+    ///
+    /// ⚠️ **当前恒为 `nil`（零写入点）** —— 这不是遗漏，而是**数据源尚不存在**。
+    /// 该文案的来源是 docs/03 §4.2.1（方向文字表）× §4.2.2（偏差档位）的拼接，
+    /// 而档位判据需要「物体包围盒中心 `C`（世界系）」算出的方位角/俯仰角/距离
+    /// （03 §4.3.1）。`C` 在**采集期尚未可知** —— 它要靠重建（或用点云估计）
+    /// 才能确定。故此处不填任何近似值：§3.4 的引导文字若拿不到真实角度就显示，
+    /// 就是**伪造引导**（会真实误导用户移动方向）。
+    /// 补齐路径：由内核提供「容器中心估计」（当前 C ABI 无此出口）。
     @State private var guidanceText: String?
-    /// AR 位置跟踪不可用时的提示（§3.3 预览状态）。
-    @State private var arTrackingUnavailable = false
     /// 当前采集期异常文案（§5.2）；`nil` 表示无异常。
+    ///
+    /// ⚠️ **当前恒为 `nil`（零写入点）** —— 同上，**数据源尚不存在**。
+    /// §5.2 的 M1..M17 不是「有什么显示什么」，而是由 docs/02 §4.8 的
+    /// **优先级引擎**裁决：D1 > D2 > … > D6 取当前最高优先级项（T-4）、
+    /// 全局最小间隔 1200 ms、同 `(检测项, 级别)` 60 s 内不重复（S-3 / S-4）。
+    /// 该引擎在 `core/` 中**零实现**（`grep "priority" core/src/` 无命中），
+    /// C ABI 亦无上报通道。故此处**不自造一个「按帧随机挑一条」的伪引擎**
+    /// —— 那会绕开 1200 ms 间隔与 60 s 去重，产生规格明确禁止的提示轰炸。
+    /// 补齐路径：优先级引擎（属 §5.2 的判据实现）。
     @State private var noticeText: String?
+
+    /// 当前是否处于 `Previewing`（预览不采帧，等用户点「开始」）。
+    ///
+    /// ── 为什么按状态机状态分流，而不是另设一个布尔量 ──────────────────────
+    ///
+    /// 「现在该显示「开始」还是「暂停/完成扫描」」是**状态机状态的函数**，
+    /// 不是独立事实。若在这里自己维护一个 `isPreviewing` 布尔量，它就必须
+    /// 与 `session.state` 保持同步 —— 而同步点散布在启动、暂停、结束、失败
+    /// 各条路径上，漏一处就会出现「状态已是 Capturing 但界面还在等开始」
+    /// 或反之（与 T-14 类问题同构）。故这里**只读状态机**，不新增状态。
+    ///
+    /// §4.1 状态图：`Previewing`（预览不采帧；模式选择、放置物体）
+    ///           → 用户点「开始」→ `Capturing`（采帧 / 门限 / 关键帧写入）。
+    ///
+    /// ⚠️ 两个渲染点（`coverageHeader` / `controls`）都必须走**同一个**三分支
+    /// 结构（`previewing` / `capturing` / 其余）。用 `if isPreviewing { } else { }`
+    /// 会把「权限申请中」「失败」等状态**误并入 `capturing` 分支** ——
+    /// 那会在用户一帧都没采时显示「完成扫描」与「覆盖方位 0%」。
+    private var isPreviewing: Bool { session.state == .previewing }
+    /// 是否已开始采集（`Capturing`，含 `paused` 变体 —— T-14 只置标志不改状态）。
+    private var isCapturing: Bool { session.state == .capturing }
 
     /// U-04 定点引导的当前点位（16 个引导方位中的第几个）。
     ///
@@ -70,6 +106,26 @@ public struct ScanView: View {
                 InlineNotice(noticeText, level: .warning)
                     .padding(.horizontal, ReconMetric.space4)
                     .padding(.bottom, ReconMetric.space2)
+            }
+            if controller.cameraPermissionDenied {
+                // §5.7 P-01 + P-02：相机被拒是**可恢复**的（用户去设置里打开即可），
+                // 故必须给出原因与唯一出口，而不是让界面静默停住。
+                //
+                // 为什么提示条 + 按钮都在本页而非弹窗：P-01 的展示位置规格为
+                // 「居中提示区」，且权限状态会在用户从设置页返回后被重查
+                // （`ReconSessionController.cameraPermissionDenied` 的两个写入
+                // 时机之一），本页常驻才能立刻反映变化。
+                VStack(spacing: ReconMetric.space2) {
+                    InlineNotice(L10n.t(.permCameraDenied), level: .error)
+                    SecondaryButton(L10n.t(.permGoSettings)) {
+                        // 经控制器持有的**同一个**权限协调器打开设置
+                        // （`PermissionCoordinator()` 每次新建实例会与
+                        //  「权限这条链只有一个发起者」的前提相抵触）。
+                        controller.openAppSettings()
+                    }
+                }
+                .padding(.horizontal, ReconMetric.space4)
+                .padding(.bottom, ReconMetric.space2)
             }
             controls
         }
@@ -132,21 +188,31 @@ public struct ScanView: View {
 
     private var coverageHeader: some View {
         HStack {
-            switch mode {
-            case .freeOrbit:
-                SpecText(L10n.fill(.fmtCoveragePercent,
-                                   String(Int((min(max(session.coverageFraction, 0), 1) * 100).rounded()))),
-                         spec: ReconFont.footnote, color: ReconColor.txtPrimary, mono: true)
-            case .guided:
-                if let guidanceText {
-                    SpecText(guidanceText, spec: ReconFont.footnote,
-                             color: ReconColor.txtPrimary, maxLines: 2)
+            if isPreviewing {
+                // §5.3 G-01：进入 `Previewing` 时提示放置物体（预览上方）。
+                // 此时尚无覆盖数据，若仍走下面的分支会显示「覆盖方位 0%」
+                // —— 那是**采集阶段**的读数，在预览阶段是没有意义的数字。
+                SpecText(L10n.t(.scanCenterObject), spec: ReconFont.footnote,
+                         color: ReconColor.txtPrimary, maxLines: 2)
+            } else if isCapturing {
+                switch mode {
+                case .freeOrbit:
+                    SpecText(L10n.fill(.fmtCoveragePercent,
+                                       String(Int((min(max(session.coverageFraction, 0), 1) * 100).rounded()))),
+                             spec: ReconFont.footnote, color: ReconColor.txtPrimary, mono: true)
+                case .guided:
+                    if let guidanceText {
+                        SpecText(guidanceText, spec: ReconFont.footnote,
+                                 color: ReconColor.txtPrimary, maxLines: 2)
+                    }
+                    Spacer()
+                    SpecText(L10n.fill(.fmtPointIndex,
+                                       String(Self.guidedPointIndex)), spec: ReconFont.footnote,
+                             color: ReconColor.txtPrimary, mono: true)
                 }
-                Spacer()
-                SpecText(L10n.fill(.fmtPointIndex,
-                                   String(Self.guidedPointIndex)), spec: ReconFont.footnote,
-                         color: ReconColor.txtPrimary, mono: true)
             }
+            // 其余状态（`CapabilityProbe` / `RequestingPermission` / 终态）不显示
+            // 覆盖方位或引导文字 —— 两者都是采集期读数，此时均无真实值可显示。
             Spacer(minLength: 0)
         }
         .padding(.horizontal, ReconMetric.space4)
@@ -162,8 +228,15 @@ public struct ScanView: View {
             Color.black
                 .aspectRatio(4.0 / 3.0, contentMode: .fit)
 
-            if arTrackingUnavailable {
+            if controller.arTrackingUnavailable {
                 // §3.3：AR 不可用时上方叠加一行提示。
+                //
+                // 读控制器而非本视图 `@State`：该事实有**两个来源**
+                // （探测期的 `ARCapability.worldTrackingSupported` 与运行期的
+                // `ARCamera.TrackingState.notAvailable`），后者由 ARKit 串行
+                // 队列上的回调提供 —— 视图的 `@State` 与那条队列之间没有通路，
+                // 故留在视图侧就永远只有探测期那一个来源（且此前连那一个都
+                // 没接，是彻底的死状态）。详见控制器内该属性的注释。
                 VStack {
                     InlineNotice(L10n.t(.scanArUnavailable), level: .warning)
                         .padding(ReconMetric.space4)
@@ -184,6 +257,39 @@ public struct ScanView: View {
     // --- 底部控制（§3.3：暂停（描边，左）/ 完成扫描（实心，右））----------
 
     private var controls: some View {
+        Group {
+            if isPreviewing {
+                // §4.1 / §4.2 T-09：`Previewing` 态的主操作是「开始」——
+                // 它是**进入 `Capturing` 的唯一事件**（docs/01 A-05 同）。
+                // 此态下不显示「暂停 / 完成扫描」：还没开始采帧，暂停无对象，
+                // 完成也无帧可提交（`canFinishScan` 恒 false，显示即恒灰）。
+                PrimaryButton(L10n.t(.scanStart)) {
+                    // ⚠️ 必须经编排器 `beginCapturing()`：它内部完成
+                    //    `session.send(.userStart)` → 恢复帧投递 →
+                    //    `recon_start_session` → 启动统计轮询。
+                    //    只改本地状态会让相机继续停着（零帧入内核）。
+                    controller.beginCapturing()
+                }
+            } else if isCapturing {
+                // `Capturing` 含 `paused` 变体（T-14 只置 paused 标志，状态不变）。
+                capturingControls
+            }
+            // 其余状态（`CapabilityProbe` / `RequestingPermission` / 终态）：
+            // **刻意留空**，而不是回退到 `capturingControls` ——
+            // 权限申请期间若显示「完成扫描」，用户会在**一帧都没采**时看到一个
+            // 可点的按钮，点了就把空会话推进 U-06。同理「暂停」也无对象可暂停。
+            // 规格 §3.3/§3.4 只定义了 `Capturing` 态的元素，未定义本阶段的控制条，
+            // 故此处**不自造文案、不显示按钮**（符合「不伪造 UI」）。
+            // 失败态的用户指引由上方 `cameraPermissionDenied` 提示条 + P-02
+            // 「去设置」承担，不依赖本控制条。
+        }
+        .padding(.horizontal, ReconMetric.space4)
+        .padding(.vertical, ReconMetric.space3)
+        .background(ReconColor.bg.page)
+    }
+
+    /// `Capturing`（含 `paused` 变体）态的底部控制条（§3.3 / §3.4 元素表）。
+    private var capturingControls: some View {
         HStack(spacing: ReconMetric.space3) {
             SecondaryButton(session.pauseButtonTitle) {
                 // 暂停/继续是 §3.3 的 Capturing 态 `paused` 变体。
@@ -203,13 +309,24 @@ public struct ScanView: View {
             PrimaryButton(L10n.t(.scanFinish),
                           enabled: session.canFinishScan,
                           hint: session.finishScanHint) {
-                // 经编排器结束采集（停帧 + 冻结统计 + 通知内核），再跳 U-06。
+                // 经编排器结束采集（停帧 + 冻结统计 + 通知内核）。
                 controller.finishCapture()
-                router.replaceTop(with: .rebuild(sessionID: UUID()))
+                // ⚠️ 进的是 **`Reviewing`（自检清单）**，不是 U-06 —— 2026-11-01 修正。
+                //
+                // 原实现直接 `replaceTop(.rebuild)`，等于**跳过了 `Reviewing`**：
+                //   ① §4.2 T-11 明确 `FinishScan` 的落点是 `Reviewing`（`Processing`
+                //      要等 T-17 的 `UserConfirmReconstruct` 才到达）；
+                //   ② docs/03 §7.1.2 CK-1..CK-7 规定的清单页从此**永不出现**；
+                //   ③ `confirmReconstruct()`（T-17 唯一实现）此前**零调用点** ——
+                //      跳级看起来"能跑到底"，实际是把状态机的必经节点挖掉了。
+                // 传**真实**会话 ID（此前是 `UUID()` —— 每次求值都不同，
+                // 且与内核里的 `session_id` 无关，U-06/U-07 拿不到本次会话）。
+                // `currentSessionID` 为 nil 说明从未 `open()` 成功 —— 此时
+                // 不推入下一界面（没有会话可展示），留在本页由异常提示呈现。
+                if let id = controller.currentSessionID {
+                    router.replaceTop(with: .reviewing(sessionID: id))
+                }
             }
         }
-        .padding(.horizontal, ReconMetric.space4)
-        .padding(.vertical, ReconMetric.space3)
-        .background(ReconColor.bg.page)
     }
 }

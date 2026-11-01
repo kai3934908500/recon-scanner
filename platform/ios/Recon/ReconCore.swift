@@ -166,6 +166,76 @@ public struct ReconCapability {
     public var totalMemoryBytes: UInt64
 }
 
+/// 平台能力**事实**上报载荷（对应 `recon_probe_data`，缺口 AC）。
+///
+/// 与 `ReconCapability` 的分工（**不要混用**）：本类型是平台层**报上去**的事实
+/// （`平台 → core`），`ReconCapability` 是 core **判定后**的结果
+/// （`core → 平台`，多出 `branch` / `depthTier` / `depthSource` 三个派生字段）。
+///
+/// ⚠️ 记忆点：`ReconCapability` 里既然有 `maxImageWidth`，为什么这里还要再报一遍？
+/// 因为「相机最大分辨率」是**设备事实**，而 `recon_capability` 里的那个字段是
+/// 平台**报上去后被 core 原样带回来**的。真机上若不上报，core 读到的就是全零，
+/// `recon_capability.max_image_width` 也是 0 —— 那才是缺口 AC 的表象。
+public struct ReconProbeData {
+    public var hasCamera: Bool
+    public var hasImu: Bool
+    public var hasLidar: Bool
+    public var hasTof: Bool
+    /// 算法 / 运动推断深度（ARCore `DEPTH_BACKEND_MOTION_STEREO` 一类）。
+    /// 内核据它把 `depth_tier` 判为 `RECON_DEPTH_ALGO` 并以 `BRANCH_RGBD` 跑。
+    public var hasAlgoDepth: Bool
+    public var supportsGpu: Bool
+    public var maxImageWidth: Int32
+    public var maxImageHeight: Int32
+    public var maxFps: Int32
+    public var imuMaxRateHz: Int32
+    public var totalMemoryBytes: UInt64
+    public var availableMemoryBytes: UInt64
+
+    public init(hasCamera: Bool, hasImu: Bool, hasLidar: Bool, hasTof: Bool,
+                hasAlgoDepth: Bool, supportsGpu: Bool,
+                maxImageWidth: Int32, maxImageHeight: Int32, maxFps: Int32,
+                imuMaxRateHz: Int32,
+                totalMemoryBytes: UInt64, availableMemoryBytes: UInt64) {
+        self.hasCamera = hasCamera
+        self.hasImu = hasImu
+        self.hasLidar = hasLidar
+        self.hasTof = hasTof
+        self.hasAlgoDepth = hasAlgoDepth
+        self.supportsGpu = supportsGpu
+        self.maxImageWidth = maxImageWidth
+        self.maxImageHeight = maxImageHeight
+        self.maxFps = maxFps
+        self.imuMaxRateHz = imuMaxRateHz
+        self.totalMemoryBytes = totalMemoryBytes
+        self.availableMemoryBytes = availableMemoryBytes
+    }
+
+    /// 把本结构映射为 C ABI 的 `recon_probe_data`。
+    ///
+    /// `Bool` → `Int32` 必须显式转换：C 侧字段声明为 `int32_t`（头文件注释说明
+    /// 不用 `bool` 是为了跨语言宽度确定）。直接塞 `Bool` 会让 Swift 按 1 字节
+    /// 写入一个 4 字节字段的高位字节，在 little-endian 下**恰好**能读出 0/1，
+    /// 但一旦结构体被 `memcpy` 到别处或编译器插入填充，就会变成随机值 ——
+    /// 故此处一律 `? 1 : 0`。
+    var cValue: recon_probe_data {
+        var d = recon_probe_data()
+        d.has_camera = hasCamera ? 1 : 0
+        d.has_imu = hasImu ? 1 : 0
+        d.has_lidar = hasLidar ? 1 : 0
+        d.has_tof = hasTof ? 1 : 0
+        d.has_algo_depth = hasAlgoDepth ? 1 : 0
+        d.supports_gpu = supportsGpu ? 1 : 0
+        d.max_image_width = maxImageWidth
+        d.max_image_height = maxImageHeight
+        d.max_fps = maxFps
+        d.imu_max_rate_hz = imuMaxRateHz
+        d.total_memory_bytes = totalMemoryBytes
+        d.available_memory_bytes = availableMemoryBytes
+        return d
+    }
+}
+
 /// 网格信息（对应 `recon_mesh_info`）。
 struct ReconMeshInfo {
     var vertexCount: UInt64
@@ -356,6 +426,35 @@ final class ReconCore {
     }
 
     // MARK: - 能力探测与参数
+
+    /// 上报平台能力**事实**（`recon_set_probe_data`，缺口 AC）。
+    ///
+    /// ── 为什么必须在 `probeCapability()` **之前**调用（顺序不可交换）───────
+    ///
+    /// core 的 `Context::ProbeCapability()` 有**一次性缓存**（`capability_probed_`，
+    /// `core/src/util/context.cpp:108`）：第一次调用时读到的平台事实会被固化，
+    /// 之后再调 `recon_set_probe_data` 也不会改变 `recon_capability`。
+    /// 因此上报**必须**发生在首次 `recon_probe_capability` 之前。
+    ///
+    /// ── 为什么是类方法而不是实例方法 ────────────────────────────────────
+    ///
+    /// `recon_set_probe_data` 是**全局**的（不绑 context，见头文件语义约束）——
+    /// 设备能力与「哪个会话」无关。做成实例方法会诱使调用方以为「每个会话配置
+    /// 一次」，而实际上重复上报是幂等的、且必须在 create 之前就位。
+    /// 做成类方法把「App 启动时一次」这件事写进签名。
+    ///
+    /// - Returns: 内核返回的状态。**不吞错**：调用方应把非 `RECON_OK` 记入日志，
+    ///            因为上报失败意味着后续探测结果可能全为零。
+    @discardableResult
+    public static func reportProbeData(_ data: ReconProbeData) -> ReconStatus {
+        var d = data.cValue
+        let st = recon_set_probe_data(&d)
+        if !isOK(st) {
+            NSLog("recon: recon_set_probe_data 失败 status=\(status(st).rawValue)"
+                  + "；能力探测将读到全零事实（缺口 AC 回退）")
+        }
+        return status(st)
+    }
 
     func probeCapability() -> ReconCapability? {
         guard let h = handle else { return nil }
