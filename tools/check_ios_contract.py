@@ -101,6 +101,7 @@ G17 locale 资源落位纪律（folder reference + 与 Swift 查找方式交叉�
 from __future__ import annotations
 
 import json
+import glob
 import os
 import re
 import sys
@@ -1847,6 +1848,13 @@ def gate_status_mapping(rep: Report) -> None:
 #          而判据只盯生成物就会漏掉真正的源头（**判据必须落在源头**）。
 #   G15-c  `cmake/Licenses.cmake` 的 iOS 嵌入位置不得写成
 #          `Recon.app/Contents/Resources`（同一扁平结构问题）。
+#   G15-d  **文档面交叉对账**（2026-11-01 补的第二类漂移）—— 声明了许可清单
+#          iOS 落位的文档（docs/*.md）里，若**同一行**同时出现
+#          `THIRD_PARTY_LICENSES` 与 `Recon.app/Contents/`，即报错。
+#          ⚠️ 判据刻意收紧到「同行共现」：`docs/12` 的 dSYM 路径
+#          （`*.dSYM/Contents/Resources/DWARF/...`）与作为反例引用的 macOS
+#          路径里的 `Contents/` **都是正确的**，不得误伤。它守的是
+#          「代码改对了、文档留在错的」这一方向（G15-a/b/c 守的是反方向）。
 #
 # 负向注入见 `tools/verify_ios_contract_negative.py --case bundle-layout`。
 # ===========================================================================
@@ -1899,9 +1907,55 @@ def gate_bundle_layout(rep: Report) -> None:
                         f"`Recon.app/Contents/...` —— iOS 无 `Contents/` 层，"
                         f"设备上该目录不存在。应写 `Recon.app`（包根）。")
 
+    # --- G15-d：文档面的交叉对账（2026-11-01 补的第二类漂移）--------------
+    #
+    # 为什么需要（与 G15-a/b/c **方向相反**的同一类问题）：
+    #   G15-a/b/c 守的是「代码写错」，修法是「改代码」。但实测发现
+    #   `docs/12 §2.7` 的嵌入位置表**仍旧**写着
+    #       iOS 放 `Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt`
+    #   （`docs/10` 的 LIC-5 同错），而 `cmake/Licenses.cmake` 早已是
+    #   `Recon.app`（包根）。即：**代码改对了、文档留在错的** ——
+    #   与 G15 初建时「文档写错、代码跟着错」是同一枚硬币的两面，
+    #   共同根因都是**同一事实有两处来源、且两者之间没有对账**。
+    #
+    #   ⚠️ 判据设计（避免误伤，这是本关最易写错处）：
+    #     ① **不得**用「文件里出现 `Contents/` 就报错」—— 
+    #        `docs/12:1197` 的 dSYM 路径 `<...>.a.dSYM/Contents/Resources/DWARF/`
+    #        里的 `Contents/` **是正确的**（那是 dSYM 包自己的结构，与 iOS
+    #        App bundle 无关）；`docs/12:1307`/`docs/10` 中作为反例被引用的
+    #        macOS 路径同样合法。
+    #     ② 故判据收紧为「**同一行**里，既出现许可清单文件名
+    #        `THIRD_PARTY_LICENSES` 又出现 `Recon.app/Contents/`」——
+    #        只有"把许可清单放进 App bundle 的 Contents"这一种写法会被命中，
+    #        其余提及 `Contents/` 的上下文一律放过。
+    #     ③ **豁免缺口登记行**：docs/14 的缺口表里，登记行的职责就是
+    #        **引用当初写错的那个值**（如缺口 AN 行必须写出
+    #        `Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt` 才能说明
+    #        漂移是什么）。若把登记行也判进来，等于「禁止记录 bug」—— 那是
+    #        判据**范围过宽**，不是文档错。故按行首编号模式 `| A<大写字母> |`
+    #        显式跳过（**只跳登记行，不跳整份文档**：docs/14 的散文段落仍在
+    #        扫描范围内；注入项 G15-d-doc14-prose 专门证明这个豁免是**窄**的）。
+    #     ④ 扫描面 = `docs/*.md` 全文（成本可忽略）。
+    _GAP_ROW = re.compile(r"^\|\s*A[A-Z](-[0-9]+)?\s*\|")
+    for doc in sorted(glob.glob(os.path.join(ROOT, "docs", "*.md"))):
+        for lineno, raw in enumerate(read_text(doc).splitlines(), 1):
+            if "THIRD_PARTY_LICENSES" not in raw:
+                continue
+            if _GAP_ROW.match(raw):
+                continue  # 缺口登记行：职责就是引用错误值，豁免（见 ③）
+            if re.search(r"Recon\.app/Contents/", raw):
+                rep.err(gate,
+                        f"{rel(doc)}:{lineno} 文档把 iOS 许可清单落位写成 "
+                        f"`Recon.app/Contents/...`，而 `cmake/Licenses.cmake` 的 "
+                        f"`RECON_LICENSES_EMBED_DEST` 是 `Recon.app`（包根）—— "
+                        f"**代码与文档两份事实来源已漂移**。iOS bundle 无 "
+                        f"`Contents/` 一层，请改文档为 `Recon.app/THIRD_PARTY_LICENSES.txt`。")
+
     if not any(gate in e for e in rep.errors):
+        n_docs = len(glob.glob(os.path.join(ROOT, "docs", "*.md")))
         rep.note(f"iOS bundle 落位纪律：检查落位表达式 {checked} 处、"
-                 f"生成器与 Licenses.cmake 各 1 处，均未出现 iOS 上不存在的 "
+                 f"生成器与 Licenses.cmake 各 1 处、文档面 {n_docs} 份（许可清单"
+                 f"与 `Contents/` 同行交叉对账），均未出现 iOS 上不存在的 "
                  f"`Contents/` 层级 ✓")
 
 

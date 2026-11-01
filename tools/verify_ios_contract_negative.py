@@ -94,6 +94,10 @@ METAL_BACKEND = os.path.join(ROOT, "platform", "ios", "Recon",
 CONTAINER_YML = os.path.join(ROOT, "platform", "ios", "Container", "project.yml")
 GEN_IOS_PROJECT = os.path.join(ROOT, "tools", "gen_ios_project.py")
 LICENSES_CMAKE = os.path.join(ROOT, "cmake", "Licenses.cmake")
+# G15-d 的目标对象：**文档面**的许可清单 iOS 落位（与代码面方向相反的漂移）。
+DOCS_10 = os.path.join(ROOT, "docs", "10_许可与合规.md")
+DOCS_12 = os.path.join(ROOT, "docs", "12_构建与打包.md")
+DOCS_14 = os.path.join(ROOT, "docs", "14_验收测试.md")
 # G16 的目标对象：未签名 IPA 打包链所在的 workflow，以及其判据实现本体。
 IOS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios.yml")
 # G18 的目标对象：装配 recon_probe_data 的地方（幻觉 API 的实际发生地）。
@@ -303,6 +307,10 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
     #     → 编得过、CI 全绿、运行期永久加载不到（GPU 路径静默降级）。
     #     故**生成物**与**生成器源头**两处都要注入：只盯生成物会漏掉
     #     「下次重生成又改回去」这条路径。
+    #     G15-d 注入的是**反方向**：代码侧早已对，而 docs/12 §2.7 与 docs/10
+    #     LIC-5 的文档面把 iOS 许可清单落位留在 `Contents/Resources/`。
+    #     两条注入（docs/12 表行、docs/10 LIC-5 行）共同证明 G15-d 的
+    #     「同行共现」判据有效，且不会误伤 dSYM 路径里的合法 `Contents/`。
     (
         "G15-a-container-contents-layer",
         "在生成的 project.yml 里把 metallib 落位改回 ${CONTENTS_FOLDER_PATH}/Resources"
@@ -333,6 +341,44 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
         [(LICENSES_CMAKE,
           '  set(RECON_LICENSES_EMBED_DEST "Recon.app")\n',
           '  set(RECON_LICENSES_EMBED_DEST "Recon.app/Contents/Resources")\n')],
+    ),
+    #     G15-d 守的是**反方向**：代码已是对的、文档留在错的。
+    #     注入必须落在「许可清单 + Recon.app/Contents/ 同行共现」上 ——
+    #     这正是判据的命中条件（dSYM 路径与 macOS 反例里的 Contents/ 不共现，
+    #     故不会被误伤；本项也顺便证明了这一点）。
+    (
+        "G15-d-doc-licenses-contents-layer",
+        "在 docs/12 的嵌入位置表里把 iOS 许可清单落位改回 Recon.app/Contents/"
+        "Resources（代码已改为包根，文档是第二事实来源）",
+        "两份事实来源已漂移",
+        [(DOCS_12,
+          "| 嵌入位置 | iOS：`Recon.app/THIRD_PARTY_LICENSES.txt`（**包根**，见下方警示）；"
+          "Android：`assets/THIRD_PARTY_LICENSES.txt`；",
+          "| 嵌入位置 | iOS：`Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt`；"
+          "Android：`assets/THIRD_PARTY_LICENSES.txt`；")],
+    ),
+    (
+        "G15-d-doc10-licenses-contents-layer",
+        "在 docs/10 的 LIC-5 行里同样把 iOS 许可清单落位写回 Contents/Resources",
+        "两份事实来源已漂移",
+        [(DOCS_10,
+          "| LIC-5 | 许可文本**不得**被压缩成不可读形式。iOS 侧放 "
+          "`Recon.app/THIRD_PARTY_LICENSES.txt`（**包根**",
+          "| LIC-5 | 许可文本**不得**被压缩成不可读形式。iOS 侧放 "
+          "`Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt`（**包根**")],
+    ),
+    #     G15-d 的**范围证明**：豁免只该覆盖「缺口登记行」（行首 `| AN |` 之类，
+    #     其职责就是引用错误值）。本项注入到 docs/14 的**散文行**上 ——
+    #     若豁免写宽了（比如整份 docs/14 都跳过），本项就不会被拒收。
+    (
+        "G15-d-doc14-prose-not-exempt",
+        "在 docs/14 的**散文段落**（非缺口登记行）里写入许可清单 + "
+        "Recon.app/Contents/ 同行共现 —— 证明登记行豁免是**窄**的",
+        "两份事实来源已漂移",
+        [(DOCS_14,
+          "> **共同根因**（与本项目既往教训同构）：判据没有落在**目标对象**上。\n",
+          "> **共同根因**：iOS 许可清单放 `Recon.app/Contents/Resources/"
+          "THIRD_PARTY_LICENSES.txt`，判据没有落在**目标对象**上。\n")],
     ),
     # --- G16：未签名 IPA 打包链纪律（2026-11-01 补）------------------------
     #     目标：`.github/workflows/ios.yml` 的 build-app job。
