@@ -67,10 +67,42 @@ else
 fi
 
 # --- 工具链探测 -----------------------------------------------------------
+# 优先级：显式 RECON_GLSLANG（绝对路径）> PATH > 常见安装位置。
+#
+# ⚠️ `RECON_GLSLANG` 的三态语义（负向注入靠它，勿"简化"）：
+#     · 未设置 / 空串 → 走自动探测；
+#     · 设为**可执行**文件的路径 → 就用它（CI 用 apt/NDK 装完之后可显式指路）；
+#     · 设为**不可执行/不存在**的路径 → 判定为「无工具链」，且**不回落**自动探测。
+#   第三种是本脚本能被**确定性**证伪的关键：注入方只要
+#     RECON_GLSLANG=/nonexistent/glslangValidator RECON_REQUIRE_SPIRV=1 \
+#       bash tools/build_vulkan_shaders.sh
+#   就必须拿到非零退出码。
+#
+#   为什么不用"把 PATH 收紧"来做这件事（第四十一轮的真实事故，勿重犯）：
+#   本 job 原先的注入手法是 `env PATH=/nonexistent ...`，但脚本里对 `python3` 与
+#   `glslangValidator` 都用 `command -v` 探测 —— PATH 一收紧，**两者都探测不到**
+#   → 脚本走到「无 python 就跳过一致性闸门」+「无工具链就 SKIP」两条**合法的
+#   降级路径** → 以 0 退出。于是断言"非零退出"不成立，注入自检自己失败、job 挂掉。
+#   教训：注入手法必须落在**判据本身**（"没有可用工具链时不得返回 0"）上，
+#   而不是落在"怎么让工具链消失"这类**环境副作用**上 —— 后者会顺带触发别的
+#   降级分支，把信号搅浑。
 GLSLANG=""
-for cand in glslangValidator glslang; do
-  if command -v "${cand}" >/dev/null 2>&1; then GLSLANG="${cand}"; break; fi
-done
+if [ -n "${RECON_GLSLANG:-}" ]; then
+  if [ -x "${RECON_GLSLANG}" ]; then
+    GLSLANG="${RECON_GLSLANG}"
+  else
+    echo "[vulkan-shaders] RECON_GLSLANG='${RECON_GLSLANG}' 不可执行 → 判定为无工具链"
+    GLSLANG=""          # 显式指定但无效：**不回落**探测
+  fi
+else
+  for cand in glslangValidator glslang; do
+    if command -v "${cand}" >/dev/null 2>&1; then GLSLANG="${cand}"; break; fi
+    for d in /usr/bin /usr/local/bin /opt/homebrew/bin; do
+      if [ -x "${d}/${cand}" ]; then GLSLANG="${d}/${cand}"; break 2; fi
+    done
+  done
+fi
+echo "[vulkan-shaders] glslangValidator: ${GLSLANG:-<未找到>}"
 
 if [ -z "${GLSLANG}" ]; then
   echo ""

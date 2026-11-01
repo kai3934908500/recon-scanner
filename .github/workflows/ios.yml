@@ -402,32 +402,40 @@ jobs:
           #     ld: warning: object file (...png_encoder.o) was built for newer
           #                 'iOS-simulator' version (18.5) than being linked (15.0)
           #   ⚠️ 这只是 **warning** —— 构建照样"成功"。也就是说：**没有本关，
-          #      这个漂移可以一路通过 CI 并且在日志里只表现为噪声**。故必须用
-          #      断言把它钉死，而不是指望人去看那上百行 warning。
-          #   `vtool -show-build` 读的是 Mach-O 的 LC_BUILD_VERSION，是产物的
-          #   真实属性，不是"我传了什么参数"的自述。
+          #      这个漂移可以一路通过 CI 且在日志里只表现为噪声**。故必须断言钉死。
+          #
+          # ⚠️ 读 minos 的正确姿势（第 6 轮 CI 已证伪一次，勿改回）：
+          #   `vtool -show-build <libReconCore.a>` **必然报
+          #     "file is not mach-o"** —— 静态归档是 `!<arch>` 容器，不是 Mach-O；
+          #   归档里是**成员**才是 Mach-O。必须取其成员。三种可行做法：
+          #     ① `vtool -show-build <member.o>`（需先解包）
+          #     ② `otool -l <archive>` —— otool 会遍历归档成员并逐个打印
+          #        LC_BUILD_VERSION，实现最简，故选它。
+          #   这里用 ②：直接 `otool -l` 归档，再用 awk 只取 LC_BUILD_VERSION 段的
+          #   `minos` 字段。LC_VERSION_MIN_IPHONEOS 段（旧式）一并兜住 ——
+          #   Xcode 16.4 用 LC_BUILD_VERSION，但旧工具链可能写后者。
           for slice in ios-arm64/libReconCore.a ios-arm64_x86_64-simulator/libReconCore.a; do
             echo "--- ${slice} ---"
-            vtool -show-build "$XCF/${slice}" > /tmp/mv.txt 2>&1 || true
-            cat /tmp/mv.txt
-            # 逐个架构检查（fat 归档上 vtool 会打印多段）
-            bad=0
-            while read -r v; do
-              if [ "${v}" != "15.0" ]; then
-                echo "::error::${slice} 有 minos=${v}，契约要求 15.0（docs/12 §4.6）"
-                bad=$((bad + 1))
-              fi
-            done < <(sed -n 's/^ *minos *//p' /tmp/mv.txt)
-            if [ "${bad}" -ne 0 ]; then
-              echo "::error::${slice} 的部署目标与 App 不一致，会引入「更高系统版本的弱符号」"
+            otool -l "$XCF/${slice}" > /tmp/mo.txt 2>&1 || true
+            # 只取 LC_BUILD_VERSION / LC_VERSION_MIN_IPHONEOS 之后的 minos/version
+            awk '/cmd LC_BUILD_VERSION/ {inb=1} /cmd LC_VERSION_MIN_IPHONEOS/ {inb=1}
+                 inb && /^ *minos / {print $2; inb=0}
+                 inb && /^ *version / {print $2; inb=0}' /tmp/mo.txt > /tmp/minos.txt
+            n_m=$(grep -c . /tmp/minos.txt || true)
+            echo "读到 ${n_m} 个 minos 值：$(sort -u /tmp/minos.txt | tr '\n' ' ')"
+            # 至少要有值 —— 0 个说明解析式已失效（判据本身失效，必须报警而非放过）
+            if [ "${n_m}" -eq 0 ]; then
+              echo "::error::未能从 ${slice} 解析出任何 minos/build-version —— 判据可能已失效"
+              echo "--- otool -l 前 60 行（供定位）---"
+              head -60 /tmp/mo.txt
+              exit 1
+            fi
+            stale=$(sort -u /tmp/minos.txt | grep -v '^15\.0$' || true)
+            if [ -n "${stale}" ]; then
+              echo "::error::${slice} 存在非 15.0 的 minos：${stale}（契约 docs/12 §4.6）"
               exit 1
             fi
           done
-          n_minos=$(sed -n 's/^ *minos *//p' /tmp/mv.txt | wc -l | tr -d ' ')
-          if [ "${n_minos}" -eq 0 ]; then
-            echo "::error::未能从 vtool 输出解析出任何 minos —— 判据可能已失效"
-            exit 1
-          fi
           echo "OK: 两个切片的 minos 均为 15.0（与 docs/12 §4.6 一致）"
 
       # --- 产物层验证 default.metallib（此前从未真正编过）------------------
@@ -512,24 +520,50 @@ jobs:
           glslangValidator --version | head -3
 
       # 先做负向注入自检：证明"缺工具链即失败"这条纪律真的生效。
-      # 手法：把 glslangValidator 从 PATH 里藏掉，断言脚本**非零退出**。
-      # 不这么测的话，`RECON_REQUIRE_SPIRV=1` 是死代码 —— 一旦哪天被
-      # 改成 0，日志里也只会多一行 SKIP，看不出覆盖已经归零。
+      # 手法：用 `RECON_GLSLANG` 指向一个**不存在**的路径（三态语义里的第三态），
+      # 断言脚本**非零退出**。不这么测的话 `RECON_REQUIRE_SPIRV=1` 是死代码 ——
+      # 哪天被改成 0，日志里只会多一行 SKIP，看不出覆盖已经归零。
+      #
+      # ⚠️ 刻意**不用**「把 PATH 收紧到 /nonexistent」（第六轮 CI 已证伪，勿改回）：
+      #   那样会让脚本内的 `python3` 探测也落空 → 走到"无 python 跳过一致性闸门"
+      #   与"无工具链 SKIP"两条**合法降级路径** → 以 0 退出 → 断言"非零退出"
+      #   不成立 → 自检自己失败、job 挂掉（一轮真实事故）。
+      #   教训：注入手法必须落在**判据本身**（"没有可用工具链时不得返回 0"），
+      #   不能落在"怎么让工具链消失"这类环境副作用上 —— 后者会顺带触发别的
+      #   降级分支，把信号搅浑。
+      #   另加一条对照：同一手法下 RECON_REQUIRE_SPIRV=0 必须**成功**退出，
+      #   证明"非零"确实来自 REQUIRE 开关而不是别的偶发原因。
       - name: 自检 —— 无工具链时必须硬失败（不静默降级）
         run: |
           set -euo pipefail
-          if env PATH="/usr/bin:/bin" bash -c 'command -v glslangValidator' >/dev/null 2>&1; then
-            echo "::error::glslangValidator 意外落在 /usr/bin —— 自检前提不成立"
+          FAKE=/nonexistent/glslangValidator
+
+          echo "--- 对照：RECON_REQUIRE_SPIRV=0 时允许降级（应成功）---"
+          if ! env RECON_GLSLANG="${FAKE}" RECON_REQUIRE_SPIRV=0 \
+                 bash tools/build_vulkan_shaders.sh > /tmp/spirv_soft.log 2>&1; then
+            echo "::error::REQUIRE=0 时不应失败（降级路径被破坏？）"
+            tail -20 /tmp/spirv_soft.log
             exit 1
           fi
-          if env PATH="/nonexistent" RECON_REQUIRE_SPIRV=1 \
-               bash tools/build_vulkan_shaders.sh > /tmp/nospirv.log 2>&1; then
+          grep -E "未找到|SKIP" /tmp/spirv_soft.log | head -3 || true
+
+          echo "--- 判据：RECON_REQUIRE_SPIRV=1 时必须非零退出 ---"
+          if env RECON_GLSLANG="${FAKE}" RECON_REQUIRE_SPIRV=1 \
+               bash tools/build_vulkan_shaders.sh > /tmp/spirv_hard.log 2>&1; then
             echo "::error::无工具链时脚本竟然返回 0（违反 RECON_REQUIRE_SPIRV=1）"
-            cat /tmp/nospirv.log
+            cat /tmp/spirv_hard.log
             exit 1
           fi
-          echo "OK: 无工具链时脚本按约定失败"
-          grep -E "SKIP|FAIL" /tmp/nospirv.log | head -5
+          echo "OK: 无工具链时脚本按约定非零退出"
+          grep -E "SKIP|FAIL" /tmp/spirv_hard.log | head -5 || true
+
+          echo "--- 附带判据：REQUIRE=1 失败时**不得**留下空产物 ---"
+          if compgen -G "build/vulkan/spirv/*.spv" > /dev/null 2>&1; then
+            echo "::error::硬失败路径下竟产生了 .spv —— 存在伪造空产物的风险"
+            ls -l build/vulkan/spirv/
+            exit 1
+          fi
+          echo "OK: 硬失败路径未留下任何 .spv"
 
       - name: 编译全部 .comp → SPIR-V 并内联为 C 数组
         run: |
