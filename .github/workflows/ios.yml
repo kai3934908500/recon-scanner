@@ -230,15 +230,27 @@ jobs:
           merge_slice() {
             local srcdir="$1" out="$2"
             local libs
-            libs=$(find "$srcdir" -name "librecon_core.a" -o \
-                          -name "librecon_platform_common.a" -o \
-                          -name "librecon_platform_ios.a" | sort)
-            echo "== $out 的输入 =="
+            # ⚠️ 必须排除 Objects-normal/ 下的**中间**归档，否则「恰好 3 个」的
+            #   断言在模拟器 slice 上必然失败（一次真实事故，勿"简化"回去）：
+            #   模拟器切片是双架构（arm64;x86_64），Xcode 会为**每个架构各产出一份**
+            #   中间归档 Objects-normal/<arch>/Binary/lib<target>.a，再加最终合并的
+            #   fat 归档 Release-iphonesimulator/lib<target>.a —— 同名共 3×2+3=9 个。
+            #   真机切片是单架构（arm64），只有 Release-iphoneos/ 下 3 个，故只有
+            #   模拟器这一步会炸。`-o` 与 `-not` 之间必须加括号，否则因 `-o` 的
+            #   优先级会解析成 `A OR B OR (C AND NOT ...)`，前两项漏掉排除条件。
+            libs=$(find "$srcdir" \( -name "librecon_core.a" -o \
+                                   -name "librecon_platform_common.a" -o \
+                                   -name "librecon_platform_ios.a" \) \
+                          -not -path "*/Objects-normal/*" | sort)
+            echo "== ${out} 的输入 =="
             echo "$libs"
             local n
             n=$(echo "$libs" | grep -c . || true)
             if [ "$n" -ne 3 ]; then
-              echo "::error::期望 3 个静态库，实际 $n 个（device=$srcdir）"
+              # 变量一律用 ${} 界定：紧跟全角标点时 `$srcdir）` 会被 bash 当作
+              # 变量名 "srcdir）" 的一部分，在 `set -u` 下先报 unbound variable
+              # 而**抢在本条错误消息之前**终止脚本，把真正的失败原因盖掉。
+              echo "::error::期望 3 个静态库，实际 ${n} 个（srcdir=${srcdir}）"
               find "$srcdir" -name "*.a" | sort || true
               exit 1
             fi
@@ -248,8 +260,30 @@ jobs:
           }
           merge_slice build/ios/device    build/ios/merged/device/libReconCore.a
           merge_slice build/ios/simulator build/ios/merged/simulator/libReconCore.a
+
+          # 合并后必须保留本切片**全部**架构。docs/12 §4.7 的架构判据在此处做
+          # 唯一可信的自动化校验：libtool 对 fat 输入若只保留单一架构，会**静默**
+          # 产出残缺的 xcframework，而下一步的 `lipo -info` 只打印结果、不判对错。
+          # 因此这里改成显式断言（不通过即失败），并在下方打印供留档。
+          dev_archs=$(lipo -archs build/ios/merged/device/libReconCore.a)
+          sim_archs=$(lipo -archs build/ios/merged/simulator/libReconCore.a)
+          echo "device    架构: ${dev_archs}"
+          echo "simulator 架构: ${sim_archs}"
           lipo -info build/ios/merged/device/libReconCore.a
           lipo -info build/ios/merged/simulator/libReconCore.a
+          if [ "$dev_archs" != "arm64" ]; then
+            echo "::error::device 切片架构应为 arm64，实为 '${dev_archs}'（docs/12 §4.7）"
+            exit 1
+          fi
+          if ! echo "$sim_archs" | grep -qw arm64; then
+            echo "::error::simulator 切片缺少 arm64（实为 '${sim_archs}'）"
+            exit 1
+          fi
+          if ! echo "$sim_archs" | grep -qw x86_64; then
+            echo "::error::simulator 切片缺少 x86_64（实为 '${sim_archs}'）"
+            exit 1
+          fi
+          echo "OK: 两个切片的架构均符合 docs/12 §4.7"
 
       - name: 合并 xcframework
         run: |
