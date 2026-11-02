@@ -391,6 +391,16 @@ public final class ReconSessionController: ObservableObject {
         return h > 0 ? w / h : 16.0 / 9.0
     }
 
+    /// 已从 ARKit 到达采集层的帧数（**与是否成功投递内核无关**）。
+    ///
+    /// 与 `rejectedFrameCount` 合用可区分「一帧都没采到」的两种互斥根因
+    /// （delegate 被抢占 vs 帧被全部拒绝）—— 判读表见 `CameraCapture.swift`
+    /// 中 `arrivedFrames` 的声明处。
+    ///
+    /// ⚠️ 这是**诊断量**，不是产品指标：它只回答「采集层还活着吗」，
+    /// 不进任何界面文案（G9：诊断值不走本地化）。
+    public var cameraCallbackFrames: Int { capture.arrivedFrames }
+
     /// 当前会话在 `records` 中的记录 id（`open()` 登记时赋值）。
     ///
     /// ── 为什么必须由控制器发布，而不是视图自己造 ──────────────────────────
@@ -948,6 +958,15 @@ public final class ReconSessionController: ObservableObject {
         let next = session.send(.permissionsGranted)
         if next == .previewing {
             capture.start(enableDepth: arCapability?.hasDepth ?? false)
+            // ★ 缺口 AV 兜底：`start()` 会 `session.run(...)`。若此前预览视图
+            //   已把会话交给 `ARView`（`ARView` 抢走了 delegate），`run` 之后
+            //   回调依然不会回到采集层。这里再声明一次归属。
+            //   与 `ARCameraPreview.mountSession` 的「保存-恢复」是**同一目标
+            //   的两次触发**（不同时机，非两处实现）—— 预览侧负责**恢复**被
+            //   `ARView` 抢走的 delegate，本处负责**在 `run` 之后再确认一次**。
+            //   归属声明的权威始终在 `CaptureSession`（`reclaimSessionDelegate`
+            //   幂等，已在位时不重复赋值）。
+            capture.reclaimSessionDelegate()
         }
     }
 
@@ -987,6 +1006,10 @@ public final class ReconSessionController: ObservableObject {
         let next = session.send(.userStart)
         if next == .capturing {
             capture.setPaused(false)
+            // ★ 重置采集链路诊断计数（缺口 AV）：从「真正开始采」这一刻起计，
+            //   否则 `Previewing` 期 ARKit 已在喷帧（暂不投递），计数会被
+            //   预置成一个非零值，让「回调是否活着」的判读失真。
+            capture.resetDiagnostics()
             // 通知内核开始采集会话（sessionId 用会话目录名，与 §5.1 的
             // `session_id` 即目录名一致）。
             if let dir = sessionDir {

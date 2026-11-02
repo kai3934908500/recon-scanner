@@ -7,6 +7,7 @@
   "fmt.actual_size": "实际尺寸  宽 %@ mm   高 %@ mm",
   "fmt.atlas_size": "图集 %@×%@",
   "fmt.captured_frames": "已采集 %d 帧",
+  "fmt.capture_diag": "相机回调 %d · 已采 %d · 被拒 %d",
   "fmt.confidence_medium": "尺度基本可信（±%@）",
   "fmt.coverage_percent": "覆盖方位 %d%%",
   "fmt.coverage_ratio": "覆盖率 %@",

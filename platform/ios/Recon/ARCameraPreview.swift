@@ -45,6 +45,37 @@
 //   · **不做画面裁剪**。缩放与 letterbox 由 SwiftUI 侧的 `.aspectRatio` 决定，
 //     本视图只负责「把 buffer 铺满给它的 frame」。
 //
+//  ── ⚠️ 已知陷阱：ARView 会**抢走** `ARSession.delegate`（缺口 AV）────────
+//
+//  这是本文件最危险的一行，单独说明。
+//
+//  Apple 文档（`ARView.session`）原话：
+//
+//    "RealityKit automatically creates a default session **that the view
+//     manages**. If you have an existing or custom session, setting it as the
+//     view's session replaces the default session."
+//
+//  关键在 **"that the view manages"** —— 视图**管理**它持有的会话，
+//  而「管理」包含**接管 `delegate`**。`ARSession.delegate` 是**单槽位**的，
+//  谁最后赋值谁生效。
+//
+//  本工程的资源所有权铁律是：**会话与 delegate 都归 `CaptureSession`**
+//  （全设备只允许一个活动会话，且采集必须唯一）。故在把会话交给 `ARView`
+//  **之后**，必须让 `CaptureSession` **重新认领** delegate —— 否则：
+//
+//    · `CaptureSession.session(_:didUpdate:)` 不再被调用 → **零帧进内核**；
+//    · 但**画面完全正常**（ARView 自己在渲染），于是表现为
+//      「黑屏修好了，却一个关键帧都没扫到」—— 比黑屏难查得多。
+//
+//  修法是**「保存-恢复」**：在赋值会话**之前**记下当前 delegate，
+//  赋值**之后**若发现被改写了就还回去（实现见 `mountSession(into:)`）。
+//  它不需要知道 delegate 是谁，故不会在「谁拥有会话」上产生第二个答案 ——
+//  归属声明的权威始终在 `CaptureSession`（会话的所有者），本文件只做无损中转。
+//
+//  时机：`makeUIView`（首次挂载）与 `updateUIView`（视图被复用/重挂）**都要**。
+//  `updateUIView` 不是冗余 —— SwiftUI 可能在不重建本 struct 的情况下重建
+//  底层 `ARView`（如容器尺寸剧变触发重建），那会再抢一次。
+//
 
 import SwiftUI
 import RealityKit
@@ -69,17 +100,56 @@ public struct ARCameraPreview: UIViewRepresentable {
         self.session = session
     }
 
+    /// 挂载会话，并把被 `ARView` 抢走的 `delegate` 还回去（缺口 AV）。
+    ///
+    /// ── 为什么是「保存-恢复」而不是「传入 `CaptureSession` 再设」────────────
+    ///
+    /// 三种可选实现的比较（记录取舍理由，避免后来者"简化"掉这一层）：
+    ///
+    /// | 方案 | 问题 |
+    /// |---|---|
+    /// | 本文件内 `view.session.delegate = someCaptureSession` | 需要 import `ui/ios` 层的 `CaptureSession` → **UI 层被平台桥接层反向依赖**（架构方向反了）；且让「谁拥有会话」出现第二个答案 |
+    /// | 传闭包 `onSessionMounted: () -> Void` 由调用方认领 | 调用方（`ScanView`）的实现是 `@MainActor` 方法，而本 struct 的 `makeUIView` / `updateUIView` 在 Swift 5 模式下**不是** `@MainActor` → 同步调用会触发 actor 隔离诊断，而本 target 开着 `SWIFT_TREAT_WARNINGS_AS_ERRORS`（**本机无 Xcode，无法编译验证**，不能赌） |
+    /// | **保存-恢复（本实现）** | 无：零跨层依赖、零 actor 表面、不关心 delegate 是谁 |
+    ///
+    /// 「保存-恢复」的语义精确：**"把 ARView 抢走的东西还回去"** —— 它不需要
+    /// 知道原来的 delegate 是谁，也就不会对「谁拥有会话」产生任何主张。
+    /// 归属声明的**权威**仍在 `CaptureSession`（会话的所有者），本文件只做
+    /// 无损的中转。这与「资源所有权铁律」不冲突：本文件不**认领**，只**恢复**。
+    ///
+    /// ⚠️ `session.delegate` 是 `weak`，保存 `previous` 不会产生循环引用，
+    /// 也不会延长任何对象寿命（`CaptureSession` 由控制器强持有）。
+    private func mountSession(into view: ARView) {
+        // ① 先记下 ARKit 会话当前的 delegate —— 即 `CaptureSession` 自己
+        //    （`CaptureSession.init` 里设过，见 CameraCapture.swift）。
+        let previous = session.delegate
+        // ② 赋值会话。★ 就是这一行会让 `ARView` 接管 delegate。
+        view.session = session
+        // ③ ARView 若改写了 delegate，立刻还回去。
+        //    判等后再赋值：已一致时**不重复赋值**（避免无谓的会话状态同步，
+        //    且让"是否真的被抢过"这件事可被断点观察）。
+        if session.delegate !== previous {
+            session.delegate = previous
+        }
+    }
+
     public func makeUIView(context: Context) -> ARView {
         // ⚠️ `automaticallyConfigureSession: false` **不可省**：
         //   为 `true` 时 `ARView` 会自行建立并运行一个世界跟踪会话，
         //   与 `CaptureSession` 的那一个直接冲突（同设备只允许一个活动会话，
-        //   表现为画面错乱或黑屏）。这行与下一行的 session 赋值是一个整体，
+        //   表现为画面错乱或黑屏）。这行与 `view.session` 的赋值是一个整体，
         //   删掉任一行都会静默退化成「预览与采集各走一路」。
-        let view = ARView(frame: .zero,
+        //
+        // ⚠️ 尺寸用 `(x:1, y:1, width:1, height:1)` 而非 `.zero`：
+        //   `.zero` 时 Metal 层拿不到 drawable（社区实测
+        //   `[CAMetalLayer nextDrawable] returning nil because allocation failed`），
+        //   表现为画面区域全黑/无内容。给一个非零初值后由 Auto Layout 撑开，
+        //   是社区通用的规避方式（Apple 未承诺 `.zero` 可用）。
+        let view = ARView(frame: .init(x: 1, y: 1, width: 1, height: 1),
                           cameraMode: .ar,
                           automaticallyConfigureSession: false)
-        // 挂载采集层的**同一个**会话（不是新建）。
-        view.session = session
+        // 挂载会话并把 delegate 还回去（缺口 AV，见 mountSession 注释）。
+        mountSession(into: view)
         // 极简画面：关掉 RealityKit 的相机后处理（颗粒/运动模糊）。
         // 理由：① §1.1 U-D-4「无浮夸视觉」；② 让预览尽量接近内核实际收到的
         // 那一帧 —— 后处理只影响**显示**（送内核的是 `ARFrame.capturedImage`
@@ -92,13 +162,10 @@ public struct ARCameraPreview: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: ARView, context: Context) {
-        // 会话实例是**稳定**的（`CaptureSession` 持有同一个，不重建），
-        // 故正常路径下这里无事可做。
-        // 仍保留这段「不一致就纠正」的兜底：若某天会话被替换（例如 App 从
-        // 后台回前台重建了采集栈），不纠正就会静默显示**旧会话**的画面 ——
-        // 一个界面看起来正常、实际采的是另一路的错误，比黑屏难查得多。
-        if uiView.session !== session {
-            uiView.session = session
-        }
+        // ★ 缺口 AV：**每次**更新都重新挂载一遍（含 delegate 恢复）。
+        //   不是冗余 —— 见文件头：底层 `ARView` 可能在不重建本 struct 的情况下
+        //   被重建（那会再抢一次 delegate），而 `UIViewRepresentable` 不保证
+        //   `makeUIView` 是唯一入口。`mountSession` 内部判等，无重复开销。
+        mountSession(into: uiView)
     }
 }

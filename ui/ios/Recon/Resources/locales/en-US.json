@@ -12,6 +12,7 @@
   "fmt.actual_size": "Actual size  W %@ mm   H %@ mm",
   "fmt.atlas_size": "Atlas %@×%@",
   "fmt.captured_frames": "%d frames captured",
+  "fmt.capture_diag": "AR callbacks %d · captured %d · rejected %d",
   "fmt.confidence_medium": "Scale is probably reliable (±%@)",
   "fmt.coverage_percent": "Coverage %d%%",
   "fmt.coverage_ratio": "Coverage %@",

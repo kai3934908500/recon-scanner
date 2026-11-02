@@ -682,6 +682,21 @@ public enum L10nKey: String, CaseIterable {
     case fmtValidationCount     = "fmt.validation_count"
     case fmtExportedSize        = "fmt.exported_size"
     case fmtPresetDiff          = "fmt.preset_diff"
+    /// 采集链路诊断行（**临时诊断**，缺口 AV）：`相机回调 %d · 已采 %d · 被拒 %d`。
+    ///
+    /// ── 为什么要把它做成界面文案（而不是只留日志）────────────────────────
+    ///
+    /// 真机反馈「无论怎么拍我都不知道，一个关键帧都没扫描到」。该症状有两种
+    /// 互斥根因（delegate 被抢占 / 帧被全部拒绝），从内核侧表现**完全一样**
+    /// （`frames_captured` 恒 0）。在无真机调试环境的条件下（本机 Windows，
+    /// 无 Xcode/lldb/Console），**界面是唯一可用的诊断通道** —— 故这里刻意
+    /// 让它可见，而不是学 `rejectedFrameCount` 那样"记了但没人看"。
+    ///
+    /// ⚠️ **临时性**：采集链路稳定后本键应随诊断行一并移除（届时同步删 JSON
+    /// 条目）。它与其它 `fmt.*` 的区别就在于此 —— 那三条是产品文案，本条是
+    /// 诊断通道。已随缺口 AV 登记（`.workbuddy/memory/CONTRACTS.md` §D5 末尾
+    /// 注明「临时诊断通道」）。
+    case fmtCaptureDiag         = "fmt.capture_diag"
     /// 确认框：`已采集的 %d 帧将被删除`
     case fmtFramesDeleted       = "msg.confirm.frames_deleted"
 
@@ -849,6 +864,31 @@ public enum L10n {
     /// 类型化重载：`L10n.fill2(.fmtPresetDiff, a, b)`。理由同 `fill(_:_:)`。
     public static func fill2(_ key: L10nKey, _ first: String, _ second: String) -> String {
         fill2(key.rawValue, first, second)
+    }
+
+    /// 三个占位符的填充。
+    ///
+    /// 现有唯一消费者是采集链路诊断行 `fmt.capture_diag`
+    /// （`相机回调 %d · 已采 %d · 被拒 %d`）—— 这三个数必须**同时**呈现才能
+    /// 判读根因（判读表见 `CameraCapture.swift` 的 `arrivedFrames` 声明处），
+    /// 拆成三行或两个键会让「三个数属于同一时刻的快照」这一语义丢失。
+    ///
+    /// 与 `fill2` 同样**按出现顺序**填入，共用 `replaceFirstPlaceholder` ——
+    /// 同一逻辑不写第二份。
+    public static func fill3(_ key: String, _ first: String,
+                             _ second: String, _ third: String) -> String {
+        var pattern = catalog.resolve(key, for: current)
+        pattern = replaceFirstPlaceholder(in: pattern, with: first)
+        pattern = replaceFirstPlaceholder(in: pattern, with: second)
+        pattern = replaceFirstPlaceholder(in: pattern, with: third)
+        pattern = pattern.replacingOccurrences(of: "%%", with: "%")
+        return pattern
+    }
+
+    /// 类型化重载：`L10n.fill3(.fmtCaptureDiag, a, b, c)`。
+    public static func fill3(_ key: L10nKey, _ first: String,
+                             _ second: String, _ third: String) -> String {
+        fill3(key.rawValue, first, second, third)
     }
 
     /// 未能在源语言表中反查到键的原文集合。

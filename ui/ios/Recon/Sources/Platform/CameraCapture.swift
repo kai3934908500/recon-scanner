@@ -314,6 +314,88 @@ public final class CaptureSession: NSObject {
     private static let queueKey = DispatchSpecificKey<Void>()
 
     // =======================================================================
+    // MARK: - 诊断：相机回调是否还活着（2026-11-02，缺口 AV）
+    // =======================================================================
+    //
+    // ── 为什么需要这个计数 ─────────────────────────────────────────────────
+    //
+    // 真机反馈「一个关键帧都没扫到」，而采集层「只 include C ABI」的分工让
+    // 这个症状有**两种互斥的根因**，且从内核侧完全无法区分：
+    //
+    //   (a) `ARSession.delegate` **被抢占** → `didUpdate frame(:_)` 根本不再被
+    //       调用 → 零帧离开采集层；
+    //   (b) delegate 正常，但**每一帧都被下游拒绝**（RGB 转换失败 / 内核拒绝）。
+    //
+    // 两者的内核表现**完全一样**（`frames_captured` 恒 0），但修法完全不同：
+    // (a) 要修 session/delegate 归属，(b) 要修帧转换。没有这个计数就只能猜。
+    //
+    // 抢占的来源是**本工程自己引入的**：`ARCameraPreview` 把本类的 `session`
+    // 赋给 `ARView.session`。Apple 文档明写「RealityKit automatically creates a
+    // default session **that the view manages**」—— 视图会**管理**它持有的会话，
+    // 包括 delegate。而本类是 ARKit 全设备**唯一**的 `ARSessionDelegate`
+    // （资源所有权铁律：会话归 `CaptureSession` 所有）。
+    //
+    // ── 口径（必须精确，否则诊断会误判）──────────────────────────────────
+    //
+    // 计数点在 `guard !isPaused` **之前** —— 它统计的是「delegate 是否还活着」，
+    // 不是「是否在投递帧」。暂停期间计数**继续增长是正确且期望的**：
+    //   · 暂停时增长 → delegate 活着（暂停生效，只是不投递）；
+    //   · 暂停时停止增长 → delegate 断了（这本身就是缺陷信号）。
+    // 若把计数放在 `isPaused` 判断之后，暂停期的「不增长」就有了两种含义，
+    // 诊断价值消失。
+    //
+    // ── 跨线程 ─────────────────────────────────────────────────────────────
+    //
+    // 写入在 ARKit 串行队列（`didUpdate`），读取在主线程（UI）。用独立锁而非
+    // `sessionQueue`：后者是 `DispatchQueue`（无 getter），且从主线程同步取一个
+    // ARKit 队列会引入排队等待 —— 诊断量不该影响被测对象。
+    private let diagLock = NSLock()
+    private var arrivedFrameCount = 0
+
+    /// 已从 ARKit 到达本类 `didUpdate frame(:_)` 的帧数（**与是否投递内核无关**）。
+    ///
+    /// 判读方式（配合 `FramePipeline.counts`）：
+    /// | 本值 | 内核已采 | 结论 |
+    /// |---|---|---|
+    /// | 0（且非暂停） | 0 | **根因 (a)**：delegate 被抢占，帧根本没到采集层 |
+    /// | 持续增长 | 0 | **根因 (b)**：帧到了但被下游**全部拒绝**（看拒绝原因） |
+    /// | 持续增长 | 增长 | 采集链路正常 |
+    public var arrivedFrames: Int {
+        diagLock.lock()
+        defer { diagLock.unlock() }
+        return arrivedFrameCount
+    }
+
+    /// 重置诊断计数（会话开始 / 停止时调用）。
+    public func resetDiagnostics() {
+        diagLock.lock()
+        arrivedFrameCount = 0
+        diagLock.unlock()
+    }
+
+    /// **重新认领**本对象为 `session.delegate`（幂等）。
+    ///
+    /// ── 为什么必须有这个入口（缺口 AV 的修法）────────────────────────────
+    ///
+    /// 预览视图把会话交给 `ARView` 之后，`ARView` 会按「自己管理会话」的既定
+    /// 行为**改写** `session.delegate`。此时本类不再收到 `didUpdate frame`，
+    /// 采集彻底停摆，而**画面看起来完全正常** —— 这正是「黑屏修好了，却一帧都
+    /// 没采到」的形态（比黑屏更难查：一个看似正常工作的界面）。
+    ///
+    /// 修法不是在预览视图里「顺手设一下」（那样会散落第二个 delegate 赋值点，
+    /// 违反「同一逻辑只写一遍」），而是**把归属声明权收回本类**：
+    /// 预览视图在挂载会话**之后**调用本方法，由本类自己声明归属。
+    ///
+    /// 幂等：已经指向本对象时**不重复赋值**。这很重要 ——
+    /// `ARSession.delegate` 的赋值会触发 ARKit 内部的会话状态同步，无谓的重复
+    /// 赋值在帧回调路径上是纯开销（且会污染「谁改的」的追溯）。
+    public func reclaimSessionDelegate() {
+        if session.delegate !== self {
+            session.delegate = self
+        }
+    }
+
+    // =======================================================================
     // MARK: - 会话生命周期
     // =======================================================================
 
@@ -468,6 +550,16 @@ public final class CaptureSession: NSObject {
 extension CaptureSession: ARSessionDelegate {
 
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        // ── 诊断计数：**必须在 `isPaused` 判断之前**（缺口 AV）──────────────
+        //
+        // 统计「delegate 是否还活着」，而非「是否在投递帧」——理由见
+        // `arrivedFrameCount` 声明处的对照表。放在暂停判断之后会让暂停期的
+        // 「不增长」同时对应「暂停生效」与「delegate 断了」两种含义，
+        // 诊断价值归零。
+        diagLock.lock()
+        arrivedFrameCount &+= 1
+        diagLock.unlock()
+
         // 暂停时不投递（T-14：状态仍是 Capturing，但暂停采帧）。
         guard !isPaused else { return }
 

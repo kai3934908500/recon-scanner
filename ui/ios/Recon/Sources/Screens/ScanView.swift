@@ -101,6 +101,7 @@ public struct ScanView: View {
         VStack(spacing: 0) {
             coverageHeader
             previewArea
+            captureDiagnostics
             if let noticeText {
                 // §1.6：提示条立即出现/立即消失，无动画。
                 InlineNotice(noticeText, level: .warning)
@@ -217,6 +218,59 @@ public struct ScanView: View {
         }
         .padding(.horizontal, ReconMetric.space4)
         .padding(.vertical, ReconMetric.space2)
+    }
+
+    // --- 采集链路诊断行（临时，缺口 AV）----------------------------------
+
+    /// 采集链路每一环的计数：**相机回调 → 已采（成功投递内核）→ 被拒**。
+    ///
+    /// ── 为什么必须有这一行（2026-11-02 真机反馈的直接产物）────────────────
+    ///
+    /// 用户原话：「无论怎么拍我都不知道，它一个关键帧都没扫描到」。这句话
+    /// 描述的是一个**完全静默**的界面：帧没进内核，界面却只显示「采集中」，
+    /// 既没有错误、也没有任何计数变化。
+    ///
+    /// 拆开看，「一帧都没采到」有**两种互斥根因**，而它们在界面与内核上
+    /// **表现完全一样**（`frames_captured` 恒 0）：
+    ///
+    ///   (a) `ARSession.delegate` 被 `ARView` 抢走 → `didUpdate frame` 根本不
+    ///       被调用 → **相机回调 = 0**；
+    ///   (b) delegate 正常，但每帧都被下游拒绝（RGB 转换失败 / 内核拒绝）
+    ///       → **相机回调在涨、已采恒 0、被拒在涨**。
+    ///
+    /// 三个数并排就能判读（不需要真机日志）：
+    ///
+    /// | 相机回调 | 已采 | 被拒 | 结论 |
+    /// |---|---|---|---|
+    /// | 0 | 0 | 0 | 根因 (a)：delegate 被抢，帧没到采集层 |
+    /// | 涨 | 0 | 涨 | 根因 (b)：帧到了但全被拒（看 `FramePipeline` 拒绝原因） |
+    /// | 涨 | 涨 | — | 采集链路正常 |
+    ///
+    /// ⚠️ **仅 `Capturing` 态显示**，且是**临时诊断通道** —— 采集链路稳定后
+    /// 连同 `fmt.capture_diag` 键一起移除（已随缺口 AV 登记于
+    /// `.workbuddy/memory/CONTRACTS.md` §D5，并注明「临时」）。
+    /// 不显示于 `Previewing`：那时还没开始采，三个数必然是 0，显示只会误导。
+    @ViewBuilder
+    private var captureDiagnostics: some View {
+        if isCapturing {
+            SpecText(L10n.fill3(.fmtCaptureDiag,
+                                MonoNumber.group(controller.cameraCallbackFrames),
+                                MonoNumber.group(session.capturedFrames),
+                                MonoNumber.group(controller.rejectedFrameCount)),
+                     spec: ReconFont.caption2,
+                     color: ReconColor.txtTertiary,
+                     mono: true,
+                     // ⚠️ `maxLines: 2`：三个 5 位数字 + 中文标签会超过
+                     //    `SpecText` 单行 40 半角字符的截断线（§1.4），
+                     //    默认 `maxLines: 1` 会把「被拒 N」截掉 —— 而那个数
+                     //    恰是判读根因 (b) 的关键，不能被截。
+                     maxLines: 2,
+                     // 诊断串不是产品文案，不受 §1.4 的 40 字符限制约束
+                     // （那条例针对「界面文案」；本行是临时诊断通道）。
+                     applyCharLimit: false)
+                .padding(.horizontal, ReconMetric.space4)
+                .padding(.vertical, ReconMetric.space1)
+        }
     }
 
     // --- 预览主体（§1.4：文字一律放 scrim 上，纯色遮罩，禁止模糊）---------
