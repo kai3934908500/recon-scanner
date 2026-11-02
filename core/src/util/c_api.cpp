@@ -12,12 +12,14 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "recon/context.h"
 #include "recon/exporter.h"
 #include "recon/orchestrator.h"
 #include "recon/params.h"
 #include "recon/png_encoder.h"
+#include "recon/preview_mesh.h"
 #include "recon/recon_c_api.h"
 #include "recon/scale_calibration.h"
 
@@ -379,6 +381,58 @@ RECON_API recon_status recon_get_mesh_info(void* context, recon_mesh_info* out_i
   Context* ctx = ToContext(context);
   return recon::Guard([&]() {
     *out_info = ctx->mesh_info();
+    return RECON_OK;
+  });
+}
+
+RECON_API recon_status recon_get_preview_mesh(void* context,
+                                              uint32_t max_triangles,
+                                              recon_preview_mesh* out_mesh) {
+  if (context == nullptr || out_mesh == nullptr) return RECON_ERR_INVALID_ARGUMENT;
+  // 先清零：任何失败路径下 out_mesh 都是「全 NULL / 全 0」，可安全重复调用，
+  // 也不会把调用方栈上的垃圾指针当成待释放缓冲。
+  *out_mesh = recon_preview_mesh{};
+  Context* ctx = ToContext(context);
+  return recon::Guard([&]() {
+    const recon::TriangleMesh& mesh = ctx->orchestrator().mesh();
+    if (mesh.positions.empty() || mesh.indices.size() < 3) {
+      // 无几何 —— 与 recon_export 对同一情形的处理**一致**（不复用第二个语义，
+      // 也不新增错误码：docs/01 §1.3 规定新增错误码须先在 §4 登记）。
+      return RECON_ERR_MESH_POISSON_FAILED;
+    }
+
+    // 抽稀与重映射逻辑在 core/src/mesh/preview_mesh.cpp（同一逻辑只写一遍）；
+    // 本层只负责取网格、分配缓冲、移交所有权。
+    recon::PreviewBuildResult built =
+        recon::BuildPreviewMesh(mesh, max_triangles);
+    if (!built.ok) return RECON_ERR_INTERNAL;  // 索引越界 = 网格数据损坏
+
+    const recon::PreviewMesh& pm = built.mesh;
+    const size_t pos_bytes = pm.positions.size() * sizeof(float);
+    const size_t idx_bytes = pm.indices.size() * sizeof(uint32_t);
+
+    float* pos_buf = nullptr;
+    uint32_t* idx_buf = nullptr;
+    if (pos_bytes > 0) {
+      pos_buf = static_cast<float*>(std::malloc(pos_bytes));
+      if (pos_buf == nullptr) return RECON_ERR_OUT_OF_MEMORY;
+      std::memcpy(pos_buf, pm.positions.data(), pos_bytes);
+    }
+    if (idx_bytes > 0) {
+      idx_buf = static_cast<uint32_t*>(std::malloc(idx_bytes));
+      if (idx_buf == nullptr) {
+        std::free(pos_buf);  // 不泄漏已分配的前一半
+        return RECON_ERR_OUT_OF_MEMORY;
+      }
+      std::memcpy(idx_buf, pm.indices.data(), idx_bytes);
+    }
+
+    out_mesh->vertex_count = static_cast<uint32_t>(pm.vertex_count());
+    out_mesh->triangle_count = static_cast<uint32_t>(pm.triangle_count());
+    out_mesh->source_triangle_count = pm.source_triangle_count;
+    out_mesh->decimation_step = pm.decimation_step;
+    out_mesh->positions = pos_buf;
+    out_mesh->indices = idx_buf;
     return RECON_OK;
   });
 }

@@ -478,16 +478,13 @@ def main() -> int:
                 # 那一类。缺了它，本闸门对缺口 AC 完全无覆盖（改回「不上报」
                 # 也不会有任何闸门报错，即 #109 同款检测盲区）。
                 "recon_set_probe_data"}
-    # 豁免：头文件里声明了、但**当前没有任何 C ABI 函数产出对应资源**，
-    # 故平台层无处调用。豁免必须带理由，且由下方 `dangling_declared` 的
-    # 反向校验守住 —— 一旦 core 真的新增了返回缓冲区的函数，本豁免应立刻失效
-    # （届时闸门会要求实现用它），不会静默过期。
-    exempt = {
-        "recon_free_buffer":
-            "无当前生产者：唯一返回 core 分配内存的函数是 recon_export_params"
-            "（char* → recon_free_string）。头文件 §所有权段落属**预留**声明，"
-            "待将来出现返回缓冲区的 ABI 函数时启用（届时删除本豁免并实现）。",
-    }
+    # 豁免表：2026-11-02 起为**空**。
+    #   `recon_free_buffer` 曾是唯一豁免项（理由：无当前生产者）。该条件已由
+    #   `recon_get_preview_mesh`（返回 `positions` + `indices` 两块 core 分配缓冲）
+    #   满足，故豁免**已删除**，两端必须真实调用它释放预览缓冲。
+    #   保留空字典而非删除变量 —— 使「新增豁免必须写明理由」的结构仍在，
+    #   并被下方反向校验守住。
+    exempt: dict[str, str] = {}
     dangling_declared = sorted(declared - all_calls - set(exempt))
     if dangling_declared:
         failures.append(
@@ -497,20 +494,41 @@ def main() -> int:
         print(f"[platform-parity] C ABI 声明覆盖无悬空："
               f"{len(declared) - len(exempt)} 项（豁免 {len(exempt)} 项）✓")
 
-    # 豁免有效性反向校验：若头文件里出现了返回 core 分配缓冲区的 out 参数
-    # （`void**` / `uint8_t**` 等），则 `recon_free_buffer` 的豁免**已过期**，
-    # 必须实现它。用 `out_context` 是唯一合法的 `void**`（生命周期句柄，
-    # 由 `recon_destroy` 回收，不经 free_buffer）。
+    # 豁免有效性反向校验：若头文件里出现了返回 core 分配缓冲区的出口，
+    # 则 `recon_free_buffer` 的豁免**已过期**，必须实现它。
+    #
+    # 出口有两种形态，**两种都要认**（2026-11-02 修正）：
+    #   ① 函数参数里的 out 指针：`void** out_buf` / `uint8_t** out_buf`；
+    #   ② **POD 结构体里的缓冲指针字段**：`float* positions;` / `uint32_t* indices;`
+    #      —— `recon_get_preview_mesh` 就属这一类。
+    #
+    # 旧版本只认 ①，于是 ② 形态的缓冲区生产者会**永远绕过**本校验，
+    # 使 `recon_free_buffer` 的豁免永不失效（假闸门）。修法：把
+    # 「以字节指针类型声明的成员/参数」一并纳入扫描。
+    #   · `out_context` 是唯一合法的 `void**`（生命周期句柄，由 recon_destroy 回收）；
+    #   · `const uint8_t* / const char*` 等**输入**缓冲不构成生产者（由调用方持有），
+    #     故排除带 `const` 的声明。
     hdr = strip_comments(read(REPO / "core" / "include" / "recon" / "recon_c_api.h"))
+    # ① out 参数（`**` 双指针）
     buf_outs = [m for m in re.findall(r"\b(uint8_t|void|unsigned\s+char)\s*\*\*\s*(\w+)", hdr)
                 if m[1] != "out_context"]
-    if buf_outs and "recon_free_buffer" in exempt:
+    # ② 结构体成员里的单重指针（非 const → 是「产出的」而非「传入的」）
+    member_ptrs = re.findall(
+        r"(?<!const\s)\b(float|double|uint8_t|uint16_t|uint32_t|uint64_t|int32_t|void)\s*\*\s*(\w+)\s*;",
+        hdr)
+    member_ptrs = [m for m in member_ptrs if m[1] != "out_context"]
+    producers = [f"{t}* {n}" for t, n in buf_outs] + [f"{t}* {n}" for t, n in member_ptrs]
+    if producers and "recon_free_buffer" in exempt:
         failures.append(
-            f"recon_free_buffer 的豁免已过期：头文件出现返回缓冲区的 out 参数 "
-            f"{buf_outs} —— 请实现 recon_free_buffer 并删除豁免")
+            f"recon_free_buffer 的豁免已过期：头文件出现返回缓冲区的出口 "
+            f"{producers} —— 请实现 recon_free_buffer 并删除豁免")
+    elif producers:
+        # 有生产者且无豁免 —— 正常态（2026-11-02 起）。
+        print(f"[platform-parity] recon_free_buffer 有真实生产者 "
+              f"（{len(producers)} 处：{', '.join(producers)}），无豁免 ✓")
     else:
-        print("[platform-parity] recon_free_buffer 豁免仍有效"
-              "（core 暂无缓冲区生产者）✓")
+        print("[platform-parity] recon_free_buffer 无生产者"
+              "（core 当前不返回任何 buffer）✓")
 
     # --- 闸门 8：平台无关逻辑**只允许一份实现**（防「同一逻辑写两遍必然漂移」）---
     #

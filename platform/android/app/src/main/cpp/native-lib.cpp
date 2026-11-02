@@ -535,6 +535,80 @@ Java_com_recon_scan_NativeBridge_cancel(JNIEnv*, jobject, jlong context) {
   return static_cast<jint>(recon_cancel(reinterpret_cast<void*>(context)));
 }
 
+// 预览网格（docs/09 §3.7 U-R-1..U-R-4）。**必须与 iOS 侧对等** ——
+// 否则平台对等闸门（check_platform_parity.py 闸门 7）会报
+// 「iOS 调用了 Android 未调用的 core 函数」。
+//
+// 返回布局（jobjectArray，共 4 项）：
+//   [0] float[]  positions（XYZ 交错，长度 = 3*vertex_count）
+//   [1] int[]    indices  （每 3 个一三角面，长度 = 3*triangle_count）
+//   [2] double[] meta     （[0]=source_triangle_count, [1]=decimation_step）
+//   [3] null 占位（保持数组定长，便于 Kotlin 侧按固定下标取用）
+//
+// 返回 null 表示「尚未重建 / 分配失败」—— 与 iOS 的 `previewMesh()` 返回 nil 对等。
+//
+// 所有权：`recon_get_preview_mesh` 返回的两块缓冲由 core 分配，本层拷贝进
+// Java 数组后**立即**用 `recon_free_buffer` 释放（两个缓冲各自独立释放）。
+JNIEXPORT jobjectArray JNICALL
+Java_com_recon_scan_NativeBridge_getPreviewMesh(
+    JNIEnv* env, jobject, jlong context, jint max_triangles) {
+  if (context == 0) return nullptr;
+  recon_preview_mesh mesh;
+  std::memset(&mesh, 0, sizeof(mesh));
+  if (recon_get_preview_mesh(reinterpret_cast<void*>(context),
+                             static_cast<uint32_t>(max_triangles), &mesh) != RECON_OK) {
+    return nullptr;
+  }
+  // 从此刻起任何提前返回都必须释放缓冲 —— 用哨兵统一收尾，避免漏释放。
+  jobjectArray out = nullptr;
+  do {
+    if (mesh.positions == nullptr || mesh.indices == nullptr ||
+        mesh.vertex_count == 0 || mesh.triangle_count == 0) {
+      break;  // 半成品：不交给 UI（不静默降级）
+    }
+    const jsize pos_len = static_cast<jsize>(mesh.vertex_count) * 3;
+    const jsize idx_len = static_cast<jsize>(mesh.triangle_count) * 3;
+
+    jfloatArray pos = env->NewFloatArray(pos_len);
+    if (pos == nullptr) break;
+    env->SetFloatArrayRegion(pos, 0, pos_len, mesh.positions);
+
+    jintArray idx = env->NewIntArray(idx_len);
+    if (idx == nullptr) break;
+    // uint32 indices：本项目的顶点数不可能达到 int32 溢出量级（预览还会抽稀），
+    // 故转 int 安全；此处显式转换而非 memcpy，避免端序/宽度假设。
+    std::vector<jint> tmp(static_cast<size_t>(idx_len));
+    for (jsize k = 0; k < idx_len; ++k) {
+      tmp[static_cast<size_t>(k)] = static_cast<jint>(mesh.indices[k]);
+    }
+    env->SetIntArrayRegion(idx, 0, idx_len, tmp.data());
+
+    jdoubleArray meta = env->NewDoubleArray(2);
+    if (meta == nullptr) break;
+    const jdouble meta_vals[2] = {
+        static_cast<jdouble>(mesh.source_triangle_count),
+        static_cast<jdouble>(mesh.decimation_step)};
+    env->SetDoubleArrayRegion(meta, 0, 2, meta_vals);
+
+    jclass obj_cls = env->FindClass("java/lang/Object");
+    if (obj_cls == nullptr) break;
+    out = env->NewObjectArray(4, obj_cls, nullptr);
+    if (out == nullptr) break;
+    env->SetObjectArrayElement(out, 0, pos);
+    env->SetObjectArrayElement(out, 1, idx);
+    env->SetObjectArrayElement(out, 2, meta);
+    // [3] 留 null。
+  } while (false);
+
+  if (mesh.positions != nullptr) {
+    recon_free_buffer(mesh.positions, static_cast<size_t>(mesh.vertex_count) * 3 * sizeof(float));
+  }
+  if (mesh.indices != nullptr) {
+    recon_free_buffer(mesh.indices, static_cast<size_t>(mesh.triangle_count) * 3 * sizeof(uint32_t));
+  }
+  return out;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_recon_scan_NativeBridge_isCancelled(JNIEnv*, jobject, jlong context) {
   if (context == 0) return 0;

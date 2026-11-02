@@ -297,6 +297,13 @@ public final class ReconSessionController: ObservableObject {
     @Published public private(set) var outcome: ReconOutcome = .running
     /// 重建结果摘要；`nil` 表示尚未产出。
     @Published public private(set) var result: ReconResultSummary?
+
+    /// 预览网格几何（docs/09 §3.7 U-R-1..U-R-4）。
+    ///
+    /// 由 `ReconCore.previewMesh()` 在重建收尾时一次性取得 —— **UI 层不做
+    /// 任何文件 IO / 几何计算**（docs/09 §1）；渲染器只消费这里已有的顶点与索引。
+    /// `nil` 表示尚未重建或核心无几何，UI 显示 `resultPreviewPending`。
+    @Published public private(set) var previewMesh: ReconCore.PreviewMesh?
     /// 最近一次内核调用的状态（**不静默吞错**：即便有专用文案，原码仍在此）。
     @Published public private(set) var lastStatus: ReconStatus = .ok
     /// 设备能力（`recon_probe_capability`）。
@@ -1075,6 +1082,9 @@ public final class ReconSessionController: ObservableObject {
         switch status {
         case .ok:
             result = core?.meshInfo().map(ReconResultSummary.init)
+            // 预览几何：与 result 同时取，保证「有统计必有几何」。
+            // UI 只读本属性，不做任何文件 IO / 几何计算（docs/09 §1）。
+            previewMesh = core?.previewMesh()
             outcome = .succeeded
             session.send(.reconstructionSucceeded)
             updateCurrentRecord(summary: result, interrupted: false)

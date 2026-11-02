@@ -20,8 +20,14 @@
   闸门 7 C ABI 声明覆盖无悬空（防「两端一起漏」）
       · 两端同时删掉 recon_get_param 的调用 → 闸门须报「悬空声明」
         （若只有闸门 4，两端一致地漏实现会**静默通过** —— 这正是本判据要堵的洞）
-  闸门 8 recon_free_buffer 豁免有效性
+      · 两端同时删掉 recon_free_buffer 的调用 → 须报「悬空声明」
+        （2026-11-02 起 free_buffer 有真实生产者 recon_get_preview_mesh，
+         豁免已删除；该注入证明「两端一起漏释放」会被拦下）
+  闸门 7b recon_free_buffer 豁免失效条件（2026-11-02 起豁免为空）
       · 给头文件加一个返回缓冲区的 out 参数 → 闸门须报「豁免已过期」
+        ⚠️ 该注入在**豁免非空时**才可能触发；豁免已删后，此形态改由
+        闸门 7 的悬空声明覆盖（见上一条）。本注入保留并**改为断言**：
+        头文件出现缓冲区出口且平台层未调用时，闸门必须失败 —— 否则报假判据。
   闸门 8 平台无关逻辑单实现（第三十五轮新增）
       · 在 iOS 的 IMUWindow.swift 重写一份切窗循环 → 闸门须报「疑似重写 IMU 切窗」
       · 在 Android 的 CaptureActivity.kt 重写一份深度换算 → 须报「疑似重写深度
@@ -269,16 +275,42 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "      )")],
     ),
     (
-        "P8-a-exempt-stale",
-        "给头文件加一个返回缓冲区的 out 参数 → free_buffer 豁免过期须报错",
-        "豁免已过期",
-        [(C_API_HEADER,
-          "RECON_API recon_status recon_get_mesh_info(void* context,\n"
-          "                                           recon_mesh_info* out_info);",
-          "RECON_API recon_status recon_get_mesh_info(void* context,\n"
-          "                                           recon_mesh_info* out_info);\n"
-          "RECON_API recon_status recon_get_preview_blob(void* context,\n"
-          "                                               uint8_t** out_buffer);")],
+        "P8-a-free-buffer-asymmetry",
+        "两端释放调用不对称：删掉 iOS 侧两处 recon_free_buffer → 闸门须报"
+        "「Android 调用了 iOS 未调用的 core 函数」"
+        "（2026-11-02 起 free_buffer 的唯一生产者是 recon_get_preview_mesh，"
+        "豁免已删除。闸门 4 会先抓到不对称 —— 证明两端**必须都释放**；"
+        "原 P8-a-exempt-stale 押「豁免已过期」，在豁免为空后恒不触发，属假判据，已替换）",
+        "Android 调用了 iOS 未调用的 core 函数",
+        [(IOS_CORE_SWIFT,
+          "                recon_free_buffer(UnsafeMutableRawPointer(p), raw.vertex_count > 0\n"
+          "                    ? Int(raw.vertex_count) * 3 * MemoryLayout<Float>.size : 0)\n",
+          ""),
+         (IOS_CORE_SWIFT,
+          "                recon_free_buffer(UnsafeMutableRawPointer(i), raw.triangle_count > 0\n"
+          "                    ? Int(raw.triangle_count) * 3 * MemoryLayout<UInt32>.size : 0)\n",
+          "")],
+    ),
+    (
+        "P8-b-free-buffer-both-missing",
+        "两端**同时**不释放：iOS 删两处 + Android 删一处 → 闸门须报「悬空声明」"
+        "（这是闸门 7 的**独立**价值：闸门 4 只查两端是否一致，"
+        "两端一致地漏掉会静默通过 —— 本注入正是为堵这个洞）",
+        "悬空声明",
+        [(IOS_CORE_SWIFT,
+          "                recon_free_buffer(UnsafeMutableRawPointer(p), raw.vertex_count > 0\n"
+          "                    ? Int(raw.vertex_count) * 3 * MemoryLayout<Float>.size : 0)\n",
+          ""),
+         (IOS_CORE_SWIFT,
+          "                recon_free_buffer(UnsafeMutableRawPointer(i), raw.triangle_count > 0\n"
+          "                    ? Int(raw.triangle_count) * 3 * MemoryLayout<UInt32>.size : 0)\n",
+          ""),
+         (NATIVE_CPP,
+          "    recon_free_buffer(mesh.positions, static_cast<size_t>(mesh.vertex_count) * 3 * sizeof(float));\n",
+          ""),
+         (NATIVE_CPP,
+          "    recon_free_buffer(mesh.indices, static_cast<size_t>(mesh.triangle_count) * 3 * sizeof(uint32_t));\n",
+          "")],
     ),
     # --- 闸门 10：能力事实上报的**字段级**三端对等（缺口 AC，第四十轮新增）----
     #

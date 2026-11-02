@@ -728,6 +728,59 @@ final class ReconCore {
         )
     }
 
+    // MARK: - 预览网格（docs/09 §3.7 U-R-1..U-R-4）
+
+    /// 预览网格：位置（Float，XYZ 交错）+ 索引（UInt32，每 3 个一三角面）。
+    ///
+    /// 这是 UI 层能做线框渲染的**唯一**几何来源 —— 满足 docs/09 §1
+    /// 「UI 层禁止任何文件 IO / 几何计算」：数据由 core 算好，本层只搬运。
+    struct PreviewMesh {
+        var positions: [Float] = []
+        var indices: [UInt32] = []
+        var sourceTriangleCount: UInt32 = 0
+        /// 抽稀步长 N（1 = 未抽稀）。UI 可据此如实显示「预览已降采样」。
+        var decimationStep: UInt32 = 1
+        /// 每次装载的唯一标识 —— 供 SwiftUI 的 `onChange` 判断「几何确实换了」。
+        /// 仅比较面数不够：两次重建可能面数相同而形状不同。
+        var loadID = UUID()
+    }
+
+    /// 读取预览网格。`maxTriangles == 0` 时使用核心默认上限（200 万，U-R-2）。
+    ///
+    /// 所有权：`recon_get_preview_mesh` 返回的 `positions` / `indices` 由 core
+    /// 分配，**必须**用 `recon_free_buffer` 释放。本方法在拷贝进 Swift 数组后
+    /// 立即释放，两个缓冲各自独立释放（`recon_preview_mesh` 注释）。
+    /// 失败（尚未重建）返回 `nil`，由 UI 显示 `resultPreviewPending`。
+    func previewMesh(maxTriangles: UInt32 = 0) -> PreviewMesh? {
+        guard let h = handle else { return nil }
+        var raw = recon_preview_mesh()
+        guard ReconCore.isOK(recon_get_preview_mesh(h, maxTriangles, &raw)) else {
+            return nil
+        }
+        // 防御：核心承诺成功时两缓冲非空；若不满足，先释放再返回 nil，
+        // 不把半成品交给 UI（不静默降级）。
+        defer {
+            if let p = raw.positions {
+                recon_free_buffer(UnsafeMutableRawPointer(p), raw.vertex_count > 0
+                    ? Int(raw.vertex_count) * 3 * MemoryLayout<Float>.size : 0)
+            }
+            if let i = raw.indices {
+                recon_free_buffer(UnsafeMutableRawPointer(i), raw.triangle_count > 0
+                    ? Int(raw.triangle_count) * 3 * MemoryLayout<UInt32>.size : 0)
+            }
+        }
+        guard let p = raw.positions, let idx = raw.indices,
+              raw.vertex_count > 0, raw.triangle_count > 0 else {
+            return nil
+        }
+        var mesh = PreviewMesh()
+        mesh.positions = Array(UnsafeBufferPointer(start: p, count: Int(raw.vertex_count) * 3))
+        mesh.indices = Array(UnsafeBufferPointer(start: idx, count: Int(raw.triangle_count) * 3))
+        mesh.sourceTriangleCount = raw.source_triangle_count
+        mesh.decimationStep = raw.decimation_step
+        return mesh
+    }
+
     // MARK: - 导出与控制
 
     @discardableResult

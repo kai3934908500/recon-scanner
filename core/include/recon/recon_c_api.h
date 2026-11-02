@@ -323,6 +323,35 @@ typedef struct recon_mesh_info {
     uint32_t degraded;                 /**< 是否处于降级态 */
 } recon_mesh_info;
 
+/**
+ * 预览网格。供 UI 层线框渲染使用（docs/09 §3.7 U-R-1..U-R-4）。
+ *
+ * 设计与所有权：
+ *   - 与 `recon_mesh_info`（只报**统计**）互补 —— 本结构体携带**几何本体**，
+ *     使 UI 层无需任何文件 IO、无需解析任何中间文件即可拿到可渲染坐标。
+ *     这与 docs/09 §1「UI 层禁止做任何几何/图像计算、任何文件 IO 决策」一致。
+ *   - `positions` / `indices` 由**核心分配**，调用方使用后必须用
+ *     `recon_free_buffer(ptr, bytes)` 释放（两个缓冲互不相关，各自释放）。
+ *   - 坐标：**float32，XYZ 交错**，单位与 `recon_mesh_info` 同源 —— 即核心
+ *     内部网格坐标（**未施加** `scale_factor`）。预览用于肉眼检查**形状**，
+ *     等比缩放不改变形状；此处**刻意不复刻**导出路径的尺度语义，
+ *     以免新增第三种解释（见 docs/01 §4 缺口 AJ 登记）。
+ *   - `indices` 为 `uint32_t`，每 3 个构成一个三角面。
+ *
+ * 降采样（U-R-2）：当网格三角面数 > `max_triangles` 时，按**确定性**步长
+ * N = ceil(原面数 / max_triangles) 每 N 个面抽 1 个，只影响本结构体，
+ * **不写回**核心网格、不影响导出。`decimation_step` 如实回报所用步长
+ * （1 表示未降采样），UI 可据此显示「预览已降采样」。
+ */
+typedef struct recon_preview_mesh {
+    uint32_t  vertex_count;          /**< 返回的顶点数 */
+    uint32_t  triangle_count;        /**< 返回的三角面数 */
+    uint32_t  source_triangle_count; /**< 降采样前的原始三角面数 */
+    uint32_t  decimation_step;       /**< 抽稀步长 N（1 = 未降采样） */
+    float*    positions;             /**< 3*vertex_count 个 float，XYZ 交错 */
+    uint32_t* indices;               /**< 3*triangle_count 个 uint32 */
+} recon_preview_mesh;
+
 /** 尺度标定结果。 */
 typedef struct recon_scale_result {
     int32_t  ok;
@@ -533,6 +562,29 @@ RECON_API recon_status recon_set_manual_scale(void* context,
 /** 读取网格信息。重建成功后有效。 */
 RECON_API recon_status recon_get_mesh_info(void* context,
                                            recon_mesh_info* out_info);
+
+/**
+ * 读取预览网格几何（线框渲染用，docs/09 §3.7）。
+ *
+ * `max_triangles`：本次希望返回的**上限**三角面数。传 0 表示使用核心默认
+ * 上限（当前 2,000,000，与 docs/09 U-R-2 的阈值一致）。超过上限时按确定性
+ * 步长抽稀（见 `recon_preview_mesh` 注释），不写回网格、不影响导出。
+ *
+ * 返回：
+ *   - `RECON_OK`：`out_mesh` 已填充；即便降采样也会带回 `decimation_step`；
+ *   - `RECON_ERR_INVALID_ARGUMENT`：context / out_mesh 为 NULL；
+ *   - `RECON_ERR_MESH_POISSON_FAILED`：核心当前无几何（尚未重建成功）。该
+ *     取值与 `recon_export` 对「无几何」的处理**一致**（不复用第二个语义）；
+ *   - `RECON_ERR_OUT_OF_MEMORY`：缓冲区分配失败（此时 `out_mesh` 已被清零，
+ *     调用方无需释放）。
+ *
+ * 所有权：成功后 `out_mesh->positions` 与 `out_mesh->indices` 由核心分配，
+ * 调用方必须各自用 `recon_free_buffer(ptr, bytes)` 释放；二者相互独立。
+ * 失败时 `out_mesh` 被清零（全 NULL / 全 0），可安全重复调用。
+ */
+RECON_API recon_status recon_get_preview_mesh(void* context,
+                                              uint32_t max_triangles,
+                                              recon_preview_mesh* out_mesh);
 
 /* ------------------------------------------------------------------------- */
 /* 导出                                                                      */

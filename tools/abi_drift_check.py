@@ -62,6 +62,10 @@ KNOWN_DRAFT_ONLY_STRUCTS = {
 #   已存在 POD 布局与函数签名（docs/01 §1.3）。
 KNOWN_REAL_ONLY_STRUCTS: set[str] = {
     "recon_probe_data",
+    # `recon_preview_mesh`：2026-11-02 3D 预览新增（见 docs/01 §2 追加裁定）。
+    #   它是**几何本体出口**（UI 线框渲染用），与 `recon_mesh_info`（只报计数）
+    #   互补。POD-only；两个缓冲由 core 分配、调用方用 recon_free_buffer 释放。
+    "recon_preview_mesh",
 }
 
 # 实现独占函数（真实头文件有、草案无）—— 锚点 §2 裁定表格：
@@ -78,6 +82,11 @@ KNOWN_ONLY_REAL_FUNCS = {
     #   「不对称」正是缺口 AC 的存在证据。若哪天它进了交集，说明有人
     #   往草案里补了同名函数，那时应改为递增 ABI 版本并走完整流程。
     "recon_set_probe_data",
+    # 2026-11-02 3D 预览：把网格几何（位置 + 索引）交给 UI 层，使 UI 无需任何
+    #   文件 IO 即可线框渲染（docs/09 §1 禁止 UI 做文件 IO / 几何计算）。
+    #   草案里同样没有对应函数（草案的 recon_get_mesh_attribute 只覆盖「逐属性
+    #   读取」的名义能力，且本函数也只覆盖位置+索引，故两者并存不冲突）。
+    "recon_get_preview_mesh",
 }
 # 草案独占函数（真实头文件无）—— 锚点 §2 裁定 A/B/C 三类：
 KNOWN_ONLY_DOC_FUNCS = {
@@ -275,6 +284,39 @@ def extract_anchor_numbers(doc01: pathlib.Path) -> dict[str, int]:
     return got
 
 
+def extract_prose_counts(doc01: pathlib.Path) -> list[tuple[str, int]]:
+    """从锚点**散文**里解析计数声明（缺口 AQ）。
+
+    为什么必须有这一条：`extract_anchor_numbers` 只认**表格行**与少数固定句式
+    （`交集大小 = N` / `草案独占的 **N** 个函数`）。而「23 函数」「only-real 9」
+    「23/37/交集 14/独占 23」这类数字散落在**正文句子**里 —— 新增 ABI 时若只改
+    表格行、漏改散文，闸门**照样 rc=0**（2026-11-02 实测踩到：新增
+    `recon_get_preview_mesh` 后，docs/01 里三处散文计数仍停在旧值 22/8）。
+    与缺口 AN 同型：**同一事实的多个副本，只有一处被守**。
+
+    返回 [(出现的原文片段, 该片段声明的数字), ...]，由调用方与实测集合比对。
+    """
+    text = _read(doc01)
+    out: list[tuple[str, int]] = []
+
+    # ① 「（N 函数）」—— 裁定句 + §2.3 表头两处都写真实头文件函数数。
+    for m in re.finditer(r"[（(](\d+)\s*函数[）)]", text):
+        out.append((f"（{m.group(1)} 函数）", int(m.group(1))))
+
+    # ② 「only-real N」/「only-doc N」—— 分歧规模，必须等于 only-real 集合大小。
+    for tag in ("only-real", "only_doc", "only-doc"):
+        for m in re.finditer(re.escape(tag) + r"\s*(\d+)", text):
+            out.append((f"{tag} {m.group(1)}", int(m.group(1))))
+
+    # ③ 「N/37/交集 M/独占 K」—— 闸门判据说明书里复述的锚点数字。
+    m = re.search(r"声明的\s*(\d+)\s*/\s*(\d+)\s*/\s*交集\s*(\d+)\s*/\s*独占\s*(\d+)", text)
+    if m:
+        out.append((f"锚点声明 {m.group(1)}/37", int(m.group(1))))
+        out.append((f"锚点声明 交集 {m.group(3)}", int(m.group(3))))
+        out.append((f"锚点声明 独占 {m.group(4)}", int(m.group(4))))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 检查
 # ---------------------------------------------------------------------------
@@ -353,6 +395,65 @@ def run(args: argparse.Namespace) -> int:
                 )
     else:
         warnings.append("未能在锚点中解析出声明数字，跳过数量交叉核对")
+
+    # --- 检查 2b：锚点**散文**计数对账（缺口 AQ，2026-11-02 实测新增） -------
+    # 为什么必须有这一条：检查 2 只认**表格行**（`函数总数 | **37** | **23**`）
+    # 与 `交集大小 = N` 等固定句式；而「（23 函数）」「only-real 9」
+    # 「23/37/交集 14/独占 23」这些计数**散落在正文句子里**。新增 ABI 时若只改
+    # 表格行、漏改散文 → 检查 2 rc=0 但文档已漂移。本次新增
+    # `recon_get_preview_mesh` 后实测踩到（docs/01 三处散文仍停在 22/8）。
+    # 与缺口 AN 同型 —— 同一事实的多个副本只守一处。此判据把它们全部纳入。
+    prose = extract_prose_counts(doc01)
+    # 反空约束：判据**必须**能取到锚点，否则「正则没命中」会伪装成「全部通过」。
+    # 这是本项目反复强调的「判据恒真是最大风险」在文本闸门上的具体落实。
+    cats = {"func_paren": 0, "only_real": 0, "only_doc": 0, "anchor_repeat": 0}
+    for frag, _ in prose:
+        if re.match(r"^（\d+ 函数）$", frag):
+            cats["func_paren"] += 1
+        elif frag.startswith("only-real"):
+            cats["only_real"] += 1
+        elif frag.startswith("only-doc") or frag.startswith("only_doc"):
+            cats["only_doc"] += 1
+        elif frag.startswith("锚点声明"):
+            cats["anchor_repeat"] += 1
+    missing = [k for k, v in cats.items() if v == 0]
+    if missing:
+        errors.append(
+            f"锚点散文计数对账未能取到这些类别 {missing} —— 要么 docs/01 改写导致"
+            f"判据失锚（判据会静默退化为恒真），要么锚点段落被删。请检查 docs/01 "
+            f"§2 裁定段是否仍含「（N 函数）」「only-real N」「only-doc N」"
+            f"「锚点声明的 N/37/交集 M/独占 K」四类表述"
+        )
+    else:
+        # 片段 → 该片段应当等于哪个实测集合大小。
+        prose_expect = [
+            ("函数", len(real)),      # 「（N 函数）」= 真实头文件函数总数
+            ("only-real", len(only_real)),
+            ("only-doc", len(only_doc)),
+            ("only_doc", len(only_doc)),
+            ("/37", len(real)),       # 「锚点声明的 N/37/…」的首个数字
+            ("交集", len(inter)),
+            ("独占", len(only_doc)),
+        ]
+        prose_bad: list[str] = []
+        for frag, n in prose:
+            for tag, want in prose_expect:
+                if tag in frag and n != want:
+                    prose_bad.append(f"{frag}（声明 {n}，实测 {want}）")
+                    break
+        # 去重（同一片段可能在文档里出现两次，报两次无意义）
+        seen: set[str] = set()
+        prose_bad = [x for x in prose_bad if not (x in seen or seen.add(x))]
+        if prose_bad:
+            errors.append(
+                f"锚点**散文**计数与实测不符 {prose_bad} —— 新增/删除 ABI 时必须"
+                f"同步更新 docs/01 正文里的计数（缺口 AQ：只改表格行不够）"
+            )
+        else:
+            print(
+                f"[abi-drift] 锚点散文计数对账通过（{len(prose)} 处："
+                f"（N 函数）/ only-real / only-doc / N/37/交集/独占）✓"
+            )
 
     # --- 检查 2：下游文档不得引用「草案独占」函数 --------------------------
     # （裁定明确：UI 侧不得假设这些函数存在）

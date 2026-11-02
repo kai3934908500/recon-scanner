@@ -48,8 +48,10 @@
 //  「✓/!」）。它**只呈现能真实判定的那一项**：S1「关键帧总数」，其数据来源
 //  `recon_scan_stats.keyframes` 是**真实可读**的（`orchestrator.cpp:537`
 //  在阶段 1 末尾写入）。其余 13 项**显式标注为「未接入」**并说明原因，
-//  与 `ResultView` 的 `WireframePlaceholder`（`线框预览尚未接入…`）
+//  与 `ResultView` 曾经的 `WireframePlaceholder`（`线框预览尚未接入…`）
 //  同一方针 ——「宁可如实告知功能未接入，也不画一个假结果」。
+//  （注：`WireframePlaceholder` 已于 2026-11-02 被**真实 Metal 线框渲染**
+//   `WireframePreview` 取代；本页的 13 项仍按同一方针如实标注未接入。）
 //
 
 import SwiftUI

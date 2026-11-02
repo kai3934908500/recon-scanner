@@ -5,11 +5,13 @@
 //  契约：docs/09_UI规格.md §3.7（线框图、元素表、U-R-1..U-R-4 预览技术约束）、
 //       §5.5 R-08/R-09/R-10（拓扑/纹理警告）、§1.4（数值等宽右对齐千分位）。
 //
-//  ── U-R-1 / U-R-3 的实现边界（诚实声明）────────────────────────────────
+//  ── U-R-1 / U-R-3 的实现边界 ────────────────────────────────────────────
 //  预览只做**线框**渲染，不做材质/光照/阴影/IBL（U-R-1）；旋转**无自动旋转、
-//  无惯性、无阻尼**（U-R-3）。这两条是**渲染层**的约束，本文件只负责声明入口
-//  与保证不加动画修饰符；真正的线框渲染需接入 Metal（shaders/metal/，尚未实现）。
-//  因此预览区当前为**未接入状态**，按 U-D-7 必须显式告知用户，不得静默留白。
+//  无惯性、无阻尼**（U-R-3）。渲染本体在平台层
+//  `platform/ios/Recon/WireframeRenderer.swift`（MTKView + `shaders/metal/
+//  wireframe.metal`），几何由核心经 `recon_get_preview_mesh` 算好
+//  —— 本层**不做几何计算、不做文件 IO**（docs/09 §1）。
+//  2026-11-02：原 `WireframePlaceholder`（显式未接入）已替换为真实渲染。
 //
 
 import SwiftUI
@@ -89,14 +91,17 @@ public struct ResultView: View {
                 // §3.7：加载中显示一行 footnote，**禁止**骨架屏闪烁（U-X-8/U-X-4）。
                 SpecText(L10n.t(.resultPreviewPending), spec: ReconFont.footnote,
                          color: ReconColor.txtSecondary)
+            } else if let mesh = controller.previewMesh, !mesh.positions.isEmpty {
+                // 线框渲染（U-R-1）。几何由核心算好（recon_get_preview_mesh），
+                // 本层只把它交给渲染器 —— 不做几何计算、不做文件 IO（§1）。
+                WireframePreview(mesh: mesh)
             } else {
-                // 线框渲染入口（Metal）。U-R-3：不加任何动画修饰符。
-                WireframePlaceholder()
+                // 有统计但无几何：如实说明，不静默留黑（U-D-7）。
+                SpecText(L10n.t(.resultPreviewPending), spec: ReconFont.footnote,
+                         color: ReconColor.txtSecondary, maxLines: 2)
             }
         }
         .frame(height: 260)
-        // 单指旋转 / 双指缩放由渲染层处理；此处不添加惯性或阻尼动画。
-        .gesture(DragGesture())      // 占位：真实旋转交给 Metal 层，无惯性
     }
 
     // --- 拓扑（§3.7 元素表）-----------------------------------------------
@@ -235,13 +240,71 @@ private struct DimCell: View {
     }
 }
 
-/// 线框渲染占位。真实实现接入 Metal（shaders/metal/）。
-/// 刻意保留为**显式未接入**状态，而不是画一个假网格。
-private struct WireframePlaceholder: View {
+/// 线框预览（U-R-1..U-R-4）。
+///
+/// 渲染本体在 `platform/ios/Recon/WireframeRenderer.swift`（平台层）——
+/// 本视图只做两件事：把核心算好的几何喂给渲染器、把用户手势转成旋转/缩放。
+/// **不做任何几何计算、不做任何文件 IO**（docs/09 §1）。
+///
+/// U-R-3：手势直接改矩阵，**不写惯性、不写阻尼**（无 `.animation`）。
+private struct WireframePreview: View {
+    let mesh: ReconCore.PreviewMesh
+    /// 渲染器（生命周期与视图一致）。
+    @StateObject private var holder = RendererHolder()
+
     var body: some View {
-        SpecText(L10n.t(.resultPreviewPending), spec: ReconFont.footnote,
-                 color: ReconColor.txtSecondary, maxLines: 2)
+        GeometryReader { _ in
+            MetalViewRepresentable(holder: holder)
+        }
+        .onAppear { holder.load(mesh: mesh) }
+        .onChange(of: mesh.loadID) { _ in holder.load(mesh: mesh) }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    // 相邻两帧位移增量 → 旋转（无惯性）。
+                    let dx = Float(v.translation.width - holder.lastDrag.width)
+                    let dy = Float(v.translation.height - holder.lastDrag.height)
+                    holder.lastDrag = v.translation
+                    holder.applyRotation(dx: dx, dy: dy)
+                }
+                .onEnded { _ in holder.lastDrag = .zero }
+        )
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { v in
+                    holder.applyZoom(scale: Float(v / holder.lastZoom))
+                    holder.lastZoom = v
+                }
+                .onEnded { _ in holder.lastZoom = 1.0 }
+        )
     }
+}
+
+/// 持有渲染器。`@StateObject` 需要 `ObservableObject`；渲染器本身是 UIView，
+/// 故用本轻量持有者包一层，避免每次重绘重建 GPU 管线。
+private final class RendererHolder: ObservableObject {
+    var view: WireframeRenderView?
+    var lastDrag: CGSize = .zero
+    var lastZoom: CGFloat = 1.0
+
+    func load(mesh: ReconCore.PreviewMesh) {
+        view?.load(positions: mesh.positions, indices: mesh.indices)
+    }
+    func applyRotation(dx: Float, dy: Float) { view?.applyRotation(deltaX: dx, deltaY: dy) }
+    func applyZoom(scale: Float) { view?.applyZoom(scale: scale) }
+}
+
+/// SwiftUI ↔ UIKit 桥接。
+private struct MetalViewRepresentable: UIViewRepresentable {
+    let holder: RendererHolder
+
+    func makeUIView(context: Context) -> WireframeRenderView {
+        let v = WireframeRenderView(frame: .zero, device: nil)
+        holder.view = v
+        return v
+    }
+
+    func updateUIView(_ uiView: WireframeRenderView, context: Context) {}
 }
 
 // ===========================================================================

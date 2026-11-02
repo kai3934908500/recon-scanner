@@ -170,6 +170,22 @@ object NativeBridge {
     /** 对应 recon_get_mesh_info()。返回 DoubleArray 或 null（布局见 [MeshInfo]）。 */
     external fun getMeshInfo(context: Long): DoubleArray?
 
+    /**
+     * 对应 recon_get_preview_mesh()。预览网格几何，供线框渲染
+     * （docs/09 §3.7 U-R-1..U-R-4）。
+     *
+     * 返回 Array<Any?>?，共 4 项，或 null（尚未重建 / 分配失败）：
+     * - `[0]` `FloatArray` positions（XYZ 交错，长度 = 3×顶点数）
+     * - `[1]` `IntArray`   indices  （每 3 个一三角面，长度 = 3×面数）
+     * - `[2]` `DoubleArray` meta    （`[0]`=抽稀前原始面数，`[1]`=抽稀步长）
+     * - `[3]` `null`（占位，保持定长便于按下标取用）
+     *
+     * `maxTriangles == 0` 时使用核心默认上限（200 万，U-R-2）。
+     * 与 iOS 侧 `ReconCore.previewMesh(maxTriangles:)` **对等** ——
+     * 两端缺一会被平台对等闸门拦下。
+     */
+    external fun getPreviewMesh(context: Long, maxTriangles: Int): Array<Any?>?
+
     // --------------------------------------------------------------------- //
     // 导出与控制                                                              //
     // --------------------------------------------------------------------- //

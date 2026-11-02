@@ -167,6 +167,7 @@ set(RECON_CORE_SOURCES
     core/src/mesh/uv_unwrap.cpp
     core/src/mesh/texture_bake.cpp
     core/src/mesh/poisson_mc.cpp
+    core/src/mesh/preview_mesh.cpp
     core/src/sfm/geometry.cpp
     core/src/sfm/matching.cpp
     core/src/sfm/registration.cpp
@@ -432,6 +433,9 @@ if(RECON_COMPILE_SHADERS AND RECON_PLATFORM_IOS)
       "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/mvs.metal"
       "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/tsdf.metal"
       "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/yuv.metal"
+      # 预览线框渲染（iOS 独有，非双端 compute 算法 —— 故**不**注册进
+      # gpu_algo.h，理由见 shaders/metal/wireframe.metal 文件头）。
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/wireframe.metal"
       "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/gpu_common.h"
       "${RECON_METALLIB_OUT}")
   add_dependencies(recon_shaders_metal recon_metallib)
@@ -663,6 +667,11 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   target_link_libraries(test_uv PRIVATE recon_core)
   add_test(NAME uv COMMAND test_uv)
 
+  # 预览网格（UI 线框渲染用）。判据：docs/09 §3.7 U-R-1..U-R-4。
+  add_executable(test_preview_mesh tests/unit/test_preview_mesh.cpp)
+  target_link_libraries(test_preview_mesh PRIVATE recon_core)
+  add_test(NAME preview_mesh COMMAND test_preview_mesh)
+
   # S9 纹理烘焙。**已达标**。
   # 单视图 RMSE 0.0115 / 多视图 0.0124（目标 < 0.05）。
   # 根因是「整体朝外定向缺失」：`OrientFacesConsistently` 只保证相邻面绕序
@@ -736,6 +745,13 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   # 平台对等闸门（recon_status 数值集合 / JNI 数组布局条数）的负向注入自检。
   add_test(NAME platform_parity_negative
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_platform_parity_negative.py")
+  # ABI 漂移闸门（abi_drift_check）的负向注入自检。2026-11-02 新增：
+  # 本轮实测踩到「闸门只锚表格行、散文计数无人守」→ docs/01 三处计数静默陈旧
+  # （缺口 AQ，与缺口 AN 同型）。补了「散文计数对账」判据 + 反空约束后，
+  # 必须同时证明新判据会拒收、且失锚时不会静默通过。
+  add_test(NAME abi_drift_negative
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_abi_drift_negative.py"
+            --root "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 endif()
 
