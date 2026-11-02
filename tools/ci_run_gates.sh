@@ -30,7 +30,7 @@
 #
 # 选择器（= 能力点，每个对应恰好一条命令）：
 #   generate  生成 iOS 工程描述（其余 iOS 类闸门的**前置**）
-#   ios       iOS 静态契约 G1..G18
+#   ios       iOS 静态契约 G1..G19
 #   neg-ios   上条的负向注入
 #   ipa       未签名 IPA 打包器的判据本体自检（stage_ios_ipa.py 的 P-1..P-9）
 #             —— 合成产物 + 逐条证伪，**不需要 macOS 与任何 Apple 工具**
@@ -47,6 +47,8 @@
 #   abi       C ABI 漂移闸门
 #   params    参数契约漂移闸门
 #   license   第三方许可扫描（GPL 家族硬阻断）
+#   shell     `set -o pipefail` 下的管道 SIGPIPE 陷阱（S-1/S-2 + 反空约束）
+#   neg-shell 上条的负向注入（5 项）
 #   xcodegen  xcodegen --project-root 防回归检查
 #
 # 组合选择器（便于一次选一组，避免手抄长列表）：
@@ -57,7 +59,7 @@
 #   shaders   = shaders,neg-shaders
 #   android   = android,neg-android
 #   toolchain = toolchain,neg-toolchain
-#   negative  = neg-ios,neg-parity,neg-shaders,neg-android,neg-toolchain
+#   negative  = neg-ios,neg-parity,neg-shaders,neg-android,neg-toolchain,neg-shell
 #
 #   `all` 单独出现即全选。未知选择器**报错退出**（不静默忽略 —— 否则打错字会
 #   表现为"以为跑了其实没跑"）。
@@ -87,7 +89,7 @@ cd "${ROOT}"
 # ---------------------------------------------------------------------------
 # 能力点全集（顺序 = 执行顺序，且与并入本脚本之前的 YAML step 顺序逐条对应）
 # ---------------------------------------------------------------------------
-CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license xcodegen"
+CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license shell neg-shell xcodegen"
 
 # 互为「组合选择器 → 能力点」的展开表。
 # 键与值都只用空格分隔的普通字符串（bash 3.2 无关联数组，macOS 上也能跑）。
@@ -99,9 +101,9 @@ selector_expand() {
     shaders)    echo "shaders neg-shaders" ;;
     android)    echo "android neg-android" ;;
     toolchain)  echo "toolchain neg-toolchain" ;;
-    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-toolchain" ;;
+    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-toolchain neg-shell" ;;
     generate | neg-ios | ipa | neg-parity | neg-shaders | neg-android | neg-toolchain | \
-    elf | abi | params | license | xcodegen)
+    elf | abi | params | license | shell | neg-shell | xcodegen)
                 echo "$1" ;;
     *)          return 1 ;;
   esac
@@ -171,7 +173,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ⚠️ 本列表必须与 `selector_expand` 的分支**逐项一致**（含组合选择器）。
   #    漏一个组合选择器 → 它的展开结果不参与下面的 ③ 并集断言，
   #    于是"该选择器指向已被删除的能力点"这类错误不会被发现。
-  for s in generate ios ipa parity shaders android toolchain elf negative abi params license xcodegen; do
+  for s in generate ios ipa parity shaders android toolchain elf negative abi params license shell xcodegen; do
     caps="$(parse_selector "${s}")" || { echo "::error::选择器 ${s} 解析失败"; fail=1; continue; }
     n="$(echo "${caps}" | wc -w | tr -d ' ')"
     echo "  - ${s} → ${n} 个：${caps}"
@@ -190,7 +192,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ③ 并集 == all，且每个能力点都可达（有选择器能选到它）
   #    ⚠️ 同上：列表必须与 selector_expand 的分支逐项一致。
   union=""
-  for s in generate ios ipa parity shaders android toolchain elf negative abi params license xcodegen; do
+  for s in generate ios ipa parity shaders android toolchain elf negative abi params license shell xcodegen; do
     union="${union} $(parse_selector "${s}")"
   done
   for c in ${CAPS_ALL}; do
@@ -328,6 +330,20 @@ fi
 if wants license; then
   step "第三方许可扫描（GPL 家族硬阻断）" \
     "${PY}" tools/license_scan.py --third-party third_party
+fi
+
+# --- 闸门 S：`set -o pipefail` 下的管道 SIGPIPE 陷阱 -----------------------
+# 为什么它是**能力点**而不是某条闸门的内部检查：同型事故已发生 **5 次**
+# （ios.yml 两条 `writer | grep -q`、android.yml 两处 `yes | sdkmanager`、
+# android.yml 一处 `$(find ... | head -1)`），跨越两个 workflow、六类命令。
+# 它是「shell 语义」层的独立风险面，不属于任何单一平台的契约闸门。
+if wants shell; then
+  step "闸门 S：pipefail 管道 SIGPIPE 陷阱（含反空约束）" \
+    "${PY}" tools/check_shell_pipefail.py --root "${ROOT}"
+fi
+if wants neg-shell; then
+  step "闸门 S 负向注入（证明 S-1/S-2/S-0 判据非假闸门）" \
+    "${PY}" tools/verify_shell_pipefail_negative.py --root "${ROOT}"
 fi
 
 # ---------------------------------------------------------------------------

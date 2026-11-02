@@ -69,6 +69,8 @@ on:
       - "tools/verify_platform_parity_negative.py"
       - "tools/shader_parity.py"
       - "tools/build_vulkan_shaders.sh"
+      - "tools/check_shell_pipefail.py"
+      - "tools/verify_shell_pipefail_negative.py"
       - "tools/ci_run_gates.sh"
       - ".github/workflows/android.yml"
   # ⚠️ 本段必须与上面的 push 段**逐条一致**（含 tools/*.py 那一串）。
@@ -90,13 +92,16 @@ on:
       - "tools/verify_platform_parity_negative.py"
       - "tools/shader_parity.py"
       - "tools/build_vulkan_shaders.sh"
+      - "tools/check_shell_pipefail.py"
+      - "tools/verify_shell_pipefail_negative.py"
       - "tools/ci_run_gates.sh"
       - ".github/workflows/android.yml"
   workflow_dispatch:
     inputs:
       gates:
         description: >
-          static-contract 要跑的闸门（逗号分隔）。默认 android,toolchain,elf。
+          static-contract 要跑的闸门（逗号分隔）。
+          默认 android,toolchain,elf,shell。
           见 tools/ci_run_gates.sh 的选择器表。
         type: string
         default: android,toolchain,elf
@@ -138,7 +143,11 @@ jobs:
       #    （属 MEMORY.md「静默丢弃最难查」类）。
       - name: Android 静态契约闸门（选择器见 tools/ci_run_gates.sh）
         env:
-          RECON_CI_GATES: ${{ github.event.inputs.gates || 'android,toolchain,elf' }}
+          # ⚠️ `shell` 必须显式列出：`shell` 能力点扫的是**两个 workflow 的 run: 块**，
+          #    而 android.yml 自身在它的扫描范围内 —— 若本 job 漏挂它，则「改
+          #    android.yml 引入 pipefail 陷阱」这件事在本 workflow 里**无人检**。
+          #    （ios.yml 的 static-contract 同样挂 `shell`，两边覆盖面因而相同。）
+          RECON_CI_GATES: ${{ github.event.inputs.gates || 'android,toolchain,elf,shell' }}
         run: bash tools/ci_run_gates.sh "${RECON_CI_GATES}"
 
       - name: 静态契约闸门选择器自检
@@ -195,7 +204,15 @@ jobs:
           fi
           echo "${SDK_ROOT}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           sdkmanager --version
-          yes | sdkmanager --licenses > /dev/null
+          # ⚠️ 绝不可写 `yes | sdkmanager --licenses`：在 `set -o pipefail` 下**必然失败**
+          # （2026-11-02 CI #25 实测，已本机复现）。机理与 ios.yml 两处同类事故一字不差：
+          # `sdkmanager` 读完所需应答即正常退出并关闭读端 → 写端 `yes` 收到 SIGPIPE
+          # 退出 141 → pipefail 令**整条管道**非零 → 本行失败 → 后续 `sdkmanager
+          # --install` 根本不执行。CI 日志正是这样：`yes: standard output: Broken pipe`
+          # 紧跟 `##[error]Process completed with exit code 1.`，而**没有任何工具链错误**。
+          # 修法：只对 `yes` 端吞掉 SIGPIPE（`{ yes || true; }`）—— `sdkmanager` 的
+          # 真实失败仍会正常传播（用 `|| true` 包整条管道会把真失败也吞掉，故不可取）。
+          { yes || true; } | sdkmanager --licenses > /dev/null
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
@@ -282,7 +299,13 @@ jobs:
           # 解包出 .so 再做符号检查（用 NDK 自带的 llvm-nm）
           NM="${SDK_ROOT}/ndk/${RECON_NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           if [ ! -x "$NM" ]; then
-            NM=$(find "${SDK_ROOT}/ndk" -name llvm-nm -type f | head -1)
+            # ⚠️ 必须带 `|| true`：`find ... | head -1` 在 `set -o pipefail` 下
+            # **必然失败**（head 命中即关读端 → find 收 SIGPIPE 141 → 整条管道
+            # 非零），而写在 `$( )` 里的失败会被 `set -e` **静默中止整个 run 块**
+            # —— 后面的符号断言全部不执行，日志里看不出任何异常。本仓库因此已
+            # 踩过 5 次同型坑（IOS/AN 两条 nm|grep -q、AND 两处 yes|sdkmanager、
+            # 以及本处），现由 `tools/check_shell_pipefail.py`（闸门 S）守住。
+            NM=$(find "${SDK_ROOT}/ndk" -name llvm-nm -type f | head -1 || true)
           fi
           [ -x "$NM" ] || { echo "::error::未找到 llvm-nm"; exit 1; }
 
@@ -377,7 +400,10 @@ jobs:
           unzip -q /tmp/clt.zip -d "${SDK_ROOT}/cmdline-tools"
           mv "${SDK_ROOT}/cmdline-tools/cmdline-tools" "${SDK_ROOT}/cmdline-tools/latest"
           export PATH="${SDK_ROOT}/cmdline-tools/latest/bin:${PATH}"
-          yes | sdkmanager --licenses > /dev/null
+          # ⚠️ 同上（build job 的同一条坑）：`yes | sdkmanager` 在 pipefail 下必然
+          # 以 141/SIGPIPE 失败。本 job 更隐蔽 —— 它跑在 verify-16kb 里，若在此中止，
+          # 16 KB 门禁会表现为「没跑」，而那是**发布阻断项**。
+          { yes || true; } | sdkmanager --licenses > /dev/null
           sdkmanager --install "build-tools;35.0.0" > /dev/null
           # 证实 zipalign 真的可执行（否则后面的检查 2 会以"找不到工具"失败，
           # 而那种失败与"对齐不合格"是两件事，必须在**这里**区分开）
