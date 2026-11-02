@@ -125,6 +125,7 @@ def build_injections() -> list[Injection]:
     M = "platform/android/app/src/main/AndroidManifest.xml"
     C = "CMakeLists.txt"
     R = "platform/android/app/src/main/res"
+    CPP = "platform/android/app/src/main/cpp"
     return [
         # ── G-AND-1：JNI 定义 target 未被 Gradle `targets` 覆盖 ──────────
         PatchInjection(
@@ -241,6 +242,24 @@ def build_injections() -> list[Injection]:
             "G-AND-5",
             "res/ 整体缺失（闸门必须硬失败而非恒真通过）",
             f"{R}/values/themes.xml"),
+
+        # ── G-AND-6：转发壳上级层数（复现 Android CI #3..#6 的真实事故）──
+        PatchInjection(
+            "G-AND-6/one-level-short",
+            "G-AND-6",
+            "转发壳少写一级 `../`（5 级）→ 解析到 platform/ → CMake FATAL_ERROR。"
+            "★ 复现 Android CI 从 #3 到 #6 四次全倒的真实 bug",
+            f"{CPP}/CMakeLists.txt",
+            '/../../../../../../" ABSOLUTE)',
+            '/../../../../../" ABSOLUTE)'),
+        PatchInjection(
+            "G-AND-6/cmaake-source-dir",
+            "G-AND-6",
+            "转发壳改用 CMAKE_SOURCE_DIR（语义是「顶层源目录」，会漂移）",
+            f"{CPP}/CMakeLists.txt",
+            'get_filename_component(RECON_REPO_ROOT\n    "${CMAKE_CURRENT_LIST_DIR}/',
+            'get_filename_component(RECON_REPO_ROOT\n    "${CMAKE_SOURCE_DIR}/'),
+
         DeleteFileInjection(
             "env/cmake-missing",
             "env",

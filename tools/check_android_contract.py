@@ -73,6 +73,17 @@ G-AND-5  SHARED/SOURCES 与 HAL/JNI 一致性 + 资源完整性反空约束
          且断言 `res/` 下 `mipmap`/`values` 目录非空（防「闸门因找不到文件
          而恒真通过」—— MEMORY.md「判据可被工具覆盖即等同于可被绕过」）。
 
+G-AND-6  薄壳转发路径的上级层数（`src/main/cpp/CMakeLists.txt`）
+         转发壳用 `${CMAKE_CURRENT_LIST_DIR}/../../.../` 指到仓库根。层数写错
+         → `RECON_REPO_ROOT` 落到 `<repo>/platform`（无 CMakeLists.txt）
+         → `CMakeLists.txt:17` 触发 FATAL_ERROR → Gradle
+         `:app:configureCMakeRelease[<abi>]` **失败**。
+         ⚠️ 这类错误的隐蔽性：**桌面构建完全不受影响**（仓库根有 CMakeLists.txt，
+         ctest 全绿），是「只有 CI 能发现」的一类 —— 第四十九轮实测：
+         Android CI 从 #3 到 #6 **四次全部**倒在这里，同一期间 iOS 侧闸门
+         + ctest 三十余项全绿。判据做两层：(a) 禁 `CMAKE_SOURCE_DIR`；
+         (b) **真的做路径解析**（不是数 `../` 的文本比对，那会随写法漂移而失锚）。
+
 包含的**反假绿**设计（本项目反复踩过的坑，逐条都对应真实事故）
 --------------------------------------------------------------
 1. **反空约束**：每个判据在「匹配数为 0」时**失败**，而非静默跳过。
@@ -718,6 +729,69 @@ def judge_g5_res_nonempty(rep: Report, counts: dict[str, int]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# G-AND-6：转发壳（src/main/cpp/CMakeLists.txt）的上级路径层数
+# ---------------------------------------------------------------------------
+def judge_g6_forwarder_path(rep: Report) -> None:
+    """G-AND-6：薄壳转发路径的 `../` 层数必须真的指到仓库根。
+
+    为什么必须**实测**而不是「数一数对不对」：这条路径错了的表现是
+    Gradle 的 `:app:configureCMakeRelease[<abi>]` 失败（`CMakeLists.txt:17`
+    的 FATAL_ERROR），而**桌面构建完全不受影响**（仓库根有 CMakeLists.txt，
+    ctest 照样全绿）—— 属「只有 CI 能发现」的一类。实测：Android CI 从 #3
+    到 #6 **四次全部**倒在这里，而同一期间 iOS 侧闸门 + ctest 三十余项全绿。
+
+    判据分两层（都做，缺一不可）：
+      (a) **静态**：不许出现 `${CMAKE_SOURCE_DIR}`（转发壳的「自己在哪里」
+          只有一个正确答案：`CMAKE_CURRENT_LIST_DIR`；前者语义是「顶层源
+          目录」，被 `add_subdirectory` 引入即漂移）。
+      (b) **实测**：把路径片段与 `CPP_SRC` 拼接后**真的做路径解析**
+          （`pathlib` 的 `..` 折叠），断言结果 == 仓库根，且该处确有
+          `CMakeLists.txt`。只比对「写了几个 `../`」是文本判据，路径一改
+          就会失锚；实测等价于 CMake 的 `get_filename_component(... ABSOLUTE)`。
+    """
+    forwarder = CPP_SRC / "CMakeLists.txt"
+    if not _require(rep, forwarder, "G-AND-6：Android 薄壳转发文件"):
+        return
+    text = strip_cmake_comments(read(forwarder))
+
+    # (a) CMAKE_SOURCE_DIR 禁令
+    if "CMAKE_SOURCE_DIR" in text:
+        rep.err("G-AND-6",
+                f"{rel(forwarder)} 使用了 `CMAKE_SOURCE_DIR` —— 转发壳必须用 "
+                f"`CMAKE_CURRENT_LIST_DIR`（前者语义是「顶层源目录」，"
+                f"被 add_subdirectory 引入即漂移）。")
+
+    # (b) 实测路径解析
+    m = re.search(
+        r"\$\{CMAKE_CURRENT_LIST_DIR\}((?:/\.\.)+)/", text)
+    if not m:
+        rep.err("G-AND-6",
+                f"{rel(forwarder)} 中未找到 `${{CMAKE_CURRENT_LIST_DIR}}/../.../` "
+                f"形态的上级路径 —— 判据失锚（路径写法已变），请同步更新本判据。")
+        return
+
+    ups = m.group(1).count("..")
+    # ⚠️ 必须 `lstrip("/")` 再拼接：`Path("a/b") / "/../.."` 在 Windows 上会把
+    #    以分隔符开头的参数当作**根相对路径**（`\../../..`）→ 丢掉前缀 `a/b`，
+    #    直接解析到盘根 → 判据对正确与错误代码**一律报错**（假红）。
+    #    本行由「注入 5 级与 6 级都报错」的负向注入实测暴露并修正。
+    resolved = (CPP_SRC / m.group(1).lstrip("/")).resolve()
+    want = REPO.resolve()
+    if resolved != want:
+        rep.err("G-AND-6",
+                f"{rel(forwarder)} 的上级路径解析到 `{resolved}`，"
+                f"但仓库根是 `{want}`（当前 {ups} 个 `../`）。"
+                f"CMake 会在 `CMakeLists.txt:17` 触发 FATAL_ERROR → "
+                f"`configureCMakeRelease` 失败。")
+        return
+    if not (resolved / "CMakeLists.txt").is_file():
+        rep.err("G-AND-6", f"解析到的 `{resolved}` 下没有 CMakeLists.txt。")
+        return
+
+    rep.note(f"G-AND-6 转发壳上级路径实测指到仓库根（{ups} 个 `../`）✓")
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def run(gates: set[str] | None = None) -> int:
@@ -731,7 +805,7 @@ def run(gates: set[str] | None = None) -> int:
             print(f"::error::{e}")
         return 1
 
-    want = gates or {"1", "2", "3", "4", "5"}
+    want = gates or {"1", "2", "3", "4", "5", "6"}
 
     jni = collect_jni_symbols()
     cmake = collect_cmake_targets()
@@ -753,6 +827,8 @@ def run(gates: set[str] | None = None) -> int:
     if "4" in want:
         judge_g4_kotlin_deps(rep, collect_kotlin_imports(),
                              collect_gradle_dependencies())
+    if "6" in want:
+        judge_g6_forwarder_path(rep)
 
     for n in rep.notes:
         print(f"[android-contract] {n}")
@@ -761,7 +837,7 @@ def run(gates: set[str] | None = None) -> int:
             print(f"::error::{e}")
         print(f"[android-contract] FAIL：{len(rep.errors)} 项违规")
         return 3
-    print("[android-contract] PASS：G-AND-1..5 全部通过")
+    print("[android-contract] PASS：G-AND-1..6 全部通过")
     return 0
 
 
@@ -769,11 +845,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Android 侧静态契约闸门（无需 JDK/SDK/NDK）")
     ap.add_argument("--gates", default="",
-                    help="只跑指定判据，逗号分隔（1,2,3,4,5）。默认全跑。")
+                    help="只跑指定判据，逗号分隔（1,2,3,4,5,6）。默认全跑。")
     args = ap.parse_args()
     gates = {g.strip() for g in args.gates.split(",") if g.strip()}
-    if gates and not gates <= {"1", "2", "3", "4", "5"}:
-        print(f"::error::未知判据：{sorted(gates - {'1','2','3','4','5'})}")
+    if gates and not gates <= {"1", "2", "3", "4", "5", "6"}:
+        print(f"::error::未知判据：{sorted(gates - {'1','2','3','4','5','6'})}")
         return 1
     return run(gates or None)
 
