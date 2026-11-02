@@ -39,6 +39,7 @@
 
 import Foundation
 import SwiftUI
+import ARKit
 import CoreVideo
 import simd
 
@@ -354,6 +355,41 @@ public final class ReconSessionController: ObservableObject {
     /// ⚠️ 本状态**不**承载 `TrackingState.limited`：那需要 §4.3 的
     /// 「3 s 等待 / 10 s 降级」迟滞策略与一个真实的降级动作，见回调处注释。
     @Published public private(set) var arTrackingUnavailable = false
+
+    /// 相机预览会话（供 `ARCameraPreview` 挂载相机画面）。
+    ///
+    /// 暴露的是 `CaptureSession` 持有的**那一个** `ARSession` 实例 ——
+    /// 预览必须与采集共用同一个会话，否则屏幕上看到的画面与实际送进内核的帧
+    /// 来自两条独立管线（docs/02 §5.5 F-1）。理由详见 `CameraCapture.swift`
+    /// 中 `arSession` 属性的注释与 `ARCameraPreview.swift` 文件头。
+    ///
+    /// 类型是 `ARSession`（非 Optional）且**恒定非空**：它在控制器初始化时就
+    /// 存在，与「内核上下文是否已建立」无关 —— 视图无需解包，也不会出现
+    /// 「会话已就绪但界面显示黑屏」的空值态。
+    public var arSession: ARSession { capture.arSession }
+
+    /// 相机预览区的宽高比（`width / height`）。
+    ///
+    /// 取**实际采用的**采集格式（`CaptureSession.activeVideoFormat`，在
+    /// `start()` 里按 docs/08 的 `1920×1080` 目标选定并留档），而不是把
+    /// `4:3` 写死在视图里。
+    ///
+    /// ── 为什么必须动态取（2026-11-02）────────────────────────────────────
+    /// 原实现是 `ScanView` 里硬编码的 `Color.black.aspectRatio(4.0/3.0, ...)`，
+    /// 而契约 docs/08 声明采集分辨率是 `1920×1080`（16:9）—— 于是「界面按 4:3
+    /// 留位、实际画面是 16:9」或反之，二者必有一处错位：要么画面被拉变形，
+    /// 要么 letterbox 边上多出黑边与真实画面比例不符。硬编码一个比例**注定**
+    /// 与真实格式不一致，故这里不写常量，直接读留档的实际值。
+    ///
+    /// 未启动采集（`activeVideoFormat == nil`，例如 `supportedVideoFormats`
+    /// 为空）时退回 **16:9** —— 那是 docs/08 `cap_resolution_width/height`
+    /// 声明的契约值，是此刻**唯一有依据**的取值；**不**猜设备真实分辨率。
+    public var previewAspectRatio: CGFloat {
+        guard let f = capture.activeVideoFormat else { return 16.0 / 9.0 }
+        let w = CGFloat(f.imageResolution.width)
+        let h = CGFloat(f.imageResolution.height)
+        return h > 0 ? w / h : 16.0 / 9.0
+    }
 
     /// 当前会话在 `records` 中的记录 id（`open()` 登记时赋值）。
     ///

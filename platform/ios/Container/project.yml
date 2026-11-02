@@ -132,6 +132,22 @@ targets:
       - sdk: CoreMedia.framework
       - sdk: CoreMotion.framework
       - sdk: ARKit.framework
+      # RealityKit：相机预览的唯一渲染容器（platform/ios/Recon/ARCameraPreview.swift）。
+      #
+      # 为什么是 RealityKit 而不是 ARKit 自带的 ARSCNView（两条硬理由）：
+      #   ① `ARSCNView.session` **只读**，无法挂载采集层的同一个 ARSession；
+      #      它只能自己开第二个会话（无 sceneDepth、无 gravity），于是预览画面
+      #      与实际投给内核的帧来自两条独立管线（docs/02 §5.5 F-1 禁止）。
+      #      `ARView.session` 可写 + `automaticallyConfigureSession: false`
+      #      才能共用采集层那一个会话。
+      #   ② SceneKit 已随 WWDC25 被 Apple 软弃用（iOS 8.0–26.0 Deprecated），
+      #      而本 target 开着 `SWIFT_TREAT_WARNINGS_AS_ERRORS: YES` —— 弃用警告
+      #      会让构建**直接失败**。ARSCNView 是一条迟早会断的路。
+      #
+      # ⚠️ Swift 侧的 `import RealityKit` 本可自动链接，此处**仍显式声明**：
+      #    显式清单可在 otool 审计（docs/11 §1.6 证明链 C）与人工复核中一眼看到，
+      #    而自动链接是隐式的、不出现在任何声明里。
+      - sdk: RealityKit.framework
       - sdk: Photos.framework
       # ── zlib（iOS 系统自带 libz.tbd）──────────────────────────────────
       # ⚠️ 少了这一条，App 链接期**必然**报：

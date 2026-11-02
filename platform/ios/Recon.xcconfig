@@ -30,4 +30,4 @@ COPY_PHASE_STRIP = YES
 // docs/11 §1.6：零网络 —— 仅链接白名单系统框架。
 // 该列表只作声明；真正的校验由 tools/check_ios_contract.py 与 CI 的
 // otool -L 步骤执行（见 docs/12 §4.3 XC 校验项）。
-OTHER_LDFLAGS = $(inherited) -framework Foundation -framework UIKit -framework AVFoundation -framework CoreMedia -framework CoreMotion -framework Metal -framework MetalKit -framework ARKit -framework Photos
+OTHER_LDFLAGS = $(inherited) -framework Foundation -framework UIKit -framework AVFoundation -framework CoreMedia -framework CoreMotion -framework Metal -framework MetalKit -framework ARKit -framework RealityKit -framework Photos

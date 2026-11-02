@@ -223,10 +223,20 @@ public struct ScanView: View {
 
     private var previewArea: some View {
         ZStack {
-            // 相机实时预览层。真实实现接 AVCaptureVideoPreviewLayer / ARSCNView；
-            // 此处留出接口，不伪造画面。
-            Color.black
-                .aspectRatio(4.0 / 3.0, contentMode: .fit)
+            // 相机实时预览层 —— 与采集层**共用同一个** `ARSession`
+            // （`controller.arSession`，实现见 platform/ios/Recon/ARCameraPreview.swift）。
+            //
+            // 2026-11-02：此前这里是一块 `Color.black.aspectRatio(4.0/3.0, ...)`
+            // 占位（注释「此处留出接口，不伪造画面」），真机表现是进扫描页**只有
+            // 黑屏** —— 相机一直在采，但没有任何视图渲染它。
+            //
+            // ⚠️ 比例的来源已改为 `controller.previewAspectRatio`（读采集格式
+            // 的实际值），**不再**硬编码 4:3：契约 docs/08 声明的是 1920×1080
+            // （16:9），写死 4:3 会让画面被拉伸或 letterbox 与真实画面不符。
+            // ARCameraPreview 自身用 `.resizeAspect` 保证画面不变形，
+            // 比例只决定**容器**的形状（§1.4：`bg.preview` 承载 letterbox 底色）。
+            ARCameraPreview(session: controller.arSession)
+                .aspectRatio(controller.previewAspectRatio, contentMode: .fit)
 
             if controller.arTrackingUnavailable {
                 // §3.3：AR 不可用时上方叠加一行提示。

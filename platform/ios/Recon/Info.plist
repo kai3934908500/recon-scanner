@@ -70,6 +70,20 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 
+	<!-- ===== 启动屏（缺它会掉进 iOS「兼容模式」= 全屏缩放，比例失真）=====
+	     规则：iOS 要求 App 声明 Launch Screen（`UILaunchStoryboardName` 或
+	     `UILaunchScreen` 二者之一）。**两者都没有时**，系统按旧机型的小屏尺寸
+	     渲染整个界面、再整体等比放大到当前屏幕 —— 表现为「比例不对、字被放大
+	     且发糊、布局按小屏挤压」（2026-11-02 用户真机实测症状）。
+	     本工程 `GENERATE_INFOPLIST_FILE: NO`（手写 plist），系统**不会**替你补
+	     这两个键；且仓库内**无**任何 LaunchScreen.storyboard / .xib 资源。
+	     空字典 `UILaunchScreen` 即「用系统默认启动屏」（纯色、跟随明暗模式），
+	     与 §1.1 U-D-4「无浮夸视觉」一致 —— 不需要额外 storyboard 文件。
+	     需要 iOS 14+；本工程部署目标 15.0（docs/12 §4.6）。
+	     ⚠️ 删掉本键 = 界面立刻回退到兼容模式的缩放渲染。 -->
+	<key>UILaunchScreen</key>
+	<dict/>
+
 	<!-- ===== 隐私清单（iOS 17+ 的 PrivacyInfo.xcprivacy 由资源打包，此处无需键）===== -->
 </dict>
 </plist>

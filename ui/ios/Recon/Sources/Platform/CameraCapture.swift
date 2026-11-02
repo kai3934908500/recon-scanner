@@ -277,6 +277,28 @@ public final class CaptureSession: NSObject {
 
     private let session = ARSession()
     private let motion = CMMotionManager()
+
+    /// 采集会话（只读暴露，供 UI 的**预览视图**挂载相机画面）。
+    ///
+    /// ── 为什么必须暴露（2026-11-02，用户真机反馈「相机画面不显示」）────────
+    ///
+    /// 本类此前**没有任何**把 `session` 或其 previewLayer 交出去的接口，而
+    /// `ScanView.previewArea` 是一块 `Color.black` 占位 —— 真机表现为「进扫描页
+    /// 只有黑屏」。相机其实**一直在采**（`didUpdate frame` 正常回调、帧也在往
+    /// 内核投递），只是没有任何视图在渲染它。
+    ///
+    /// ⚠️ 暴露的是**同一个** `ARSession` 实例，不是新建的。理由：
+    ///   · ARKit 全设备**只允许一个活动 session**（同一时刻两个 session 会互相
+    ///     冲突，表现为画面错乱/黑屏）；
+    ///   · 预览视图若自己 `session.run(...)`，就会用**另一份配置**开第二个会话
+    ///     —— 那份配置没有 `.sceneDepth`、没有 `.gravity`，于是「看到的画面」与
+    ///     「实际采到的帧」来自两条独立管线（位姿不一致，且深度丢失）。
+    ///     这正是 docs/02 §5.5 F-1「RGB 与深度必须同帧同源」要防的事。
+    ///
+    /// 因此预览视图必须用 `.automaticallyConfigureSession = false` 的容器
+    /// （见 `platform/ios/Recon/ARCameraPreview.swift`），本属性是它的唯一入口。
+    public var arSession: ARSession { session }
+
     /// 独立串行队列：相机帧回调不得占用主线程（docs/11 §5 线程模型）。
     private let sessionQueue = DispatchQueue(label: "recon.capture.arkit")
     private let motionQueue = OperationQueue()
@@ -298,20 +320,78 @@ public final class CaptureSession: NSObject {
     /// 启动采集。调用方须**已获得相机权限**（docs/11 §1.3 时序）。
     ///
     /// - Parameter enableDepth: 是否请求 `sceneDepth`。仅当探测到支持时传 `true`。
+    /// - Parameter videoFormat: 显式指定的采集格式。传 `nil`（默认）时按
+    ///   `selectVideoFormat()` 的规则从设备实际支持的格式里挑最接近契约的那个。
     /// - Note: 使用 `.gravity`（不用 `.gravityAndHeading`）—— 02 §5.5 的世界系
     ///   约定为重力对齐，重定向会让重建结果出现非预期旋转。
     public func start(enableDepth: Bool, videoFormat: ARWorldTrackingConfiguration.VideoFormat? = nil) {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.planeDetection = []                       // 本产品不做平面检测
-        if let videoFormat {
-            config.videoFormat = videoFormat
+        // ★ 2026-11-02：此前调用方从不传 `videoFormat`，于是 ARKit 用**默认格式**
+        //   （实测 `1920×1440`，4:3）—— 既与 docs/08 声明的 `1920×1080`（16:9）
+        //   不符，又比契约多 25% 像素（直接放大缺口 AT 那条 OOM 路径的输入量）。
+        //   现在显式挑一个，并把实际选中的格式留档到 `activeVideoFormat`。
+        if let chosen = videoFormat ?? Self.selectVideoFormat() {
+            config.videoFormat = chosen
+            activeVideoFormat = chosen
         }
         if enableDepth, ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         startMotion()
+    }
+
+    /// 实际采用的视频格式（`start()` 之后有效）。
+    ///
+    /// **刻意留档而不是只存在局部变量里**：调用方（`ReconSessionController`）
+    /// 与诊断需要能回答「这次到底采的是多少分辨率」—— 否则「契约写了 1920×1080、
+    /// 实际采的是 1920×1440」这种不一致在运行期**完全不可见**（正是本项目反复
+    /// 踩的「静默不一致」形态）。为 `nil` 表示 `supportedVideoFormats` 为空、
+    /// 未覆盖 ARKit 默认值（此时**不假装**知道分辨率）。
+    public private(set) var activeVideoFormat: ARWorldTrackingConfiguration.VideoFormat?
+
+    /// 从设备实际支持的格式中，挑最接近契约 `1920×1080` 的那一个。
+    ///
+    /// ── 挑选规则（确定性，不依赖 `supportedVideoFormats` 的返回顺序）────────
+    ///
+    /// 以「宽高比更接近 16:9」为主序、「宽度更接近 1920」为次序：
+    ///   ① ARKit 各机型给的格式集合不同（可能含 `1920×1440` / `1920×1080` /
+    ///      `3840×2160` …），**不能假定**某个具体尺寸存在。找不到完全一致的
+    ///      就如实退到最接近的那个，由 `activeVideoFormat` 原样留档 ——
+    ///      **不假装**采到了 1080p。
+    ///   ② 顺序必须确定：`min(by:)` 在比较函数不构成严格全序时结果依赖数组顺序，
+    ///      而数组顺序 Apple 未承诺。故比较函数用「比例差 > 0.01 才按比例判胜，
+    ///      否则按宽度差判胜」构造成全序，浮点噪声不会让两个同比例格式随机取胜。
+    ///
+    /// **不**按「深度可用性」筛选：`.sceneDepth` 的可用性由 `frameSemantics`
+    /// 决定，与 `videoFormat` 正交 —— 混进来只会让规则变复杂且没有事实依据。
+    ///
+    /// - Returns: 选中的格式；`supportedVideoFormats` 为空时返回 `nil`
+    ///   （Apple 未承诺该数组非空）。返回 `nil` 时**不覆盖** ARKit 默认值 ——
+    ///   fail-open，而非编造一个设备上不存在的格式。
+    public static func selectVideoFormat() -> ARWorldTrackingConfiguration.VideoFormat? {
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        guard !formats.isEmpty else { return nil }
+
+        let targetRatio = 16.0 / 9.0      // docs/08 `cap_resolution_*` 的 1920×1080
+        let targetWidth = 1920.0
+
+        func ratio(_ f: ARWorldTrackingConfiguration.VideoFormat) -> Double {
+            Double(f.imageResolution.width) / Double(f.imageResolution.height)
+        }
+        func width(_ f: ARWorldTrackingConfiguration.VideoFormat) -> Double {
+            Double(f.imageResolution.width)
+        }
+
+        return formats.min { a, b in
+            let da = abs(ratio(a) - targetRatio)
+            let db = abs(ratio(b) - targetRatio)
+            // 比例差在 0.01 内视为同级，再按宽度比接近度裁决（构造全序）。
+            if abs(da - db) > 0.01 { return da < db }
+            return abs(width(a) - targetWidth) < abs(width(b) - targetWidth)
+        }
     }
 
     /// 暂停采集（对应状态机 `Capturing` 的 `paused` 变体，T-14 切后台）。
