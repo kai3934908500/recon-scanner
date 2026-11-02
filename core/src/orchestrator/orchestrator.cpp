@@ -604,7 +604,31 @@ recon_status Orchestrator::StagePreprocess(const ReconOptions& opt,
   // 与 C ABI 的采集统计保持一致（单一数据源）。
   if (ctx_ != nullptr) {
     ctx_->scan_stats().frames_accepted = n;
-    ctx_->scan_stats().keyframes = n;
+    // ⚠️ **此处刻意不写 `keyframes`**（缺口 AV 附带修正，2026-11-02）。
+    //
+    // 旧代码是 `ctx_->scan_stats().keyframes = n;` —— 把**帧数**当成**关键帧
+    // 数**写入。那是**假数据**：本阶段（StagePreprocess）连灰度化都才刚做完，
+    // 关键帧判定（docs/03 §5.1 的增益判据：几何增量 ∨ 视角增量 ∨ 质量分）
+    // **根本还没发生** —— 它属于位姿阶段（StageVio / StageSfmMonol）。
+    //
+    // 后果（真机可观测）：`recon_scan_stats.keyframes` 在**采集期**恒为 0
+    // （无任何写入点），而 `ReviewingView` 用它判自检 S1、并据此决定
+    // 「确认重建」按钮是否可点 —— 于是用户采完进自检页，按钮**恒不可点**。
+    // 虚假的 `= n` 只在重建之后才盖上去，对自检页毫无帮助（时序上晚了一步）。
+    //
+    // 修法：本阶段**不写**该字段（没有事实就不填，符合「不伪造」铁律）。
+    //
+    // ⚠️ **更正（同日自查）**：不要想当然地以为「位姿阶段会补写它」——**不会**。
+    // 已全仓 grep 核实：`scan_stats().keyframes` 在 core 内**再无任何写入点**
+    // （`c_api.cpp` 只做清零与读出）。位姿阶段确实算出了真实的关键帧数，但它是
+    // 写进**另一条通道** `StageResult::metrics`（键名同为 `"keyframes"`，
+    // 见 `StageVio` / `StageSfmMonol` 的 `out->metrics.push_back`），
+    // 与 C ABI 的 `recon_scan_stats` **不是同一个存储**。
+    //
+    // 故本字段当前是**死字段**：C ABI 冻结结构里声明了、却永远读出 0。
+    // 这是**真实缺口**（已登记，不擅自扩 ABI 去补）—— 谁要把 metrics 那条
+    // 通道接到 `scan_stats` 上，须先裁决「采集期 vs 重建后」两个时点的语义，
+    // 不能顺手加一行 `=`。
   }
   return RECON_OK;
 }

@@ -45,11 +45,21 @@
 //    · C ABI 21 个导出函数**无任何自检查询接口**。
 //
 //  故本视图**不伪造一个看起来完整的 14 项清单**（那会在每一项上给出假
-//  「✓/!」）。它**只呈现能真实判定的那一项**：S1「关键帧总数」，其数据来源
-//  `recon_scan_stats.keyframes` 是**真实可读**的（`orchestrator.cpp:537`
-//  在阶段 1 末尾写入）。其余 13 项**显式标注为「未接入」**并说明原因，
-//  与 `ResultView` 曾经的 `WireframePlaceholder`（`线框预览尚未接入…`）
-//  同一方针 ——「宁可如实告知功能未接入，也不画一个假结果」。
+//  「✓/!」）。它**只呈现能真实判定的那一项**：S1「关键帧总数」。
+//
+//  ⚠️ **2026-11-02 修正**：此前这里写「`recon_scan_stats.keyframes` 是真实
+//  可读的（`orchestrator.cpp:537` 在阶段 1 末尾写入）」—— **该说法已不成立**。
+//  那处的写入是 `scan_stats().keyframes = n`（把**帧数**当**关键帧数**），
+//  属**假数据**，本轮已删（见 `orchestrator.cpp` 中 `StagePreprocess` 末尾的
+//  修正注释）。真实的关键帧数由**位姿阶段**（`StageVio` / `StageSfmMonol`）
+//  写入 —— 那在本页（重建**之前**）**尚未发生**。
+//
+//  故本页对 S1 的现状是：**采集期无法判定**（`keyframes` 恒 0，且 0 不等于
+//  「测了且不合格」），如实标 `notWired`；只有重建已给出真实值时（如「继续
+//  扫描」后再次进本页）才做阈值判定。其余 13 项**显式标注为「未接入」**
+//  并说明原因，与 `ResultView` 曾经的 `WireframePlaceholder`
+//  （`线框预览尚未接入…`）同一方针 ——「宁可如实告知功能未接入，也不画一个
+//  假结果」。
 //  （注：`WireframePlaceholder` 已于 2026-11-02 被**真实 Metal 线框渲染**
 //   `WireframePreview` 取代；本页的 13 项仍按同一方针如实标注未接入。）
 //
@@ -109,10 +119,12 @@ public struct ReviewingView: View {
 
     /// 自检清单（S1..S14，共 14 项；顺序与 §7.1.1 表一致）。
     ///
-    /// ── 唯一被真实判定的一项：S1 ──────────────────────────────────────────
+    /// ── S1 的现状（2026-11-02 修正，缺口 AV 连带）───────────────────────────
     ///  判据 `关键帧总数 ≥ scan_review_min_keyframes（默认 60）`。
-    ///  当前值取 `controller.scanStats?.keyframes`，**缺失时标 notWired**
-    ///  —— 不把 `nil` 当 0（那会凭空报「有效帧数过少」）。
+    ///  当前值取 `controller.scanStats?.keyframes`。但该值**在 C ABI 上当前
+    ///  无任何写入点**（恒 0，已全仓 grep 核实，详见 `s1State()` 的修正说明），
+    ///  而本页在重建**之前** —— 故采集期恒为 0，本页对 S1 **无法判定**
+    ///  （`0` 不等于「测了且不合格」）。详见 `s1State()` 的修正说明。
     ///
     /// ⚠️ 阈值 `60` 按 docs/03 §7.1.1 S1 表值取：该键尚未注册（见下表
     ///    `notWired` 说明），故这里**不能**经 `controller.paramInt` 读 ——
@@ -122,7 +134,7 @@ public struct ReviewingView: View {
     private var checklist: [ChecklistItem] {
         var items: [ChecklistItem] = []
 
-        // S1 关键帧总数（唯一可真实判定项）
+        // S1 关键帧总数（唯一有一处真实判定的项；采集期标 notWired）
         items.append(ChecklistItem(
             id: "S1", title: L10n.t(.reviewItemKeyframes),
             severity: .warn, state: s1State()))
@@ -159,11 +171,39 @@ public struct ReviewingView: View {
     }
 
     /// S1 的判定。关键帧数来自内核 `recon_scan_stats.keyframes`。
+    ///
+    /// ── ⚠️ 2026-11-02 修正（缺口 AV 连带）：`0` **不等于**「测了且不合格」─────
+    ///
+    /// 本函数此前把 `keyframes == 0` 判为 `.failed`。但内核的 `keyframes`
+    /// 在 **C ABI 上当前无写入点**（旧代码那处 `= n` 是把**帧数**当**关键帧数**
+    /// 的假数据，本轮已删；删后再 grep 全仓，core 内**再无第二处写入**
+    /// —— `c_api.cpp` 只做清零与读出）。而位姿阶段（KC：docs/03 §5.1.2）
+    /// 确实算出了真实的关键帧数，但写进的是**另一条通道**
+    /// `StageResult::metrics`（键名同为 `"keyframes"`），与 `recon_scan_stats`
+    /// **不是同一个存储**。故本页（重建**之前**）读到的 `keyframes` **恒为 0**。
+    ///
+    /// 旧代码会因此**凭空报「有效帧数过少」**（`.failed` 且 severity=warn），
+    /// 而用户此刻其实**一帧都没重建过、根本无从判定**。那是「用 0 冒充
+    /// 已知」的伪造。
+    ///
+    /// 根因：内核**采集期没有关键帧判定**（docs/03 §5.1.2 的增益判据按 KF-3
+    /// 需要位姿，属重建流程内；`core/src/capture/quality_gate.cpp` 主流程从未调用）。
+    /// 故本页对 S1 **无法判定** —— 按本视图的既定三态语义（`notWired` =
+    /// 「我们测不了」，见 `ChecklistItem.State` 注释），应如实标 `.notWired`。
+    ///
+    /// 判据仍严格保留：**只有** `keyframes > 0` 时才做阈值判定 —— 那意味着
+    /// 将来真把 metrics 那条通道接到了 `scan_stats` 上（须先裁决语义），
+    /// 届时本判据**无需修改**即生效。
     private func s1State() -> ChecklistItem.State {
         guard let n = controller.scanStats?.keyframes else {
-            // 体统计缺失（未开始采集 / 句柄缺失）—— **不当作 0**。
+            // 统计缺失（未开始采集 / 句柄缺失）—— **不当作 0**。
             return .notWired
         }
+        // 采集期恒 0（内核无采集期关键帧判定）—— 与「缺失」同处置，
+        // **不**判 failed（理由见上方修正说明）。这一区分很关键：
+        // 若把 0 判 failed，用户会在每一条全新的采集上看到一条假的
+        // 「有效帧数过少」，且那条 warn 还会触发 §5.6 Q-05 确认框。
+        if n == 0 { return .notWired }
         // 阈值 = docs/03 §7.1.1 S1 表值（`scan_review_min_keyframes` 默认 60）。
         let threshold: UInt64 = 60
         if n >= threshold { return .passed }
@@ -189,8 +229,25 @@ public struct ReviewingView: View {
         }
     }
     /// 确认按钮是否可用（CK-4：severe 未通过时禁用）。
+    ///
+    /// ── ⚠️ 2026-11-02 修正（缺口 AV 连带）：判据从「关键帧数」改为「已采帧数」──
+    ///
+    /// 旧判据是 `(controller.scanStats?.keyframes ?? 0) > 0`。但 `keyframes`
+    /// **在 C ABI 上当前无写入点**（见 `s1State()` 的修正说明），而本页在
+    /// 重建**之前** —— 该值恒为 0 → 按旧判据，**「确认重建」按钮永久禁用，
+    /// 用户永远无法进入重建**。这是一条**死锁**：按钮的判据要等到按钮点下去
+    /// 之后才成立。
+    ///
+    /// 正确的判据是「**有没有东西可重建**」，即**已采集帧数 > 0** ——
+    /// 那是重建的输入，且在本页**真实可得**（`frames_captured` 由
+    /// `recon_push_frame` 每帧递增，不依赖重建阶段）。
+    ///
+    /// 为什么不用 `frames_captured` 是否「够多」（如 ≥ `cap_min_frames_before_finish`）：
+    /// 那个门限已在**结束采集**时把过关（`session.canFinishScan`），能走到本页
+    /// 就说明帧数已达标。本页再卡一次会让同一规则出现两个门（本项目大忌）。
+    /// 本页只守住「非空」这条底线，其余交给自检项如实呈现。
     private var canConfirm: Bool {
-        !hasSevereFailure && (controller.scanStats?.keyframes ?? 0) > 0
+        !hasSevereFailure && (controller.scanStats?.framesCaptured ?? 0) > 0
     }
 
     // =======================================================================
@@ -269,9 +326,22 @@ public struct ReviewingView: View {
                 SpecText(L10n.fill(.fmtCapturedFrames,
                                    ScanSessionModel.frameCountText(Int(s.framesCaptured))),
                          spec: ReconFont.footnote, color: ReconColor.txtSecondary, mono: true)
-                SpecText(L10n.fill(.fmtIngestedKeyframes,
-                                   MonoNumber.group(Int(s.keyframes))),
-                         spec: ReconFont.footnote, color: ReconColor.txtSecondary, mono: true)
+                // ⚠️ 2026-11-02（缺口 AV 连带）：**采集期不显示关键帧数**。
+                //
+                // `s.keyframes` 在 C ABI 上当前无写入点、恒为 0，本页（重建
+                // **之前**）读到的自然是 0。显示「已入库关键帧 0」会让用户以为
+                // 「一个关键帧都没采到」（那正是本轮真机反馈的原话），而
+                // **事实是**：内核此刻尚未做关键帧判定，这个 0 不是「采到了 0 个」，
+                // 而是「还没到判定的时候」。两者语义完全不同 —— 显示 0 就是伪造
+                // 一个读数。
+                //
+                // 仅在 `keyframes > 0` 时才显示，与 `s1State()` 的判据保持同一口径。
+                if s.keyframes > 0 {
+                    SpecText(L10n.fill(.fmtIngestedKeyframes,
+                                       MonoNumber.group(Int(s.keyframes))),
+                             spec: ReconFont.footnote,
+                             color: ReconColor.txtSecondary, mono: true)
+                }
             }
         }
     }
