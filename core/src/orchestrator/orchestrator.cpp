@@ -260,6 +260,11 @@ void Orchestrator::Reset() {
   std::lock_guard<std::mutex> lock(mutex_);
   frames_.clear();
   accepted_frames_ = 0;
+  // 像素预算计数随 frames_ 一并归零（缺口 AT）—— 不归零会让下一次会话
+  // 一开始就误判「已超预算」，把首帧像素立即释放掉。
+  resident_pixel_bytes_ = 0;
+  released_pixel_frames_ = 0;
+  pixel_budget_note_emitted_ = false;
   key_poses_.clear();
   key_intrinsics_.clear();
   keyframe_indices_.clear();
@@ -449,12 +454,76 @@ recon_status Orchestrator::onFramePushed(const recon_frame_packet& packet) {
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    resident_pixel_bytes_ += FramePixelBytes(f);
     frames_.push_back(std::move(f));
     if (state_ == OrchestratorState::kPlacing) {
       state_ = OrchestratorState::kScanning;
     }
+    // ★ OOM 保护：入帧后立即按预算裁决（缺口 AT，2026-11-02）。
+    //   必须在 push_back 之后、释放锁之前调用 —— 否则下一帧可能已越过预算。
+    //   本函数与调用方同持 mutex_（见其声明的 "Locked" 后缀约定）。
+    EnforcePixelBudgetLocked();
   }
   return RECON_OK;
+}
+
+// ── 采集期像素内存预算（缺口 AT）────────────────────────────────────────────
+//
+// 完整背景见 orchestrator.h 中 `frame_pixel_budget_bytes_` 的声明处注释。
+// 此处只强调**为什么不能简单地「删掉整帧」**：
+//
+//   `frames_` 的下标被 `keyframe_indices_` / `key_poses_` / `key_intrinsics_`
+//   / `key_timestamps_ns_` 四组平行数组直接引用（`BuildKeyframeArrays`、
+//   MVS 的 `BuildKeyframeArrays`、烘焙的 `keyframe_indices_` 遍历都会
+//   `frames_[idx]`）。删元素会让这些下标**整体错位**，是比 OOM 更隐蔽的
+//   错误（会静默产出错配的位姿/纹理 → 几何错误但**不崩溃**）。
+//   故只释放**像素矢量**（`clear()` + `shrink_to_fit()`），下标与元数据不动。
+//
+//   这正是 docs/13 §0.3 表格第 3 行「关键帧元数据（位姿/特征点）：分块加载」
+//   与第 2 行「关键帧图像：落盘后释放引用」的**同一条思路**，只是落盘那一步
+//   尚未实现（缺口 AT 的完整修复路径）。
+
+size_t Orchestrator::FramePixelBytes(const CapturedFrame& f) {
+  size_t n = f.rgb.size() + f.depth.size() * sizeof(uint16_t)
+             + f.depth_confidence.size() + f.gray.size();
+  return n;
+}
+
+void Orchestrator::EnforcePixelBudgetLocked() {
+  const size_t budget = frame_pixel_budget_bytes_;
+  if (budget == 0) return;  // 0 = 不设限（测试可用）
+  if (resident_pixel_bytes_ <= budget) return;
+
+  // 从最旧帧开始释放，直到回到预算内。`begin()` 是最旧 —— 采集顺序入队。
+  //
+  // ⚠️ 只释放**还没被释放过**的帧（用 `!rgb.empty()` 判）：
+  //    已释放的帧其 `FramePixelBytes` 为 0，重复遍历会让 `released_pixel_frames_`
+  //    虚高，也会让循环多绕。深度-only 帧（rgb 为空但有深度）用 depth 判。
+  size_t i = 0;
+  while (resident_pixel_bytes_ > budget && i < frames_.size()) {
+    CapturedFrame& f = frames_[i];
+    const bool has_pixels = !f.rgb.empty() || !f.depth.empty()
+                            || !f.depth_confidence.empty() || !f.gray.empty();
+    if (has_pixels) {
+      const size_t freed = FramePixelBytes(f);
+      f.rgb.clear();               f.rgb.shrink_to_fit();
+      f.depth.clear();             f.depth.shrink_to_fit();
+      f.depth_confidence.clear();  f.depth_confidence.shrink_to_fit();
+      f.gray.clear();              f.gray.shrink_to_fit();
+      resident_pixel_bytes_ -= freed;
+      released_pixel_frames_ += 1;
+    }
+    ++i;
+  }
+
+  // 不静默降级：把释放事实与规模记进内核日志（真机可经设备日志看到）。
+  // 频率控制：只在**首次**越界时全量记录，之后由 runStage 的 metrics 承担。
+  if (released_pixel_frames_ > 0 && !pixel_budget_note_emitted_) {
+    pixel_budget_note_emitted_ = true;
+    EmitLog(2, "内存保护：像素预算 " + std::to_string(budget / (1024 * 1024))
+                + " MiB 触顶，已释放最旧帧像素缓冲（保留全部位姿与元数据）；"
+                + "MVS 稠密匹配可用帧数将减少。这是内存保护行为，不是精度参数降级。");
+  }
 }
 
 recon_status Orchestrator::finishCapture() {

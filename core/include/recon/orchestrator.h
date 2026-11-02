@@ -263,6 +263,36 @@ class Orchestrator {
   // 质量门限通过（被接受）的帧数。
   size_t accepted_frame_count() const { return accepted_frames_; }
 
+  // ── 采集期像素内存预算（缺口 AT）─────────────────────────────────────────
+  //
+  // `@param bytes` 预算字节数；0 = 不设限（测试用）。设置后立即按新预算裁决。
+  // 平台层在 `open()` 时按 docs/13 §1.2 的预算公式调用
+  // （iOS `os_proc_available_memory()` × 系数）—— 当前由 ABI 消费方
+  // 直接调用，尚未经 C ABI 暴露（C ABI 出口见 docs/14 缺口 AT 的后续项）。
+  void SetFramePixelBudget(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    frame_pixel_budget_bytes_ = bytes;
+    EnforcePixelBudgetLocked();
+  }
+  size_t frame_pixel_budget_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return frame_pixel_budget_bytes_;
+  }
+  // 当前常驻像素字节数与已释放像素的帧数（诊断 / 测试断言用）。
+  size_t resident_pixel_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return resident_pixel_bytes_;
+  }
+  size_t released_pixel_frames() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return released_pixel_frames_;
+  }
+  // frames_ 的元素个数（**含像素已被释放的帧** —— 元数据仍全部在册）。
+  size_t captured_frame_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return frames_.size();
+  }
+
   // 关键帧时间戳（单调时钟纳秒），与 keyframe_indices_ 逐元素对齐。
   //
   // VIO 输出契约要求每关键帧带时间戳（docs/05 §3.10），因为下游按**时间**
@@ -337,6 +367,46 @@ class Orchestrator {
   SessionSpec spec_;
   std::vector<CapturedFrame> frames_;
   size_t accepted_frames_ = 0;
+
+  // ── 采集期像素内存预算（OOM 保护；docs/13 §0.3 / §1.3、docs/02 §5.6）────
+  //
+  // 背景（2026-11-02 真机实测，一次真实崩溃，缺口 AT）：
+  //   `frames_` 把每帧的 RGB / 深度**全量深拷贝**且**无任何上限**。
+  //   iOS 的 ARKit 默认 videoFormat 是 1920×1440（4:3），BGRA8 单帧
+  //   11.06 MiB；加深度约 12.5 MiB。100 余帧即 ~1.3 GiB 常驻 ——
+  //   在 iPhone 13（约 4 GB RAM、单 App 上限 ~2 GB）上撞 jetsam 内存
+  //   上限被系统直接杀进程，表现为用户反馈的「扫到 100 多帧必闪退」。
+  //
+  // 正解是 docs/02 §5.6 的**采集期落盘**（`cap_disk_cache_enabled=1`，
+  //   `cap_ring_buffer_frames=600`）：图像写入 `frames.bin` 后释放引用，
+  //   按 docs/03 §5.3.2 的 L1 层要求「常驻内存 0」。该落盘实现**尚未完成**
+  //   （全仓 `grep frames.bin core/` 零命中），故此处先做**止血**。
+  //
+  // 止血语义（**必须与「降精度」严格区分**）：
+  //   · 像素超预算时，按 FIFO 释放**最旧**帧的像素缓冲（rgb / depth /
+  //     depth_confidence / gray）；
+  //   · **保留全部元数据**：frame_id / 位姿 / 内参 / 时间戳 / 各尺寸字段。
+  //     故 `key_poses_` / `keyframe_indices_` / VIO / TSDF 的**索引与位姿
+  //     语义完全不变**，几何重建链照常工作（这正是 docs/13 R-PREC-4
+  //     「只降并行度/批大小/分块策略」允许的范围）；
+  //   · 代价：被释放帧不再参与 MVS 稠密匹配、不提供纹理采样。
+  //     这是**真实损失**，故 `released_pixel_frames_` 必须被日志上报
+  //     （不静默降级，U-D-7 / docs/13 §0.2）。
+  //
+  // 预算取值：默认 1024 MiB。依据 —— iOS 单 App 上限约 2 GB，采集期
+  //   还需为 TSDF（13 §1.3：1.5 GB 上限，但按需分块）、MVS、纹理留余量；
+  //   1024 MiB 约可容纳 110 帧 1080p 像素（7.91+1.5 MiB/帧）。
+  //   **待平台上报真实可用内存（`os_proc_available_memory()`）后，应改为
+  //   按 docs/13 §1.2 的预算公式动态取值**，此处先用保守常量。
+  size_t frame_pixel_budget_bytes_ = static_cast<size_t>(1024) * 1024 * 1024;
+  size_t resident_pixel_bytes_ = 0;
+  size_t released_pixel_frames_ = 0;
+  bool pixel_budget_note_emitted_ = false;
+
+  // 按预算释放最旧帧的像素。**调用方必须已持有 mutex_**。
+  void EnforcePixelBudgetLocked();
+  // 单帧像素字节数（rgb + depth + depth_confidence + gray）。
+  static size_t FramePixelBytes(const CapturedFrame& f);
 
   // 最近一次 runReconstruction 的选项。runStage 单阶段调用复用它，保证
   // 「整跑」与「单跑某一阶段」在开关上完全一致（否则两条路径会漂移）。

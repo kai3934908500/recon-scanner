@@ -672,6 +672,13 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   target_link_libraries(test_preview_mesh PRIVATE recon_core)
   add_test(NAME preview_mesh COMMAND test_preview_mesh)
 
+  # 采集期像素内存预算（缺口 AT，2026-11-02）。
+  # 判据 I-1..I-6，见测试文件头：这是「扫描 100 余帧必闪退」的回归锁。
+  # 新增消费路径若漏了「像素可能为空」的守卫，I-6 会以崩溃形式失败。
+  add_executable(test_frame_budget tests/unit/test_frame_budget.cpp)
+  target_link_libraries(test_frame_budget PRIVATE recon_core)
+  add_test(NAME frame_budget COMMAND test_frame_budget)
+
   # S9 纹理烘焙。**已达标**。
   # 单视图 RMSE 0.0115 / 多视图 0.0124（目标 < 0.05）。
   # 根因是「整体朝外定向缺失」：`OrientFacesConsistently` 只保证相邻面绕序
