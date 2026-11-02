@@ -34,8 +34,13 @@
   G18 iOS 系统 API 幻觉清单
       · 把 imuMaxRate 的诚实写 0 改回不存在的 maximumGyroUpdateInterval
         → 闸门须报「不存在」（**复现 CI #20 的真实失败**）
+      · 使用不存在的 maximumDeviceMotionUpdateInterval
+      · 把 MTKView 正确的 depthStencilPixelFormat 改回不存在的 depthPixelFormat
+        → 闸门须报「不存在」（**复现 CI #24 的真实失败**；同时覆盖
+        `platform/ios/**/*.swift` 这一此前不在视野内的目录）
 
 ⚠️ 本脚本会**临时修改** `platform/ios/Recon/ReconCore.swift`、
+   `platform/ios/Recon/WireframeRenderer.swift`、
    `ui/ios/Recon/Sources/State/ReconStageMap.swift`、
    `ui/ios/Recon/Sources/Localization/Localization.swift`、
    `ui/ios/Recon/Resources/locales/zh-CN.json`、以及任一视图 `.swift` 再还原。
@@ -100,9 +105,12 @@ DOCS_12 = os.path.join(ROOT, "docs", "12_构建与打包.md")
 DOCS_14 = os.path.join(ROOT, "docs", "14_验收测试.md")
 # G16 的目标对象：未签名 IPA 打包链所在的 workflow，以及其判据实现本体。
 IOS_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ios.yml")
-# G18 的目标对象：装配 recon_probe_data 的地方（幻觉 API 的实际发生地）。
+# G18 的目标对象：装配 recon_probe_data 的地方（幻觉 API 的实际发生地），
+# 以及线框渲染器（CI #24 的 depthPixelFormat 幻觉发生地）。
 CAMERA_CAPTURE = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Platform",
                               "CameraCapture.swift")
+WIREFRAME_RENDERER = os.path.join(ROOT, "platform", "ios", "Recon",
+                                  "WireframeRenderer.swift")
 
 
 def slurp(path: str) -> str:
@@ -491,6 +499,28 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "        let imuMaxRate: Int32 = "
           "Int32(1.0 / motion.maximumDeviceMotionUpdateInterval)\n")],
     ),
+    # 2026-11-02 CI #24（#114 线框渲染）：复现「MTKView.depthPixelFormat」这条
+    # 真编译幻觉。注入 = 把正确的 `depthStencilPixelFormat` 改回错的
+    # `depthPixelFormat` —— 正是 CI 当场报 `cannot find in scope` 的那一行。
+    (
+        "G18-c-hallucinated-mtkview-depth-format",
+        "把 MTKView 正确的 depthStencilPixelFormat 改回不存在的 "
+        "depthPixelFormat（复现 CI #24 的真实错误）",
+        "不存在",
+        [(WIREFRAME_RENDERER,
+          "        desc.depthAttachmentPixelFormat = depthStencilPixelFormat\n",
+          "        desc.depthAttachmentPixelFormat = depthPixelFormat\n")],
+    ),
+    # --- G19：Swift 访问级别自洽 -------------------------------------------
+    # ① 复现 CI #24 的原始错误：把顶层 public 的 PreviewMesh 降为 internal，
+    #    而 `public private(set) var previewMesh: PreviewMesh?` 仍引用它。
+    (
+        "G19-a-public-exposes-internal-type",
+        "把 PreviewMesh 从 public 降为 internal，而 ReconSessionController 的 "
+        "public 属性仍引用它（复现 CI #24 的真实错误）",
+        "非 public",
+        [(SWIFT_CORE, "public struct PreviewMesh {", "struct PreviewMesh {")],
+    ),
 ]
 
 
@@ -578,7 +608,7 @@ def main() -> int:
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
           f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 / "
-          f"G18 均有效）")
+          f"G18 / G19 均有效）")
     return 0
 
 

@@ -113,7 +113,9 @@ public final class WireframeRenderView: MTKView {
         desc.vertexFunction = vfn
         desc.fragmentFunction = ffn
         desc.colorAttachments[0].pixelFormat = colorPixelFormat
-        desc.depthAttachmentPixelFormat = depthPixelFormat
+        // MTKView 的深度格式属性名是 `depthStencilPixelFormat`（**不存在**
+        // `depthPixelFormat` —— 2026-11-02 CI #24 真编译抓到的幻觉 API）。
+        desc.depthAttachmentPixelFormat = depthStencilPixelFormat
         do {
             pipeline = try dev.makeRenderPipelineState(descriptor: desc)
         } catch {

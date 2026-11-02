@@ -203,6 +203,25 @@ def iter_ios_platform_impl_files() -> list[str]:
     return sorted(out)
 
 
+def iter_ios_platform_swift_files() -> list[str]:
+    """`platform/ios/**` 下的 Swift 源（**G18 幻觉清单的真实目标对象之一**）。
+
+    为什么单独需要这一份：`platform/ios/Recon/` 是**平台桥接层**，里面既有
+    Objective-C++（`.mm`，见上一个函数）也有 Swift（如
+    `WireframeRenderer.swift` 线框渲染器）。2026-11-02 CI #24 实测：该文件里的
+    `depthPixelFormat` 幻觉**不在任何闸门视野内** —— 因为 G18 此前只扫
+    `ui/ios/**/*.swift` + `platform/ios/**/*.mm`，而 `platform/ios/**/*.swift`
+    两份都不属。新代码落在闸门视野外，正是 LESSONS §C「判据范围要跟上代码位置」
+    记过的同型漏洞（G14 当年也是同一个洞换了个位置）。
+    """
+    out: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(IOS_PLATFORM):
+        for fn in filenames:
+            if fn.endswith(".swift"):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
 def strip_comments_and_strings(text: str) -> str:
     """剥离注释与字符串字面量，避免把「注释里提到被禁 API」当成违规。
 
@@ -2298,12 +2317,22 @@ _SYSTEM_API_DENYLIST: list[tuple[str, str, str]] = [
      "该成员不存在（同上）。docs/11 §3.1.5 曾引用此名，已一并修正"),
     ("maximumAccelerometerUpdateInterval", "CMMotionManager",
      "该成员不存在（同上）"),
+    # 2026-11-02 CI #24（#114 线框渲染）真编译抓到的幻觉成员：
+    #   `WireframeRenderer.swift` 写 `desc.depthAttachmentPixelFormat =
+    #   depthPixelFormat` —— MTKView 上**没有** `depthPixelFormat`。
+    #   正确的是 `depthStencilPixelFormat`（MTKView 的属性名带 stencil）。
+    #   报错：`error: cannot find 'depthPixelFormat' in scope`（exit 65）。
+    ("depthPixelFormat", "MTKView",
+     "MTKView 的深度格式属性名是 `depthStencilPixelFormat`；"
+     "`RenderPipelineDescriptor.depthAttachmentPixelFormat` 才是目标字段。"
+     "（2026-11-02 CI #24 真编译实测）"),
 ]
 
 
 def gate_system_api_denylist(rep: Report) -> None:
     gate = "G18/system-api-denylist"
-    files = iter_swift_files() + iter_ios_platform_impl_files()
+    files = (iter_swift_files() + iter_ios_platform_impl_files()
+             + iter_ios_platform_swift_files())
     hits = 0
     for path in files:
         raw = read_text(path)
@@ -2326,6 +2355,110 @@ def gate_system_api_denylist(rep: Report) -> None:
         rep.note(f"系统 API 幻觉清单：{len(files)} 个 iOS 源文件已扫，"
                  f"未出现 {len(_SYSTEM_API_DENYLIST)} 个已登记幻觉成员 ✓"
                  f"（注意：本闸门只覆盖**已登记**的名字，不是类型检查器）")
+
+
+# ---------------------------------------------------------------------------
+# G19 Swift 访问级别自洽（public 成员不得暴露非 public 类型）
+# ---------------------------------------------------------------------------
+#
+# ── 为什么需要这条（2026-11-02 CI #24 的真实事故，#114 线框渲染）───────────
+#
+# `ReconSessionController.previewMesh` 声明为
+#     @Published public private(set) var previewMesh: ReconCore.PreviewMesh?
+# 而 `PreviewMesh` 当时是 **`ReconCore` 的嵌套类型**（`ReconCore` 为 internal）。
+# Swift 规则：嵌套类型的**有效访问级别 = min(自身, 外层)** —— 故
+# `ReconCore.PreviewMesh` 的有效级别仍是 **internal**，即使我给它标了 public。
+# 真编译报：
+#
+#     error: property cannot be declared public because its type uses
+#            an internal type
+#     ** BUILD FAILED **   （exit 65）
+#
+# 同轮 G1..G18 **全绿** —— 因为这条规则既不是「契约不一致」（G 系列扫的），
+# 也不是「已登记幻觉名」（G18 扫的），而是一条**Swift 类型系统的可见性规则**。
+# 与 CI #20 的幻觉 API 同族：**只有类型检查器能发现**。本闸门把它提前到
+# ubuntu 静态 job，失败得更快、更好归因。
+#
+# ── 判据（窄而准，避免假阳性）──────────────────────────────────────────
+#   ① 收集全仓 iOS Swift 里的**顶层类型名**及其可见性（public / 非 public）；
+#   ② 收集 `public` 成员声明（`public var/let/func ... : Type` 与
+#      `public private(set) var ... : Type`）里引用的类型名；
+#   ③ 若引用的类型名**在本仓被定义为非 public** → 报错。
+#   ⚠️ 只查「本仓定义的类型」：系统类型（String / UUID / Array / MTLDevice …）
+#      不在仓内定义 → 天然不触发，无需白名单（白名单是假闸门的温床）。
+#   ⚠️ 只查**顶层**可见性：嵌套类型若外层非 public，其有效级别也非 public ——
+#      故凡「以 `Outer.Inner` 形式引用且 Outer 非 public」同样报错。
+def _collect_swift_visibility() -> tuple[set[str], set[str]]:
+    """返回 (public 顶层类型名集合, 非 public 顶层类型名集合)。"""
+    public_types: set[str] = set()
+    nonpublic_types: set[str] = set()
+    _DECL = re.compile(
+        r"^(?P<mods>(?:public\s+|internal\s+|private\s+|fileprivate\s+|"
+        r"final\s+|open\s+)*)"
+        r"(?P<kind>struct|class|enum|actor|protocol)\s+(?P<name>[A-Za-z_]\w*)",
+        re.MULTILINE)
+
+    files = (iter_swift_files() + iter_ios_platform_swift_files())
+    for path in files:
+        code = strip_comments_and_strings(read_text(path))
+        for m in _DECL.finditer(code):
+            name = m.group("name")
+            # 只认「行首无缩进的顶层声明」——嵌套类型由外层决定，单独收集会误判。
+            line_start = code.rfind("\n", 0, m.start()) + 1
+            prefix = code[line_start:m.start()]
+            if prefix.strip():  # 有缩进 → 是嵌套类型，跳过（由外层覆盖）
+                continue
+            if "public " in m.group("mods") or "open " in m.group("mods"):
+                public_types.add(name)
+            else:
+                nonpublic_types.add(name)
+    # 同名既 public 又 nonpublic 时以 public 为准（罕见，从严无害）。
+    nonpublic_types -= public_types
+    return public_types, nonpublic_types
+
+
+def gate_swift_access_level(rep: Report) -> None:
+    gate = "G19/swift-access-level"
+    _pub, nonpub = _collect_swift_visibility()
+    if not nonpub:
+        rep.note("Swift 访问级别自洽：仓库内无非 public 顶层类型，跳过 ✓")
+        return
+
+    # `public` 成员声明行：捕获 `: TypeName` / `-> TypeName` 里的类型名。
+    # 逐行扫描（比整文件正则更好定位行号，也更稳）。
+    _DECL_LINE = re.compile(
+        r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*"
+        r"public\s+(?:private\(set\)\s+|private\s+|final\s+|override\s+)*"
+        r"(?:var|let|func)\s+[A-Za-z_]\w*")
+    # 类型注解：`: T` 或 `-> T`，取首个标识符段（`ReconCore.PreviewMesh` → `ReconCore`）。
+    _TYPE_REF = re.compile(r"(?::\s*|->\s*)([A-Z][A-Za-z0-9_]*)")
+
+    hits = 0
+    for path in (iter_swift_files() + iter_ios_platform_swift_files()):
+        raw = read_text(path)
+        code = strip_comments_and_strings(raw)
+        for i, (raw_ln, code_ln) in enumerate(
+                zip(raw.splitlines(), code.splitlines()), 1):
+            if not _DECL_LINE.match(code_ln):
+                continue
+            for tm in _TYPE_REF.finditer(code_ln):
+                tname = tm.group(1)
+                if tname in nonpub:
+                    rep.err(
+                        gate,
+                        f"{rel(path)}:{i} 的 `public` 成员把 **非 public** "
+                        f"类型 `{tname}` 暴露出去 —— Swift 规则要求"
+                        f"`public` 声明的类型也必须是 `public`（同 module 同样"
+                        f"强制）。真实 CI 会报 `property cannot be declared "
+                        f"public because its type uses an internal type`"
+                        f"（2026-11-02 CI #24 真实事故）。修法：把 `{tname}` "
+                        f"提升为**顶层 `public`** —— 嵌套在 internal 类型里"
+                        f"标 public 无效（有效级别取 min(自身, 外层)）")
+                    hits += 1
+                    break
+    if hits == 0:
+        rep.note(f"Swift 访问级别自洽：{len(nonpub)} 个非 public 顶层类型均未被 "
+                 f"`public` 成员暴露 ✓")
 
 
 def main() -> int:
@@ -2352,6 +2485,7 @@ def main() -> int:
     gate_ipa_pipeline(rep)
     gate_locale_resource_layout(rep)
     gate_system_api_denylist(rep)
+    gate_swift_access_level(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -2375,7 +2509,8 @@ def main() -> int:
           "G10 ABI 边界 / G11 错误码逐值对等 / G12 阶段映射自洽 / "
           "G13 错误码映射穷举 / G14 平台平面缓冲纪律 / "
           "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
-          "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 全部通过。")
+          "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 / "
+          "G19 Swift 访问级别自洽 全部通过。")
     return 0
 
 

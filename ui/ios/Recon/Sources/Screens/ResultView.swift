@@ -248,7 +248,7 @@ private struct DimCell: View {
 ///
 /// U-R-3：手势直接改矩阵，**不写惯性、不写阻尼**（无 `.animation`）。
 private struct WireframePreview: View {
-    let mesh: ReconCore.PreviewMesh
+    let mesh: PreviewMesh
     /// 渲染器（生命周期与视图一致）。
     @StateObject private var holder = RendererHolder()
 
@@ -287,7 +287,7 @@ private final class RendererHolder: ObservableObject {
     var lastDrag: CGSize = .zero
     var lastZoom: CGFloat = 1.0
 
-    func load(mesh: ReconCore.PreviewMesh) {
+    func load(mesh: PreviewMesh) {
         view?.load(positions: mesh.positions, indices: mesh.indices)
     }
     func applyRotation(dx: Float, dy: Float) { view?.applyRotation(deltaX: dx, deltaY: dy) }

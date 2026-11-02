@@ -236,6 +236,40 @@ public struct ReconProbeData {
     }
 }
 
+/// 预览网格（对应 `recon_preview_mesh`，docs/09 §3.7 U-R-1..U-R-6）。
+///
+/// 位置（Float，XYZ 交错）+ 索引（UInt32，每 3 个一三角面）。这是 UI 层能做
+/// 线框渲染的**唯一**几何来源 —— 满足 docs/09 §1「UI 层禁止任何文件 IO /
+/// 几何计算」：数据由 core 算好，本层只搬运。
+///
+/// ── 为什么是**顶层** `public struct`（2026-11-02 CI #24 真编译教训）────────
+/// 初版把它写成 `ReconCore` 的**嵌套**类型并标 `public`，结果 CI 报
+/// `property cannot be declared public because its type uses an internal type`：
+/// Swift 的嵌套类型有效访问级别 = `min(自身, 外层)`，而 `ReconCore` 是
+/// **internal**，故 `ReconCore.PreviewMesh` 的有效级别仍是 internal。
+/// 与之对照：`ReconCapability` 同样是顶层 `public struct`（见其上方注释）。
+/// **这条规则 G1..G18 结构上看不见 —— 只有类型检查器能发现。**
+public struct PreviewMesh {
+    public var positions: [Float]
+    public var indices: [UInt32]
+    public var sourceTriangleCount: UInt32
+    /// 抽稀步长 N（1 = 未抽稀）。UI 可据此如实显示「预览已降采样」（U-R-6）。
+    public var decimationStep: UInt32
+    /// 每次装载的唯一标识 —— 供 SwiftUI 的 `onChange` 判断「几何确实换了」。
+    /// 仅比较面数不够：两次重建可能面数相同而形状不同。
+    public var loadID: UUID
+
+    public init(positions: [Float] = [], indices: [UInt32] = [],
+                sourceTriangleCount: UInt32 = 0,
+                decimationStep: UInt32 = 1, loadID: UUID = UUID()) {
+        self.positions = positions
+        self.indices = indices
+        self.sourceTriangleCount = sourceTriangleCount
+        self.decimationStep = decimationStep
+        self.loadID = loadID
+    }
+}
+
 /// 网格信息（对应 `recon_mesh_info`）。
 struct ReconMeshInfo {
     var vertexCount: UInt64
@@ -729,21 +763,6 @@ final class ReconCore {
     }
 
     // MARK: - 预览网格（docs/09 §3.7 U-R-1..U-R-4）
-
-    /// 预览网格：位置（Float，XYZ 交错）+ 索引（UInt32，每 3 个一三角面）。
-    ///
-    /// 这是 UI 层能做线框渲染的**唯一**几何来源 —— 满足 docs/09 §1
-    /// 「UI 层禁止任何文件 IO / 几何计算」：数据由 core 算好，本层只搬运。
-    struct PreviewMesh {
-        var positions: [Float] = []
-        var indices: [UInt32] = []
-        var sourceTriangleCount: UInt32 = 0
-        /// 抽稀步长 N（1 = 未抽稀）。UI 可据此如实显示「预览已降采样」。
-        var decimationStep: UInt32 = 1
-        /// 每次装载的唯一标识 —— 供 SwiftUI 的 `onChange` 判断「几何确实换了」。
-        /// 仅比较面数不够：两次重建可能面数相同而形状不同。
-        var loadID = UUID()
-    }
 
     /// 读取预览网格。`maxTriangles == 0` 时使用核心默认上限（200 万，U-R-2）。
     ///
