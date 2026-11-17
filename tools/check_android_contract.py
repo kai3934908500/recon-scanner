@@ -81,12 +81,18 @@ G-AND-6  薄壳转发路径的上级层数（`src/main/cpp/CMakeLists.txt`）
          ⚠️ 这类错误的隐蔽性：**桌面构建完全不受影响**（仓库根有 CMakeLists.txt，
          ctest 全绿），是「只有 CI 能发现」的一类 —— 第四十九轮实测：
          Android CI 从 #3 到 #6 **四次全部**倒在这里，同一期间 iOS 侧闸门
-         + ctest 三十余项全绿。判据做三层：(a) 禁 `CMAKE_SOURCE_DIR`；
+         + ctest 三十余项全绿。判据做四层：(a) 禁 `CMAKE_SOURCE_DIR`；
          (b) **真的做路径解析**（不是数 `../` 的文本比对，那会随写法漂移而失锚）；
          (c) 根 CMakeLists.txt **禁 `CMAKE_CURRENT_SOURCE_DIR`**、必须用
          `RECON_REPO_ROOT`（因为 include() 不改 CMAKE_CURRENT_SOURCE_DIR，
          根文件里的仓库相对路径会全部指向壳目录 —— 2026-11-02 的第二次
-         Android CI 失败即此，与 (a)(b) 是**同一根因的两个层面**）。
+         Android CI 失败即此，与 (a)(b) 是**同一根因的两个层面**）；
+         (d) 根 CMakeLists.txt 的源文件语句里**禁裸相对路径** —— (c) 只拦
+         显式带 `${CMAKE_CURRENT_SOURCE_DIR}/` 前缀的写法，而
+         `core/src/util/params.cpp` 这类**裸路径同样按该变量解析**，是同一
+         陷阱的第二种表现（第三次 Android CI 失败，run #9）。(d) 另带
+         **以语句数为落点的反空约束** —— 实测把源文件语句全删后
+         `target_sources` 仍贡献 token 数，若反空只看 token 数会静默通过。
 
 包含的**反假绿**设计（本项目反复踩过的坑，逐条都对应真实事故）
 --------------------------------------------------------------
@@ -847,6 +853,83 @@ def judge_g6_forwarder_path(rep: Report) -> None:
     rep.note(f"G-AND-6(c) 根 CMakeLists.txt 路径锚点自洽："
              f"锚点由 `${{CMAKE_CURRENT_LIST_DIR}}` 定义 1 处、"
              f"{n_use} 处引用、0 处 `${{CMAKE_CURRENT_SOURCE_DIR}}` ✓")
+
+    # --- (d) 根 CMakeLists.txt 的**裸相对路径**禁令 ---------------------------
+    # ⚠️ 第三层判据（2026-11-02 补，对应 CI run #9 的真实失败）：
+    #   判据 (c) 只拦「显式带 `${CMAKE_CURRENT_SOURCE_DIR}/` 前缀」的写法，
+    #   但 CMake 里**裸相对路径**（如 `core/src/util/params.cpp`）**同样**按
+    #   `CMAKE_CURRENT_SOURCE_DIR` 解析 —— 语义陷阱有两种表现，第一轮只修了
+    #   一种。CI #9 报的正是裸路径：
+    #     Cannot find source file: core/src/util/params.cpp
+    #     Cannot find source file: platform/common/src/capture_state.cpp
+    #     Cannot find source file: platform/android/app/src/main/cpp/native-lib.cpp
+    #   （`add_library` / `add_executable` / `set(...SOURCES ...)` 的源文件列表）
+    #
+    #   判据：(d1) `add_library` / `add_executable` / `set(RECON_*SOURCES ...)`
+    #         语句体内的每个源文件路径 token 都必须以 `${RECON_REPO_ROOT}/`
+    #         或 `${VAR}/` 形式带锚点；
+    #         (d2) **反空约束** —— 这类语句数必须 >= 30，且路径 token 数 > 0。
+    #              反空点落在**语句数**上，不落在路径 token 数上：实测把
+    #              `add_library`/`add_executable`/`set(SOURCES)` 全删后，
+    #              `target_sources`（metal 着色器）仍贡献 33 个 token →
+    #              若反空只看 token 数，判据会在扫描面塌缩时**静默通过**
+    #              （本轮负向注入实测暴露）。
+    flat_root = re.sub(r"\s+", " ", strip_cmake_comments(read(ROOT_CMAKE)))
+
+    def _paren_body(text: str, open_paren_idx: int) -> str:
+        """返回 `(` 之后到匹配 `)` 之前的片段（处理嵌套括号）。"""
+        depth, i = 1, open_paren_idx
+        while i < len(text) and depth:
+            c = text[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        return text[open_paren_idx:i - 1]
+
+    src_stmt_re = re.compile(
+        r"\b(add_library|add_executable)\s*\(|\bset\s*\(\s*(RECON_[A-Z0-9_]*SOURCES)\s+",
+        re.I)
+    bodies = [_paren_body(flat_root, m.end()) for m in src_stmt_re.finditer(flat_root)]
+
+    # 源文件扩展名（含平台特化：.mm/.metal/.comp）；`.c` 覆盖 zlib 内联拷贝。
+    path_tok_re = re.compile(
+        r'(?<![A-Za-z0-9_.\-])'
+        r'([A-Za-z0-9_][A-Za-z0-9_./\-]*\.(?:cpp|cc|cxx|mm|metal|comp|glsl|c|h|hpp))\b')
+
+    total_tok, bare = 0, []
+    for b in bodies:
+        for m in path_tok_re.finditer(b):
+            total_tok += 1
+            # 带锚点的形态在展平文本里是 `... ${RECON_REPO_ROOT}/<path>`；
+            # token 前的三个字符恰为 `}/` 即判定为已锚定。
+            if not b[max(0, m.start() - 3):m.start()].endswith("}/"):
+                bare.append(m.group(1))
+
+    if len(bodies) < 30:
+        rep.err("G-AND-6",
+                f"仓库根 CMakeLists.txt 中 `add_library`/`add_executable`/"
+                f"`set(RECON_*SOURCES)` 语句只扫到 {len(bodies)} 条（应 >= 30）——"
+                f"反空约束触发：扫描面缩小说明本判据已失锚（语句写法已变），"
+                f"必须同步更新 G-AND-6(d) 而不是让它静默通过。")
+        return
+    if total_tok == 0:
+        rep.err("G-AND-6",
+                "仓库根 CMakeLists.txt 的源文件语句里一个路径 token 都没扫到 —— "
+                "G-AND-6(d) 的路径正则已失锚，请同步更新。")
+        return
+    if bare:
+        show = "、".join(sorted(set(bare))[:5])
+        rep.err("G-AND-6",
+                f"仓库根 CMakeLists.txt 出现 {len(bare)} 处**裸相对路径**源文件引用"
+                f"（如 {show}）—— CMake 按 `CMAKE_CURRENT_SOURCE_DIR` 解析它们，"
+                f"而 Android 转发壳 `include()` 后该变量**仍是壳目录** → "
+                f"`Cannot find source file` → `configureCMakeRelease` 失败"
+                f"（CI #9 实测）。必须写成 `${{RECON_REPO_ROOT}}/<path>`。")
+        return
+    rep.note(f"G-AND-6(d) 源文件路径全部锚定：{len(bodies)} 条语句 / "
+             f"{total_tok} 个路径 token / 0 处裸相对路径 ✓")
 
 
 # ---------------------------------------------------------------------------

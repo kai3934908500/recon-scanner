@@ -271,7 +271,7 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
         "把 imu-bridge.cpp 从根 CMakeLists 的 target 源列表移除 → 不参与编译",
         "未注册进根 CMakeLists",
         [(ROOT_CMAKE,
-          "      platform/android/app/src/main/cpp/imu-bridge.cpp)",
+          "      ${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/imu-bridge.cpp)",
           "      )")],
     ),
     (

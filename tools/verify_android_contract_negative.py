@@ -283,6 +283,64 @@ def build_injections() -> list[Injection]:
             "env",
             "根 CMakeLists.txt 缺失 → 环境问题必须硬失败（rc=1）",
             C),
+
+        # ── G-AND-6(d)：根 CMakeLists.txt 的**裸相对路径** ────────────────
+        # 复现 2026-11-02 的**第三次** Android CI 失败（run #9）：判据 (c) 只拦
+        # 带 `${CMAKE_CURRENT_SOURCE_DIR}/` 前缀的写法，而裸相对路径
+        # （`core/src/util/params.cpp`）**同样**按该变量解析 → CI 报
+        # `Cannot find source file`。四处覆盖不同语句类型，证明判据不是只认
+        # 某一条语句。
+        PatchInjection(
+            "G-AND-6d/bare-path-sources-set",
+            "G-AND-6",
+            "`set(RECON_CORE_SOURCES ...)` 里的 core 源文件去掉锚点（裸相对路径）"
+            "→ 复现 CI #9 的 `Cannot find source file: core/src/util/params.cpp`",
+            C,
+            "${RECON_REPO_ROOT}/core/src/util/params.cpp",
+            "core/src/util/params.cpp"),
+        PatchInjection(
+            "G-AND-6d/bare-path-add-library",
+            "G-AND-6",
+            "`add_library(recon_platform_common ...)` 里去掉锚点（同一形态在**另一**"
+            "条语句里，证明判据覆盖 `add_library` 而非只认 `set`）",
+            C,
+            "${RECON_REPO_ROOT}/platform/common/src/capture_state.cpp",
+            "platform/common/src/capture_state.cpp"),
+        PatchInjection(
+            "G-AND-6d/bare-path-add-executable",
+            "G-AND-6",
+            "`add_executable(test_params ...)` 里去掉锚点（第三类语句：`add_executable`）",
+            C,
+            "${RECON_REPO_ROOT}/tests/unit/test_params.cpp",
+            "tests/unit/test_params.cpp"),
+        PatchInjection(
+            "G-AND-6d/bare-path-android-jni",
+            "G-AND-6",
+            "Android JNI 源文件去掉锚点（复现 CI #9 报的另一条 "
+            "`Cannot find source file: platform/android/.../native-lib.cpp`）",
+            C,
+            "${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/native-lib.cpp",
+            "platform/android/app/src/main/cpp/native-lib.cpp"),
+        # ── G-AND-6(d) 反空：把源文件语句整批删掉（判据不得恒真通过）──────
+        # ⚠️ 反空点必须落在**语句数**上，不能落在路径 token 数上：实测删掉
+        #    add_library/add_executable/set(SOURCES) 后，`target_sources`
+        #    （metal 着色器）仍贡献 33 个 token → 若只看 token 数，闸门会在
+        #    扫描面塌缩时静默通过（本轮负向注入实测暴露）。
+        #
+        #    下面把**全部 22 条** `add_executable(test_* ...)` 的形态整体改写
+        #    （`add_executable(` → `add_executable_x(`）——语句不再被正则识别，
+        #    语句数从 37 跌到 15 (< 30)，反空约束必须触发。
+        #    用 `--count` 精确断言出现次数：若将来有人新增/删除测试用例导致
+        #    条数变化，这条注入会因「锚点次数不符」直接报错（而不是悄悄失效）。
+        PatchInjection(
+            "G-AND-6d/anti-empty-shrink-scan-surface",
+            "G-AND-6",
+            "把全部 `add_executable(test_*...)` 的语句名改写（模拟语句写法变更）"
+            "→ 语句数跌破 30，反空约束必须触发而非静默通过",
+            C,
+            "add_executable(test_",
+            "add_executable_renamed(test_",
+            count=22),
     ]
 
 

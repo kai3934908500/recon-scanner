@@ -46,6 +46,32 @@ option(RECON_USE_METAL "启用 Metal 计算后端" OFF)
 #   「只有 CI 能发现」的错误（与缺口 AW 的转发壳层数错同源，都是 Android
 #   顶层结构 + 路径推导的陷阱）。
 #
+#   ⚠️ 同一个语义陷阱有**两种**表现形式，必须**都**修（第一轮只修了 A）：
+#
+#     A) 显式带前缀的 `${CMAKE_CURRENT_SOURCE_DIR}/xxx`
+#        → 已在第一次修复中全部换成 `${RECON_REPO_ROOT}/xxx`。
+#
+#     B) **裸相对路径** `xxx/yyy.cpp`（无任何前缀）
+#        → CMake 同样按 `CMAKE_CURRENT_SOURCE_DIR` 解析，**一模一样地错**。
+#        第一次修复**漏掉了这一整类**（62 处），CI #9 因此报
+#        `Cannot find source file: core/src/util/params.cpp` /
+#        `platform/common/src/capture_state.cpp` /
+#        `platform/android/app/src/main/cpp/native-lib.cpp` ——
+#        `add_library` / `add_executable` / `set(...SOURCES ...)` 里的
+#        源文件列表全是裸路径。现已全部锚定。
+#        同类还有 `install(DIRECTORY <相对路径> ...)`，同样处理。
+#
+#   **本机复现方法**（这类错误以前只能靠 CI 发现，现在可以本地先验）：
+#     把仓库复制到一个 ASCII 临时目录，然后以 **Android 转发壳**为源目录
+#     configure（而非仓库根）——转发壳会 `include()` 本文件，从而复现
+#     `CMAKE_CURRENT_SOURCE_DIR` 仍指向 cpp/ 的情形：
+#       cp -r platform core tests tools cmake shaders CMakeLists.txt $TMP/
+#       cmake -S $TMP/platform/android/app/src/main/cpp -B $TMP/b \
+#             -DRECON_PLATFORM_ANDROID=OFF
+#     修复前必报 `Cannot find source file`；修复后应打印 `Configuring done`。
+#     （注：需 ASCII 路径，见缺口 AL —— MinGW 下 CJK 路径会静默失败。）
+#     回归防线：`tools/check_android_contract.py` 的 **G-AND-6**（含裸路径判据）。
+#
 #   修法：用 `CMAKE_CURRENT_LIST_DIR`（**会**随 `include()` 更新，指向本文件
 #   所在目录 = 仓库根）锚定一个 `RECON_REPO_ROOT`，全文件路径一律挂在它下面。
 #   这是仓库既有技法（`cmake/Licenses.cmake:27` 早已这么用）。
@@ -186,35 +212,35 @@ include("${RECON_REPO_ROOT}/cmake/Licenses.cmake")
 # 核心库
 # ---------------------------------------------------------------------------
 set(RECON_CORE_SOURCES
-    core/src/util/params.cpp
-    core/src/util/linalg.cpp
-    core/src/util/robust_fit.cpp
-    core/src/util/memory_guard.cpp
-    core/src/util/context.cpp
-    core/src/util/c_api.cpp
-    core/src/capture/quality_gate.cpp
-    core/src/capture/depth_preprocess.cpp
-    core/src/sync/imu_preintegration.cpp
-    core/src/sync/time_sync.cpp
-    core/src/rgbd/tsdf_fusion.cpp
-    core/src/calib/scale_calibration.cpp
-    core/src/postproc/mesh_repair.cpp
-    core/src/export/exporter.cpp
-    core/src/export/png_encoder.cpp
-    core/src/util/camera.cpp
-    core/src/mvs/patchmatch_stereo.cpp
-    core/src/vio/msckf.cpp
-    core/src/vio/vio_estimator.cpp
-    core/src/mesh/poisson_mesh.cpp
-    core/src/mesh/uv_unwrap.cpp
-    core/src/mesh/texture_bake.cpp
-    core/src/mesh/poisson_mc.cpp
-    core/src/mesh/preview_mesh.cpp
-    core/src/sfm/geometry.cpp
-    core/src/sfm/matching.cpp
-    core/src/sfm/registration.cpp
-    core/src/sfm/pose_graph.cpp
-    core/src/orchestrator/orchestrator.cpp)
+    ${RECON_REPO_ROOT}/core/src/util/params.cpp
+    ${RECON_REPO_ROOT}/core/src/util/linalg.cpp
+    ${RECON_REPO_ROOT}/core/src/util/robust_fit.cpp
+    ${RECON_REPO_ROOT}/core/src/util/memory_guard.cpp
+    ${RECON_REPO_ROOT}/core/src/util/context.cpp
+    ${RECON_REPO_ROOT}/core/src/util/c_api.cpp
+    ${RECON_REPO_ROOT}/core/src/capture/quality_gate.cpp
+    ${RECON_REPO_ROOT}/core/src/capture/depth_preprocess.cpp
+    ${RECON_REPO_ROOT}/core/src/sync/imu_preintegration.cpp
+    ${RECON_REPO_ROOT}/core/src/sync/time_sync.cpp
+    ${RECON_REPO_ROOT}/core/src/rgbd/tsdf_fusion.cpp
+    ${RECON_REPO_ROOT}/core/src/calib/scale_calibration.cpp
+    ${RECON_REPO_ROOT}/core/src/postproc/mesh_repair.cpp
+    ${RECON_REPO_ROOT}/core/src/export/exporter.cpp
+    ${RECON_REPO_ROOT}/core/src/export/png_encoder.cpp
+    ${RECON_REPO_ROOT}/core/src/util/camera.cpp
+    ${RECON_REPO_ROOT}/core/src/mvs/patchmatch_stereo.cpp
+    ${RECON_REPO_ROOT}/core/src/vio/msckf.cpp
+    ${RECON_REPO_ROOT}/core/src/vio/vio_estimator.cpp
+    ${RECON_REPO_ROOT}/core/src/mesh/poisson_mesh.cpp
+    ${RECON_REPO_ROOT}/core/src/mesh/uv_unwrap.cpp
+    ${RECON_REPO_ROOT}/core/src/mesh/texture_bake.cpp
+    ${RECON_REPO_ROOT}/core/src/mesh/poisson_mc.cpp
+    ${RECON_REPO_ROOT}/core/src/mesh/preview_mesh.cpp
+    ${RECON_REPO_ROOT}/core/src/sfm/geometry.cpp
+    ${RECON_REPO_ROOT}/core/src/sfm/matching.cpp
+    ${RECON_REPO_ROOT}/core/src/sfm/registration.cpp
+    ${RECON_REPO_ROOT}/core/src/sfm/pose_graph.cpp
+    ${RECON_REPO_ROOT}/core/src/orchestrator/orchestrator.cpp)
 
 # ── 库形态：Android 必须是 SHARED，其余平台 STATIC ──────────────────────────
 # 为什么 Android 不能是 STATIC（第四十三轮实测的**致命缺口 A**）：
@@ -529,14 +555,14 @@ endif()
 # 这样做的理由（铁律：同一逻辑写两遍必然漂移）：采集状态机的迁移规则（T-01..T-30）
 # 是双端共享契约，若在 Kotlin 与 Swift 各写一份必然漂移。故以 C++ 单实现承载。
 add_library(recon_platform_common STATIC
-    platform/common/src/capture_state.cpp
-    platform/common/src/imu_window.cpp
-    platform/common/src/depth_convert.cpp
+    ${RECON_REPO_ROOT}/platform/common/src/capture_state.cpp
+    ${RECON_REPO_ROOT}/platform/common/src/imu_window.cpp
+    ${RECON_REPO_ROOT}/platform/common/src/depth_convert.cpp
     # YUV 4:2:0 → BGRA8 的**色彩数学本体**（平台无关）。
     # iOS(ARKit 420YpCbCr8BiPlanarFullRange) 与 Android(YUV_420_888) 都要做
     # 这一步，故按「同一逻辑不写两遍」下沉；两端只负责像素格式判定与平面取址。
     # 见 platform/common/include/recon_platform/yuv_convert.h 的文件头。
-    platform/common/src/yuv_convert.cpp)
+    ${RECON_REPO_ROOT}/platform/common/src/yuv_convert.cpp)
 add_library(recon::platform_common ALIAS recon_platform_common)
 target_include_directories(recon_platform_common PUBLIC
     "${RECON_REPO_ROOT}/platform/common/include")
@@ -561,12 +587,12 @@ if(RECON_PLATFORM_ANDROID)
   # `System.loadLibrary("recon_platform_android")`。STATIC 下无 `.so` 可加载 →
   # 同一个 `UnsatisfiedLinkError`（缺口 A 的第二处）。详见 recon_core 处注释。
   add_library(recon_platform_android SHARED
-      platform/android/app/src/main/cpp/native-lib.cpp
-      platform/android/app/src/main/cpp/platform-bridge.cpp
+      ${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/native-lib.cpp
+      ${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/platform-bridge.cpp
       # IMU 环形缓冲的 JNI 薄封装：桥接 `platform/common/src/imu_window.cpp`
       # 的规则本体到 Kotlin `object ImuRingBuffer`。本文件只做类型搬运与
       # 交错布局重排，**不含任何切窗规则**（见 imu-bridge.cpp 文件头）。
-      platform/android/app/src/main/cpp/imu-bridge.cpp)
+      ${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/imu-bridge.cpp)
   target_link_libraries(recon_platform_android PUBLIC recon_core recon_platform_common)
   # ── 着色器依赖进 CMake 图（第四十三轮实测的**致命缺口 B**）──────────────
   # 此前 `recon_shaders_vulkan` 从未被任何 target 链接，于是
@@ -593,13 +619,13 @@ endif()
 if(RECON_PLATFORM_IOS)
   enable_language(OBJCXX)
   add_library(recon_platform_ios STATIC
-      platform/ios/Recon/CaptureStateBridge.mm
-      platform/ios/Recon/PlatformCaptureBridge.mm
+      ${RECON_REPO_ROOT}/platform/ios/Recon/CaptureStateBridge.mm
+      ${RECON_REPO_ROOT}/platform/ios/Recon/PlatformCaptureBridge.mm
       # YUV→BGRA8 转换门面（docs/11 §693 IOS-AR-5 指定的文件名）。
       # GPU 主路径（Metal compute，零拷贝 CVMetalTextureCache）+ CPU 回退
       # （platform/common/src/yuv_convert.cpp）。host 侧**不含色彩数学** ——
       # 系数由 MakeYuvToBgraParams 算出，参数块走 shaders/common/gpu_algo.h。
-      platform/ios/Recon/MetalComputeBackend.mm)
+      ${RECON_REPO_ROOT}/platform/ios/Recon/MetalComputeBackend.mm)
   target_link_libraries(recon_platform_ios PUBLIC recon_platform_common)
   # 着色器依赖进 CMake 图：host 侧是**唯一**会加载 default.metallib 的目标
   # （MetalComputeBackend.mm）。此前只声明了这两个 INTERFACE target 却无人链接，
@@ -626,7 +652,7 @@ endif()
 # 桌面验证工具
 # ---------------------------------------------------------------------------
 if(RECON_BUILD_CLI AND RECON_PLATFORM_DESKTOP)
-  add_executable(recon_cli tools/recon_cli.cpp)
+  add_executable(recon_cli ${RECON_REPO_ROOT}/tools/recon_cli.cpp)
   target_link_libraries(recon_cli PRIVATE recon_core)
 endif()
 
@@ -636,88 +662,88 @@ endif()
 if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   enable_testing()
 
-  add_executable(test_params tests/unit/test_params.cpp)
+  add_executable(test_params ${RECON_REPO_ROOT}/tests/unit/test_params.cpp)
   target_link_libraries(test_params PRIVATE recon_core)
   add_test(NAME params COMMAND test_params)
 
-  add_executable(test_c_api tests/unit/test_c_api.cpp)
+  add_executable(test_c_api ${RECON_REPO_ROOT}/tests/unit/test_c_api.cpp)
   target_link_libraries(test_c_api PRIVATE recon_core)
   add_test(NAME c_api COMMAND test_c_api)
 
-  add_executable(test_export tests/unit/test_export.cpp)
+  add_executable(test_export ${RECON_REPO_ROOT}/tests/unit/test_export.cpp)
   target_link_libraries(test_export PRIVATE recon_core)
   add_test(NAME export COMMAND test_export)
 
-  add_executable(test_sync_depth tests/unit/test_sync_depth.cpp)
+  add_executable(test_sync_depth ${RECON_REPO_ROOT}/tests/unit/test_sync_depth.cpp)
   target_link_libraries(test_sync_depth PRIVATE recon_core)
   add_test(NAME sync_depth COMMAND test_sync_depth)
 
   # 时间轴归一化（docs/02 §3.2 / §3.7 / §3.8）：仿射拟合、5σ 剔除、
   # 置信度分级、漂移拒用、倒退/跳变/丢帧、重锚定延续性。
-  add_executable(test_time_sync tests/unit/test_time_sync.cpp)
+  add_executable(test_time_sync ${RECON_REPO_ROOT}/tests/unit/test_time_sync.cpp)
   target_link_libraries(test_time_sync PRIVATE recon_core)
   add_test(NAME time_sync COMMAND test_time_sync)
 
   # 深度预处理（docs/04 §3）：置信度掩码、飞行点剔除、BMRE、深度→RGB 对齐、
   # 原始缓冲不可变铁律。
-  add_executable(test_depth_preprocess tests/unit/test_depth_preprocess.cpp)
+  add_executable(test_depth_preprocess ${RECON_REPO_ROOT}/tests/unit/test_depth_preprocess.cpp)
   target_link_libraries(test_depth_preprocess PRIVATE recon_core)
   add_test(NAME depth_preprocess COMMAND test_depth_preprocess)
 
   # 位姿图优化与闭环检测（docs/05 §4.5–§4.6）：指纹、候选检测、几何验证、
   # 位姿图 LM、gauge 固定、闭环回滚。
-  add_executable(test_pose_graph tests/unit/test_pose_graph.cpp)
+  add_executable(test_pose_graph ${RECON_REPO_ROOT}/tests/unit/test_pose_graph.cpp)
   target_link_libraries(test_pose_graph PRIVATE recon_core)
   add_test(NAME pose_graph COMMAND test_pose_graph)
 
   # 内存保护与降级器（docs/13 §3.4 / §3.5 / §4）：水位分级、白名单从基线重算、
   # 黑名单不触碰断言、迟滞恢复、blacklist_touched 恒空。
-  add_executable(test_memory_guard tests/unit/test_memory_guard.cpp)
+  add_executable(test_memory_guard ${RECON_REPO_ROOT}/tests/unit/test_memory_guard.cpp)
   target_link_libraries(test_memory_guard PRIVATE recon_core)
   add_test(NAME memory_guard COMMAND test_memory_guard)
 
   # 分块 TSDF 一致性（docs/13 §3.2.1；docs/14 §5.1 TSDF 行 ③④⑤）：
   # 分块与单块逐点一致、体素边长不被改（黑名单 B-1）、分块省内存。
-  add_executable(test_tsdf_tiled tests/unit/test_tsdf_tiled.cpp)
+  add_executable(test_tsdf_tiled ${RECON_REPO_ROOT}/tests/unit/test_tsdf_tiled.cpp)
   target_link_libraries(test_tsdf_tiled PRIVATE recon_core)
   add_test(NAME tsdf_tiled COMMAND test_tsdf_tiled)
 
   # 预积分零偏雅可比（docs/02 §3.5.5 P-1、docs/05 §3.3.5 J-1）：
   # 中心差分校验 ∂Δ/∂b 三式，相对误差 < 1e-5。
-  add_executable(test_preint_jacobian tests/unit/test_preint_jacobian.cpp)
+  add_executable(test_preint_jacobian ${RECON_REPO_ROOT}/tests/unit/test_preint_jacobian.cpp)
   target_link_libraries(test_preint_jacobian PRIVATE recon_core)
   add_test(NAME preint_jacobian COMMAND test_preint_jacobian)
 
-  add_executable(test_mvs tests/unit/test_mvs.cpp)
+  add_executable(test_mvs ${RECON_REPO_ROOT}/tests/unit/test_mvs.cpp)
   target_link_libraries(test_mvs PRIVATE recon_core)
   add_test(NAME mvs COMMAND test_mvs)
 
   # SfM 几何原语（docs/05 §4.3–§4.4）：E/F 估计、位姿恢复、多视图三角化。
-  add_executable(test_sfm tests/unit/test_sfm.cpp)
+  add_executable(test_sfm ${RECON_REPO_ROOT}/tests/unit/test_sfm.cpp)
   target_link_libraries(test_sfm PRIVATE recon_core)
   add_test(NAME sfm COMMAND test_sfm)
 
-  add_executable(test_vio tests/unit/test_vio.cpp)
+  add_executable(test_vio ${RECON_REPO_ROOT}/tests/unit/test_vio.cpp)
   target_link_libraries(test_vio PRIVATE recon_core)
   add_test(NAME vio COMMAND test_vio)
 
-  add_executable(test_poisson tests/unit/test_poisson.cpp)
+  add_executable(test_poisson ${RECON_REPO_ROOT}/tests/unit/test_poisson.cpp)
   target_link_libraries(test_poisson PRIVATE recon_core)
   add_test(NAME poisson COMMAND test_poisson)
 
-  add_executable(test_uv tests/unit/test_uv.cpp)
+  add_executable(test_uv ${RECON_REPO_ROOT}/tests/unit/test_uv.cpp)
   target_link_libraries(test_uv PRIVATE recon_core)
   add_test(NAME uv COMMAND test_uv)
 
   # 预览网格（UI 线框渲染用）。判据：docs/09 §3.7 U-R-1..U-R-4。
-  add_executable(test_preview_mesh tests/unit/test_preview_mesh.cpp)
+  add_executable(test_preview_mesh ${RECON_REPO_ROOT}/tests/unit/test_preview_mesh.cpp)
   target_link_libraries(test_preview_mesh PRIVATE recon_core)
   add_test(NAME preview_mesh COMMAND test_preview_mesh)
 
   # 采集期像素内存预算（缺口 AT，2026-11-02）。
   # 判据 I-1..I-6，见测试文件头：这是「扫描 100 余帧必闪退」的回归锁。
   # 新增消费路径若漏了「像素可能为空」的守卫，I-6 会以崩溃形式失败。
-  add_executable(test_frame_budget tests/unit/test_frame_budget.cpp)
+  add_executable(test_frame_budget ${RECON_REPO_ROOT}/tests/unit/test_frame_budget.cpp)
   target_link_libraries(test_frame_budget PRIVATE recon_core)
   add_test(NAME frame_budget COMMAND test_frame_budget)
 
@@ -728,19 +754,19 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   # → 整片纹理变黑（RMSE 0.51）。已在 `RunMeshPipeline` 末端接入
   # `OrientMeshOutward`（逐分量径向符号，**不做 BFS 传播**）。
   # 详见 docs/06 §2.5.1 (24)(26)。
-  add_executable(test_bake tests/unit/test_bake.cpp)
+  add_executable(test_bake ${RECON_REPO_ROOT}/tests/unit/test_bake.cpp)
   target_link_libraries(test_bake PRIVATE recon_core)
   add_test(NAME bake COMMAND test_bake)
 
   # 端到端编排测试（L5）。合成长方体 6 视图 → 全链路 → 导出。
   # 覆盖 runReconstruction 的 8 个阶段、C ABI 生命周期、取消语义、空会话。
-  add_executable(test_pipeline tests/unit/test_pipeline.cpp)
+  add_executable(test_pipeline ${RECON_REPO_ROOT}/tests/unit/test_pipeline.cpp)
   target_link_libraries(test_pipeline PRIVATE recon_core)
   add_test(NAME pipeline COMMAND test_pipeline)
 
   # 平台适配层：采集状态机（docs/09 §4.1/§4.2，T-01..T-30）。
   # 平台无关逻辑，故可在桌面单测 —— 保证双端共享的迁移规则本身正确。
-  add_executable(test_capture_state tests/unit/test_capture_state.cpp)
+  add_executable(test_capture_state ${RECON_REPO_ROOT}/tests/unit/test_capture_state.cpp)
   target_link_libraries(test_capture_state PRIVATE recon_platform_common)
   add_test(NAME capture_state COMMAND test_capture_state)
 
@@ -748,7 +774,7 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   # 这两块在 iOS 上曾以 Swift 实现（IMUWindow.swift / FrameConverter.swift）；
   # 下沉到 platform/common 后由本测试在桌面验收，双端只做薄封装。
   # 详见 platform/common/include/recon_platform/imu_window.h 的文件头。
-  add_executable(test_platform_capture tests/unit/test_platform_capture.cpp)
+  add_executable(test_platform_capture ${RECON_REPO_ROOT}/tests/unit/test_platform_capture.cpp)
   target_link_libraries(test_platform_capture PRIVATE recon_platform_common)
   add_test(NAME platform_capture COMMAND test_platform_capture)
 
@@ -758,7 +784,7 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   # 且 GPU 侧着色器刻意不含任何数值字面量（系数全经参数块传入、由本模块算出）
   # → 本测试绿即「数学对」，真机只剩「GPU 是否忠实执行这几行 FMA」待验。
   # 见 platform/common/include/recon_platform/yuv_convert.h 的文件头。
-  add_executable(test_platform_yuv tests/unit/test_platform_yuv.cpp)
+  add_executable(test_platform_yuv ${RECON_REPO_ROOT}/tests/unit/test_platform_yuv.cpp)
   target_link_libraries(test_platform_yuv PRIVATE recon_platform_common)
   add_test(NAME platform_yuv COMMAND test_platform_yuv)
 
@@ -870,7 +896,10 @@ endif()
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
 install(TARGETS recon_core ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(DIRECTORY core/include/recon DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# 同样必须锚定：`install(DIRECTORY <相对路径> ...)` 的源路径也按
+# `CMAKE_CURRENT_SOURCE_DIR` 解析，而 include() 不改它（见文件头 RECON_REPO_ROOT 说明）。
+install(DIRECTORY "${RECON_REPO_ROOT}/core/include/recon"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(RECON_PLATFORM_ANDROID)
   set(RECON_PLATFORM_NAME "android")
