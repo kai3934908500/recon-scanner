@@ -137,7 +137,23 @@ Java_com_recon_scan_NativeBridge_create(JNIEnv* env, jobject, jstring session_di
   std::memset(&cfg, 0, sizeof(cfg));
   cfg.abi_version = RECON_ABI_VERSION;
   cfg.session_dir = dir;
-  cfg.forced_branch = 0xFFFFFFFFu;  // 自动探测
+  // 哨兵 `0xFFFFFFFF`（= UINT32_MAX）表示「自动探测」。
+  //
+  // ⚠️ 必须**显式**转换，不能直接写 `0xFFFFFFFFu`：`forced_branch` 的类型是
+  //    枚举 `recon_pipeline_branch`，而 **C++ 不允许 `unsigned int` 隐式转枚举**
+  //    （C 允许）。原先直接赋值在 CI 上报：
+  //      error: assigning to 'recon_pipeline_branch' from incompatible type
+  //             'unsigned int'
+  //    这是一个**只有 C++ 编译能发现**的错误 —— 桌面构建不编译本文件
+  //    （它在 `if(RECON_PLATFORM_ANDROID)` 内），故只在 Android CI 暴露。
+  //
+  //    语义依据（core/src/util/context.cpp:84-90）：core 侧**按数值判定** ——
+  //    `static_cast<int32_t>(forced_branch)` 后只有恰好等于 RECON_BRANCH_RGBD(0)
+  //    或 RECON_BRANCH_MONO(1) 才算强制分支，其余一律走自动探测。故这里是
+  //    「传一个越界位模式」而非「传一个合法枚举值」，`static_cast` 正是这个
+  //    意图的准确表达（与 iOS 侧 `recon_pipeline_branch(rawValue: 0xFFFF_FFFF)`
+  //    的 `Int32(bitPattern:)` 逐位一致）。
+  cfg.forced_branch = static_cast<recon_pipeline_branch>(0xFFFFFFFFu);
   cfg.preset = preset;
   cfg.max_threads = (max_threads > 0) ? static_cast<uint32_t>(max_threads) : 0u;
   cfg.enable_rgbd = 1;

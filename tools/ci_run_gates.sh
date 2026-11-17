@@ -38,9 +38,13 @@
 #   neg-parity
 #   shaders   着色器两端一致性（P1..P15）
 #   neg-shaders
-#   android   Android 静态契约（G-AND-1..5：JNI target 覆盖 / loadLibrary 动态库形态 /
-#             Manifest 资源与类名 / Kotlin 依赖 / res 反空）
-#   neg-android  上条的负向注入（15 项）
+#   android   Android 静态契约（G-AND-1..6：JNI target 覆盖 / loadLibrary 动态库形态 /
+#             Manifest 资源与类名 / Kotlin 依赖 / res 反空 / 转发壳与根 CMake 路径锚点）
+#   neg-android  上条的负向注入（24 项）
+#   jni       Android JNI 桥接层的**语法-类型**闸门（G-AND-7：用 tools/jni_stub.h
+#             替代 NDK 的 jni.h + `-fsyntax-only`）—— ⚠️ 这是**唯一**必须调编译器
+#             的静态闸门，故独立成能力点；找不到 C++ 编译器时**硬失败**（fail-closed）
+#   neg-jni   上条的负向注入（7 项，含 CI #10 真实错误还原）
 #   toolchain Android 工具链版本一致性（NDK/AGP/Gradle/Kotlin/CMake 五处声明）
 #   neg-toolchain 上条的负向注入（12 项）
 #   elf       ELF PT_LOAD 对齐解析器自检（16 KB 门禁的判据实现本体）
@@ -89,7 +93,7 @@ cd "${ROOT}"
 # ---------------------------------------------------------------------------
 # 能力点全集（顺序 = 执行顺序，且与并入本脚本之前的 YAML step 顺序逐条对应）
 # ---------------------------------------------------------------------------
-CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android toolchain neg-toolchain elf abi params license shell neg-shell xcodegen"
+CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android jni neg-jni toolchain neg-toolchain elf abi params license shell neg-shell xcodegen"
 
 # 互为「组合选择器 → 能力点」的展开表。
 # 键与值都只用空格分隔的普通字符串（bash 3.2 无关联数组，macOS 上也能跑）。
@@ -100,9 +104,10 @@ selector_expand() {
     parity)     echo "generate parity neg-parity" ;;
     shaders)    echo "shaders neg-shaders" ;;
     android)    echo "android neg-android" ;;
+    jni)        echo "jni neg-jni" ;;
     toolchain)  echo "toolchain neg-toolchain" ;;
-    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-toolchain neg-shell" ;;
-    generate | neg-ios | ipa | neg-parity | neg-shaders | neg-android | neg-toolchain | \
+    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-jni neg-toolchain neg-shell" ;;
+    generate | neg-ios | ipa | neg-parity | neg-shaders | neg-android | neg-jni | neg-toolchain | \
     elf | abi | params | license | shell | neg-shell | xcodegen)
                 echo "$1" ;;
     *)          return 1 ;;
@@ -173,7 +178,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ⚠️ 本列表必须与 `selector_expand` 的分支**逐项一致**（含组合选择器）。
   #    漏一个组合选择器 → 它的展开结果不参与下面的 ③ 并集断言，
   #    于是"该选择器指向已被删除的能力点"这类错误不会被发现。
-  for s in generate ios ipa parity shaders android toolchain elf negative abi params license shell xcodegen; do
+  for s in generate ios ipa parity shaders android jni toolchain elf negative abi params license shell xcodegen; do
     caps="$(parse_selector "${s}")" || { echo "::error::选择器 ${s} 解析失败"; fail=1; continue; }
     n="$(echo "${caps}" | wc -w | tr -d ' ')"
     echo "  - ${s} → ${n} 个：${caps}"
@@ -192,7 +197,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ③ 并集 == all，且每个能力点都可达（有选择器能选到它）
   #    ⚠️ 同上：列表必须与 selector_expand 的分支逐项一致。
   union=""
-  for s in generate ios ipa parity shaders android toolchain elf negative abi params license shell xcodegen; do
+  for s in generate ios ipa parity shaders android jni toolchain elf negative abi params license shell xcodegen; do
     union="${union} $(parse_selector "${s}")"
   done
   for c in ${CAPS_ALL}; do
@@ -298,6 +303,28 @@ fi
 if wants neg-android; then
   step "Android 契约负向注入（证明 G-AND 判据非假闸门）" \
     "${PY}" tools/verify_android_contract_negative.py
+fi
+
+# --- Android JNI 桥接层的**语法-类型**闸门（G-AND-7）-----------------------
+# 为什么独立成能力点、且**必须**在静态 job 里跑：
+#   桥接 `.cpp` 只挂在根 CMakeLists 的 `if(RECON_PLATFORM_ANDROID)` 分支，
+#   开发机无 NDK → 这一层 C++ **从未被本机编译过**，任何语法/类型错误只能等
+#   Android CI 真编译才暴露（CI run #10 就是这样丢的：`unsigned int` 隐式转
+#   枚举，C 允许、**C++ 不允许** —— 恰好只有 C++ 编译器能发现）。
+#   本闸门用 `tools/jni_stub.h` + `-fsyntax-only` 把这一层搬到任何带 C++ 的机器。
+#   ⚠️ 它是**唯一**必须 shell out 到编译器的静态闸门（其余都是一句话能跑的
+#      纯 Python 解析）—— 这一点与 `check_android_contract.py` 的第一原则
+#      （"不依赖工具输出"）冲突，故**不并入**那份闸门，而是独立成能力点。
+#      找不到编译器时它**硬失败**（fail-closed，绝不静默跳过）。
+#   ⚠️ 它**不替代** Android CI 的真编译（`-fsyntax-only` 不生成代码、不链接），
+#      只是把反馈周期从"分钟级 CI"压到"秒级本机"。
+if wants jni; then
+  step "Android JNI 桥接语法闸门（G-AND-7：jni_stub.h + -fsyntax-only）" \
+    "${PY}" tools/check_jni_bridge_syntax.py
+fi
+if wants neg-jni; then
+  step "JNI 桥接语法闸门负向注入（含 CI #10 真实错误还原）" \
+    "${PY}" tools/verify_jni_bridge_syntax_negative.py
 fi
 
 # --- Android 工具链版本一致性（五处声明 vs docs/12 §3.1 锁定值）-------------

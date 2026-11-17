@@ -827,6 +827,26 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   add_test(NAME abi_drift_negative
     COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_abi_drift_negative.py"
             --root "${RECON_REPO_ROOT}")
+  # Android JNI 桥接层的**语法-类型**闸门（缺口 AX，2026-11-02 新增）。
+  # ⚠️ 本地无 NDK 时桥接 C++（platform/android/.../*.cpp）**不在任何编译单元里**
+  #    → 语法/类型错误只能等 Android CI 真编译才暴露（CI #10 的
+  #    `unsigned int` 隐式转枚举就是这么丢的，C 允许、C++ 不允许）。
+  #    本闸门用 tools/jni_stub.h + `-fsyntax-only` 把这一层搬到本机。
+  #    它是唯一会 shell out 到编译器的静态闸门；找不到编译器时**硬失败**
+  #    （fail-closed）—— 故列入 ctest 前先探测一次编译器存在性，避免把
+  #    「本机没装编译器」误报成「契约违规」（两者的修法完全不同）。
+  find_program(RECON_CXX_FOR_JNI_GATE NAMES clang++ g++ c++ cc)
+  if(RECON_CXX_FOR_JNI_GATE)
+    add_test(NAME jni_bridge_syntax
+      COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_jni_bridge_syntax.py"
+              --root "${RECON_REPO_ROOT}")
+    add_test(NAME jni_bridge_syntax_negative
+      COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_jni_bridge_syntax_negative.py")
+  else()
+    message(STATUS
+      "未找到 C++ 编译器 —— 跳过 ctest 的 jni_bridge_syntax（该闸门需要编译器；"
+      "Android CI 的 static-contract job 里仍会跑，找不到编译器时它硬失败）。")
+  endif()
 endif()
 endif()
 
