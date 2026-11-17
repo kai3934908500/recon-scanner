@@ -341,6 +341,41 @@ def build_injections() -> list[Injection]:
             "add_executable(test_",
             "add_executable_renamed(test_",
             count=22),
+        # ── G-AND-8：16 KB 参数必须按 ABI 分支挂载 ──────────────────────
+        # 复现 CI #11 的真实缺陷形态：把 ABI 分支拆掉 → 参数无条件生效 →
+        # armeabi-v7a 也被抬到 16 KB（违反 docs/12 §3.2）。
+        PatchInjection(
+            "G-AND-8/unconditional-align",
+            "G-AND-8",
+            "把 `if(_recon_abi IN_LIST RECON_16KB_ABIS)` 改成 `if(TRUE)` "
+            "（= CI #11 那个把 32 位抬到 16 KB 的无条件挂载写法）",
+            C,
+            "if(_recon_abi IN_LIST RECON_16KB_ABIS)",
+            "if(TRUE)"),
+        PatchInjection(
+            "G-AND-8/align-outside-branch",
+            "G-AND-8",
+            "把 `add_link_options(...)` 挪到 `else()` 之后（= 落到 else 分支，"
+            "对 32 位反而生效、对 64 位失效）",
+            C,
+            "    add_link_options(${RECON_LINK_ALIGN_FLAGS})\n",
+            "    message(STATUS \"moved\")\n",
+            count=1),
+        PatchInjection(
+            "G-AND-8/whitelist-loses-x86_64",
+            "G-AND-8",
+            "把 ABI 白名单里的 `x86_64` 删掉（该 ABI 失去 16 KB 合规，"
+            "而 Play 政策覆盖两个 64 位 ABI）",
+            C,
+            'set(RECON_16KB_ABIS "arm64-v8a" "x86_64")',
+            'set(RECON_16KB_ABIS "arm64-v8a")'),
+        PatchInjection(
+            "G-AND-8/whitelist-gains-v7a",
+            "G-AND-8",
+            "把 `armeabi-v7a` 加进白名单（与 docs/12 §3.2「保持 4 KB」直接冲突）",
+            C,
+            'set(RECON_16KB_ABIS "arm64-v8a" "x86_64")',
+            'set(RECON_16KB_ABIS "arm64-v8a" "x86_64" "armeabi-v7a")'),
     ]
 
 

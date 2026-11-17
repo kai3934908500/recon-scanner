@@ -156,34 +156,67 @@ fi
 # ---------------------------------------------------------------------------
 # 检查 3（先做，因为不依赖 strip）：armeabi-v7a 必须仍为 4 KB
 # ---------------------------------------------------------------------------
-# 文档表述是「不适用，保持 4 KB」。这里把它做成**正向断言**：
-# 32 位 ELF 的 p_align 应当恰好是 0x1000；若变成 0x4000，说明
+# 文档表述是「不适用，保持 4 KB」。这里把它做成**正向断言**：32 位 ELF 的
+# p_align 应当 <= 0x1000；若出现 0x4000，说明
 # `-Wl,-z,max-page-size=16384` 被**无条件**加到了 32 位 target 上 ——
-# 那会让 4 KB 页设备上的 .so 体积虚增（对齐填充），属真实副作用。
+# 那会让 4 KB 页设备上的 .so 体积虚增（对齐填充），且与 docs/12 §3.2 的
+# 「明确不做：不在 armeabi-v7a 上做 16 KB 对齐」直接冲突。
+#
+# ⚠️ 本条曾被**写成了一个零检测力的假闸门**（CI #11 后由本机端到端复核发现）：
+#   原实现问的是「`--min-align 0x4000` 是否**失败**」，靠失败来反推「是 4 KB」。
+#   但 armeabi-v7a 目录里混有**第三方预编译库**（libarcore_sdk_c/jni、
+#   libc++_shared —— 它们不受我们的 CMake 链接参数控制，实测本来就是 0x1000），
+#   于是 `all(a >= 0x4000)` 恒为假 → 恒「失败」→ 恒判「符合 ✓」。
+#   而真实 CI 产物里**本案自建**的 librecon_core.so / librecon_platform_android.so
+#   恰恰是 0x4000 —— 假闸门把真缺陷放过去了整整一路。
+#   修法有两层（缺一不可）：
+#     ① 判据方向显式化：改用 `--max-align 0x1000`（正向断言，不再靠"失败"反推）；
+#     ② 判据范围收敛：**只判本案自建的 .so**（白名单前缀），第三方预编译库
+#        的对齐由它们自己的发布方决定，混进来只会稀释判据。
+#   回归防线：elf_load_align.py --self-test 的 bad-max-* 用例。
 echo ""
-echo "== 检查 3：armeabi-v7a 保持 4 KB 页对齐（0x1000）=="
-mapfile -t sos32 < <(find_so "armeabi-v7a")
+echo "== 检查 3：armeabi-v7a 保持 4 KB 页对齐（p_align <= 0x1000）=="
+mapfile -t sos32_all < <(find_so "armeabi-v7a")
+# 只保留本案自建的 .so（第三方预编译库不归我们的链接参数管，见上方注释）。
+RECON_OWN_PREFIXES=("librecon_")
+sos32=()
+for s in "${sos32_all[@]}"; do
+  b="$(basename "$s")"
+  for pre in "${RECON_OWN_PREFIXES[@]}"; do
+    case "$b" in "${pre}"*) sos32+=("$s") ;; esac
+  done
+done
 if [ "${#sos32[@]}" -eq 0 ]; then
-  note "armeabi-v7a: 未产出该 ABI 的 .so（跳过；不适用 16 KB 规则）"
+  note "armeabi-v7a: 未产出**本案自建**的 .so（第三方预编译库 ${#sos32_all[@]} 个不参与本判据）"
 else
-  echo "--- armeabi-v7a：${#sos32[@]} 个 .so ---"
-  "${PY}" "${SCRIPT_DIR}/elf_load_align.py" --report --min-align 0x1000 "${sos32[@]}" || true
-  # 正向断言：32 位 **不得**满足 16 KB 门槛。
-  #   判据形式：`--min-align 0x4000` 必须**失败**（rc=3）。
-  #   若它 rc=0，说明 armeabi-v7a 的 LOAD 段全部 >= 0x4000 —— 即
-  #   `-Wl,-z,max-page-size=16384` 被无条件套到了 32 位 target 上，
-  #   会让 4 KB 页设备上的 .so 因对齐填充而虚增体积（docs/12 §3.2）。
-  #   反过来若 rc 既不是 0 也不是 3（如 1），说明脚本用法/环境出错，也判失败。
+  echo "--- armeabi-v7a：本案自建 ${#sos32[@]} 个 .so（另有第三方 ${#sos32_all[@]} 个不判）---"
+  # 正向断言：每一个本案自建的 32 位 .so，其**全部** LOAD 段必须 <= 0x1000。
+  #   rc=0 → 符合 4 KB；rc=3 → 出现了 0x4000（真实缺陷）；其它 → 判据本身出错。
   set +e
   "${PY}" "${SCRIPT_DIR}/elf_load_align.py" --no-cross-check \
-      --min-align 0x4000 "${sos32[@]}" >/dev/null 2>&1
+      --max-align 0x1000 "${sos32[@]}"
   rc32=$?
   set -e
   case "${rc32}" in
-    3) note "armeabi-v7a 未达 16 KB 门槛 → 4 KB 口径符合 docs/12 §3.2 ✓" ;;
-    0) bad "armeabi-v7a 的 .so 竟然全部 >= 0x4000 —— 疑似把 16 KB 对齐参数"$'\n'"  误加到 32 位 target 上（docs/12 §3.2：32 位保持 4 KB）" ;;
+    0) note "armeabi-v7a 自建 .so 全部 <= 0x1000 → 4 KB 口径符合 docs/12 §3.2 ✓" ;;
+    3) bad "armeabi-v7a 的**自建** .so 出现 > 0x1000 的 LOAD 段 —— 疑似把"$'\n'"  16 KB 对齐参数（-Wl,-z,max-page-size=16384）**无条件**套到了 32 位"$'\n'"  target 上。docs/12 §3.2 明文：armeabi-v7a 保持 4 KB、不做 16 KB 对齐" ;;
     *) bad "armeabi-v7a 检查以异常退出码 ${rc32} 结束（既非 0 也非 3）—— 判据本身出错" ;;
   esac
+  # 附带留档：第三方预编译库的实际值（不判定，只报告）
+  third=()
+  for s in "${sos32_all[@]}"; do
+    b="$(basename "$s")"
+    is_own=0
+    for pre in "${RECON_OWN_PREFIXES[@]}"; do
+      case "$b" in "${pre}"*) is_own=1 ;; esac
+    done
+    [ "$is_own" -eq 0 ] && third+=("$s")
+  done
+  if [ "${#third[@]}" -gt 0 ]; then
+    note "第三方预编译库（不判，仅留档；其对齐由各自发布方决定）："
+    "${PY}" "${SCRIPT_DIR}/elf_load_align.py" --report --no-cross-check \
+      "${third[@]}" 2>/dev/null | sed 's/^报告  /    /' || true
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -10,12 +10,12 @@
 #       这些检查与编译器无关，故不必耗 macOS 分钟数。
 #       （闸门 → 命令的映射集中在 tools/ci_run_gates.sh，可用 workflow_dispatch
 #        的 `gates` 输入收窄；见该脚本文件头。）
-#   build-xcframework —— 跑在 macos-26 上，真正编译三个静态库并打包 xcframework。
+#   build-xcframework —— 跑在 macos-15 上，真正编译三个静态库并打包 xcframework。
 #   shaders-vulkan   —— 跑在 ubuntu 上，用 glslangValidator 把 8 个 `.comp`
 #       **真编译**为 SPIR-V。补的是"8 个 Vulkan 着色器从未过编译器"的盲区：
 #       shader_parity.py 只做两端源码层比对，查不出 GLSL 自身的语法错误。
 #       （Metal 侧相反，只能靠 `xcrun metal`，故在 macOS job 内。）
-#   build-app        —— 跑在 macos-26 上，编整机 App。两轮编译：① simulator
+#   build-app        —— 跑在 macos-15 上，编整机 App。两轮编译：① simulator
 #       （验证 Swift/ObjC++ 可编译 + zlib 链入判据）；② device **归档** →
 #       手工打**未签名 IPA**（`Payload/` + zip，不用 `-exportArchive`：它强制
 #       签名，而 CI 无 Apple 凭据）→ 产物结构判据 P-1..P-9 → 上传 artifact。
@@ -39,16 +39,29 @@
 #     回退 —— 代码写了但从未被编过，是「静默失效」的一类）。
 #   · **Xcode 26 起 Metal 工具链被从 Xcode 中剥离**为按需下载组件，独立装需
 #     `xcodebuild -downloadComponent MetalToolchain`（约 700 MB，且需 Apple ID
-#     登录，匿名会 401）。**但 GitHub Actions 的 `macos-26` 镜像已预置该工具链**
-#     （runner-images 已确认可直接构建 Metal；已知问题仅出现在使用
-#     `codeql-action/init` 之后，与本项目无关）。故改用 macos-26 而非
-#     "在 macos-15 上下载工具链"。
+#     登录，匿名会 401）。**GitHub Actions 的镜像已预置该工具链**，故无需自行下载。
+#     ⚠️ 这里有一条**已被 CI 实证推翻**的早期判断，留档以免重犯：
+#        早期注释写「macos-26 镜像预置工具链 → 故改用 macos-26，而非在 macos-15
+#        上下载工具链」。前半句（macos-26 预置）成立，但**macos-15 同样预置** ——
+#        runner-images 维护者在 issue #13080 明示「可为 macOS 15 镜像提供
+#        Xcode 26.0.1 的 MetalToolchain，测试显示可用」。所以「为拿工具链而选
+#        macos-26」这个理由**不成立**，它不是选 macos-26 的充分条件。
+#   · **为什么现在跑 macos-15 而不是 macos-26（2026-11-17 实测回退）**：
+#     macos-26 遭遇 GitHub 平台侧 macOS runner **容量故障** —— 本项目 CI
+#     #29/#30/#31/#32 的 macOS job **四次全部** `runner_name=''` / `runner_id=0` /
+#     `steps=[]`，排队**恰好 15 分 01 秒**后被 cancelled（ubuntu job 秒级成功）。
+#     该症状与 GitHub community discussion #212069 逐字相同，已定性为**平台侧**
+#     故障而非本项目配置。同期 macos-15 的 CI #25–#28 全部 success。
+#   · 回退**不损失** Liquid Glass 真编译保障 —— 已核实 runner-images macos-15
+#     Readme：该镜像预装 Xcode **26.0.1 / 26.1.1 / 26.2 / 26.3**（含 iOS 26 SDK），
+#     只是**默认**是 16.4。故选择步骤显式切到 26.x 即可（已实现 + 主版本断言）。
+#     若哪天 macos-26 容量恢复，可把下面两处 `runs-on` 改回 —— 选择步骤无需改动。
 #   · 本项目**必须编译 Metal 着色器**（shaders/metal/*.metal）与 RealityKit，
 #     两者都需 Metal 编译器。**选择 Xcode 的步骤里当场断言 `xcrun --find metal`
 #     可用** —— fail-closed：若镜像哪天不再预置，CI 会在十几秒内明确报错，
 #     而不是等到 CompileMetalFile 阶段才抛 "missing Metal Toolchain"。
 #   · 若将来镜像或 Xcode 版本变化，改这里的 Xcode 选择式即可；**不要**退回
-#     macos-15/Xcode 16.4 —— 那会让 `.glassEffect` 永远走不到真分支。
+#     镜像默认的 Xcode 16.4 —— 那会让 `.glassEffect` 永远走不到真分支。
 
 name: iOS
 
@@ -187,8 +200,8 @@ jobs:
   # 真正编译静态库 + 打包 xcframework（macOS）
   # ===========================================================================
   build-xcframework:
-    name: 构建 ReconCore.xcframework（macos-26 / Xcode 26）
-    runs-on: macos-26
+    name: 构建 ReconCore.xcframework（macos-15 / Xcode 26）
+    runs-on: macos-15
     needs: static-contract
     steps:
       - uses: actions/checkout@v4
@@ -201,16 +214,23 @@ jobs:
       - name: 选择 Xcode 26
         run: |
           set -euo pipefail
-          # macos-26 镜像预装 Xcode 26.x（可能多个小版本）。取镜像自带的默认
-          # 26.x：不硬编具体小版本，避免镜像更新后路径不存在而整体挂掉。
-          # 优先显式挑一个已知存在的大版本目录，找不到则用默认。
-          if [ -d /Applications/Xcode_26.0.app ]; then
-            sudo xcode-select -s /Applications/Xcode_26.0.app
-          fi
+          # macos-15 镜像**默认 Xcode 是 16.4**（会静默跳过 .glassEffect），
+          # 但镜像同时预装了 26.0.1 / 26.1.1 / 26.2 / 26.3 —— 必须显式切到 26.x。
+          # 优先 26.0：runner-images 明示「macOS 15 镜像已为 Xcode 26.0.1 预置
+          # Metal 工具链」（issue #13080），而更高小版本是否预置**未证实**；
+          # 故按「已证实有工具链的版本优先」排序，后面若干项只是镜像收敛到
+          # 单一版本时的兜底，避免目录不存在就整体挂掉。
+          for cand in 26.0 26.1.1 26.1 26.2 26.3; do
+            if [ -d "/Applications/Xcode_${cand}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${cand}.app"
+              break
+            fi
+          done
           xcode-select -p
           xcodebuild -version
           # 断言：所选 Xcode 的主版本必须是 26（否则 #if compiler(>=6.2) 恒假，
           # .glassEffect 会被静默跳过 —— 那正是本 job 要防的「静默失效」）。
+          # fail-closed：若上面的目录一个都不存在，这里会停在默认的 16.4 而明确报错。
           XV=$(xcodebuild -version | awk '/^Xcode /{print $2}')
           echo "Xcode 主版本 = ${XV}"
           case "${XV}" in
@@ -677,7 +697,7 @@ jobs:
   #   所以"关掉它 = 少验证一层"这件事在日志里是显式的（该 job 显示 skipped）。
   build-app:
     name: 编 Recon.app（simulator 校验 + device 归档）+ 打未签名 IPA
-    runs-on: macos-26
+    runs-on: macos-15
     needs: build-xcframework
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_build_app }}
     steps:
@@ -690,16 +710,22 @@ jobs:
       - name: 选择 Xcode 26
         run: |
           set -euo pipefail
-          # 与 build-xcframework 同一套选择逻辑（见该 job 的注释）。
-          if [ -d "/Applications/Xcode_26.0.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_26.0.app
-          fi
+          # 与 build-xcframework 同一套选择逻辑（见该 job 的注释与 macos-15 说明）。
+          for cand in 26.0 26.1.1 26.1 26.2 26.3; do
+            if [ -d "/Applications/Xcode_${cand}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${cand}.app"
+              break
+            fi
+          done
           xcodebuild -version
           XV=$(xcodebuild -version | awk '/^Xcode /{print $2}')
           case "${XV}" in
             26.*) : ;;
             *) echo "::error::Xcode 版本为 ${XV}，本 workflow 要求 26.x"; exit 1 ;;
           esac
+          # Metal 工具链 fail-closed 断言（与 build-xcframework 同因）。
+          xcrun -sdk iphoneos --find metal
+          xcrun -sdk iphoneos --find metallib
 
       # ⚠️ `path` 必须**就是** xcframework 目录名，因为 artifact 里不带这一层。
       #    CI 实证（build-app 第一轮失败即此）：upload-artifact 以「上传路径的公共

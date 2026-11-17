@@ -68,6 +68,7 @@ on:
       - "tools/verify_toolchain_negative.py"
       - "tools/check_16kb.sh"
       - "tools/elf_load_align.py"
+      - "tools/verify_abi_align_negative.py"
       - "tools/check_platform_parity.py"
       - "tools/verify_platform_parity_negative.py"
       - "tools/shader_parity.py"
@@ -94,6 +95,7 @@ on:
       - "tools/verify_toolchain_negative.py"
       - "tools/check_16kb.sh"
       - "tools/elf_load_align.py"
+      - "tools/verify_abi_align_negative.py"
       - "tools/check_platform_parity.py"
       - "tools/verify_platform_parity_negative.py"
       - "tools/shader_parity.py"
@@ -382,14 +384,47 @@ jobs:
         with:
           python-version: "3.12"
 
-      # artifact 里保存的是**仓库相对路径**（见 build job 的 upload path），
-      # 故下载到工作区根即可让 `platform/android/app/build/...` 还原原位 ——
-      # 这样 `check_16kb.sh` 的默认路径推导（APP_DIR=platform/android/app）
-      # 无需任何改动就能命中，不必传 --build-dir（少一处需要维护的耦合）。
+      # ⚠️ artifact 内部**不带** `platform/android/app/build/` 这一层（CI #11 实证）。
+      #   `upload-artifact@v4` 以**所有 path 的最长公共祖先**为 artifact 根：
+      #   本 workflow 上传的三个 glob 的 LCA 是 `platform/android/app/build`
+      #   （日志原话：`The least common ancestor is .../platform/android/app/build.
+      #    This will be the root directory of the artifact`），故包内条目是
+      #   `outputs/apk/...` 与 `intermediates/...`（已下载该 run 的 artifact zip
+      #   逐条核实，共 36 条，无 `platform/` 前缀）。
+      #   ⇒ 下载必须**显式**把目标目录设为 `platform/android/app/build`，才能让
+      #      `check_16kb.sh` 的默认推导（BUILD_BASE=platform/android/app/build）
+      #      命中；否则内容会落到工作区根，脚本报「未找到任何 .so 产物」。
+      #      （此处旧注释曾**假设** artifact 保存的是「仓库相对路径」—— 那是未
+      #        经验证的假设，CI #11 因此失败。登记为 docs/14 缺口 AZ；同轮由
+      #        真实产物复核发现的假闸门 + 32 位对齐偏差见缺口 AY。）
       - name: 下载构建产物（APK + .so）
         uses: actions/download-artifact@v4
         with:
           name: android-apk
+          path: platform/android/app/build
+
+      # 落位断言：把「artifact 目录层被展开 / 落错目录」与「构建根本没跑」**分开**。
+      #   两者都表现为 check_16kb.sh 的「未找到产物」，但根因完全不同 ——
+      #   前者是 CI 配置缺陷（改 workflow），后者是构建失败（改代码）。
+      #   不区分就会像无头苍蝇一样改本来没问题的脚本。
+      - name: 校验下载落位
+        run: |
+          set -euo pipefail
+          B=platform/android/app/build
+          missing=0
+          for d in "$B/outputs/apk/debug" "$B/outputs/apk/release" "$B/intermediates"; do
+            if [ ! -d "$d" ]; then
+              echo "::error::artifact 解包后缺少 ${d}（下载 path 与 artifact 内部结构不符？）"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "--- 实际解出内容（depth<=3）---"
+            find . -maxdepth 3 -not -path './.git/*' | sort | head -60 || true
+            exit 1
+          fi
+          echo "OK：APK / .so 落位正确"
+          find "$B/outputs/apk" -name '*.apk' | sort
 
       # check_16kb.sh 会**自己**去 ANDROID_HOME/ANDROID_SDK_ROOT 下找最高版本的
       # build-tools/zipalign（见脚本「定位 zipalign」段）。故这里只需把 SDK 装好、

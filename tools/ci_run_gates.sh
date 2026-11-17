@@ -48,6 +48,10 @@
 #   toolchain Android 工具链版本一致性（NDK/AGP/Gradle/Kotlin/CMake 五处声明）
 #   neg-toolchain 上条的负向注入（12 项）
 #   elf       ELF PT_LOAD 对齐解析器自检（16 KB 门禁的判据实现本体）
+#   neg-abi-align  「按 ABI 分别判页对齐」判据的负向注入（5 项，含 CI #11 的
+#             32 位被抬到 16 KB 的真实缺陷形态）—— 这条判据曾是**假闸门**
+#             （靠 `--min-align 0x4000` 的失败反推 4 KB，而集合里混有第三方
+#             4 KB 库 → 恒判通过），故必须用注入钉住它别再退化。
 #   abi       C ABI 漂移闸门
 #   params    参数契约漂移闸门
 #   license   第三方许可扫描（GPL 家族硬阻断）
@@ -93,7 +97,7 @@ cd "${ROOT}"
 # ---------------------------------------------------------------------------
 # 能力点全集（顺序 = 执行顺序，且与并入本脚本之前的 YAML step 顺序逐条对应）
 # ---------------------------------------------------------------------------
-CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android jni neg-jni toolchain neg-toolchain elf abi params license shell neg-shell xcodegen"
+CAPS_ALL="generate ios neg-ios ipa parity neg-parity shaders neg-shaders android neg-android jni neg-jni toolchain neg-toolchain elf neg-abi-align abi params license shell neg-shell xcodegen"
 
 # 互为「组合选择器 → 能力点」的展开表。
 # 键与值都只用空格分隔的普通字符串（bash 3.2 无关联数组，macOS 上也能跑）。
@@ -106,9 +110,9 @@ selector_expand() {
     android)    echo "android neg-android" ;;
     jni)        echo "jni neg-jni" ;;
     toolchain)  echo "toolchain neg-toolchain" ;;
-    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-jni neg-toolchain neg-shell" ;;
+    negative)   echo "neg-ios neg-parity neg-shaders neg-android neg-jni neg-toolchain neg-shell neg-abi-align" ;;
     generate | neg-ios | ipa | neg-parity | neg-shaders | neg-android | neg-jni | neg-toolchain | \
-    elf | abi | params | license | shell | neg-shell | xcodegen)
+    elf | neg-abi-align | abi | params | license | shell | neg-shell | xcodegen)
                 echo "$1" ;;
     *)          return 1 ;;
   esac
@@ -178,7 +182,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ⚠️ 本列表必须与 `selector_expand` 的分支**逐项一致**（含组合选择器）。
   #    漏一个组合选择器 → 它的展开结果不参与下面的 ③ 并集断言，
   #    于是"该选择器指向已被删除的能力点"这类错误不会被发现。
-  for s in generate ios ipa parity shaders android jni toolchain elf negative abi params license shell xcodegen; do
+  for s in generate ios ipa parity shaders android jni toolchain elf negative neg-abi-align abi params license shell xcodegen; do
     caps="$(parse_selector "${s}")" || { echo "::error::选择器 ${s} 解析失败"; fail=1; continue; }
     n="$(echo "${caps}" | wc -w | tr -d ' ')"
     echo "  - ${s} → ${n} 个：${caps}"
@@ -197,7 +201,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # ③ 并集 == all，且每个能力点都可达（有选择器能选到它）
   #    ⚠️ 同上：列表必须与 selector_expand 的分支逐项一致。
   union=""
-  for s in generate ios ipa parity shaders android jni toolchain elf negative abi params license shell xcodegen; do
+  for s in generate ios ipa parity shaders android jni toolchain elf negative neg-abi-align abi params license shell xcodegen; do
     union="${union} $(parse_selector "${s}")"
   done
   for c in ${CAPS_ALL}; do
@@ -345,6 +349,18 @@ fi
 if wants elf; then
   step "ELF PT_LOAD 对齐解析器自检（合成 ELF + 反空约束）" \
     "${PY}" tools/elf_load_align.py --self-test
+fi
+
+# --- 「按 ABI 分别判页对齐」判据的负向注入 --------------------------------
+# 为什么单列：这条产物侧判据**曾是假闸门**（见 verify_abi_align_negative.py
+# 的文件头）—— 它靠「`--min-align 0x4000` 失败」反推「是 4 KB」，而目录里
+# 混有第三方 4 KB 库 → 恒判通过。CI #11 的真实产物里，本案自建的 32 位
+# .so 被 16 KB 对齐（违反 docs/12 §3.2）而闸门毫无反应。
+# 注入用**合成 ELF** 作判据的目标对象，故不需要 Android SDK（任何机器可跑）。
+# 它同时覆盖 CMake 根因侧的 G-AND-8（静态闸门）。
+if wants neg-abi-align; then
+  step "「按 ABI 分别判页对齐」负向注入（5 项，含 CI #11 真实缺陷形态）" \
+    "${PY}" tools/verify_abi_align_negative.py --root "${ROOT}"
 fi
 
 if wants abi; then

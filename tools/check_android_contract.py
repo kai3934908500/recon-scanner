@@ -94,6 +94,18 @@ G-AND-6  薄壳转发路径的上级层数（`src/main/cpp/CMakeLists.txt`）
          **以语句数为落点的反空约束** —— 实测把源文件语句全删后
          `target_sources` 仍贡献 token 数，若反空只看 token 数会静默通过。
 
+G-AND-8  16 KB 页对齐参数必须**按 ABI 分支**挂载
+         根 CMakeLists 的 `add_link_options(${RECON_LINK_ALIGN_FLAGS})` 必须在
+         「ABI ∈ 64 位白名单」的分支内。无条件挂载会把 armeabi-v7a 也抬到 16 KB
+         —— CI #11 产物实证：本案自建的 librecon_core.so /
+         librecon_platform_android.so 在 armeabi-v7a 下 LOAD p_align = 0x4000，
+         而 docs/12 §3.2 明文「保持 4 KB」，并列入「明确不做」表。
+         决定性反证：同一构建里 NDK 出品的 libc++_shared.so 恰为 0x1000，
+         说明「NDK r28 默认 16 KB」只对 64 位成立。
+         ⚠️ 该缺陷曾长期存在而未被发现，因为**产物侧**判据
+         （`check_16kb.sh` 检查 3）当时是**假闸门**（详见该脚本注释）。
+         本判据把同一根因拉到**纯静态**层面，无 SDK 也能拦。
+
 包含的**反假绿**设计（本项目反复踩过的坑，逐条都对应真实事故）
 --------------------------------------------------------------
 1. **反空约束**：每个判据在「匹配数为 0」时**失败**，而非静默跳过。
@@ -933,6 +945,134 @@ def judge_g6_forwarder_path(rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
+# G-AND-8：16 KB 页对齐参数必须**按 ABI 分支**挂载（32 位保持 4 KB）
+# ---------------------------------------------------------------------------
+def judge_g8_align_by_abi(rep: Report) -> None:
+    """G-AND-8：根 CMakeLists 的 `add_link_options(${RECON_LINK_ALIGN_FLAGS})`
+    必须在「ABI ∈ 64 位白名单」的分支内，**不得**无条件挂载。
+
+    真实事故（CI #11 产物实证，第五十一轮发现）
+    ------------------------------------------
+    根 CMakeLists 原先把 `-Wl,-z,max-page-size=16384` **无条件**加到全部 ABI。
+    后果：armeabi-v7a 下**本案自建**的 librecon_core.so /
+    librecon_platform_android.so 的 LOAD p_align 被抬到 **0x4000（16 KB）**，
+    而 docs/12 §3.2 明文「armeabi-v7a：**不适用**，保持 4 KB 页对齐」，
+    并把它列入「**明确不做**：不在 armeabi-v7a 上做 16 KB 对齐」。
+
+    决定性反证：**同一构建**里 NDK 出品的 `libc++_shared.so` 在 armeabi-v7a
+    下恰为 `0x1000` —— 说明「NDK r28 默认 16 KB」只对 64 位 ABI 成立
+    （与 Google 官方页大小指南一致），是那条无条件参数把 32 位改坏的。
+
+    ⚠️ 为什么需要本静态判据（产物侧已有一条）：产物侧判据
+    （`check_16kb.sh` 检查 3）**需要一个真实的 Android 构建**才跑得起来，
+    而「参数挂载方式」在**纯静态**层面就能判 —— 让这类错误在无 SDK 的机器上
+    也拦得住（本项目「判据可被工具覆盖即等同于可被绕过」的教训）。
+
+    判据（三层，全部落在**目标文件**上，不落判据自述）
+    ------------------------------------------------
+      (a) 必须**存在** ABI 分支：根 CMakeLists 里要有对 64 位 ABI 白名单的
+          `IN_LIST` / `STREQUAL` 判定 —— 否则「无条件挂载」的老写法又回来了。
+      (b) `add_link_options(${RECON_LINK_ALIGN_FLAGS})` 必须**在**该分支的
+          `if(...)` 与 `else()/endif()` 之间（用**行区间**判定，不做文本模糊匹配）。
+      (c) 反空：ABI 白名单里必须同时含 `arm64-v8a` 与 `x86_64`（漏一个即
+          该 ABI 失去 16 KB 合规 —— 而 Google Play 的 16 KB 政策覆盖两个
+          64 位 ABI）。
+    """
+    if not _require(rep, ROOT_CMAKE, "G-AND-8：仓库根 CMakeLists.txt"):
+        return
+    text = strip_cmake_comments(read(ROOT_CMAKE))
+    lines = text.splitlines()
+
+    # ---- (c) 白名单内容 ------------------------------------------------
+    m_abis = re.search(r'set\(\s*RECON_16KB_ABIS\s+([^)]*)\)', text)
+    if not m_abis:
+        rep.err("G-AND-8",
+                "仓库根 CMakeLists.txt 里找不到 `set(RECON_16KB_ABIS ...)` —— "
+                "16 KB 页对齐的 ABI 白名单不存在，无法判定「按 ABI 分支」。"
+                "docs/12 §3.5 要求 64 位 ABI 启用、§3.2 要求 32 位保持 4 KB。")
+        return
+    abis = set(re.findall(r'"([^"]+)"', m_abis.group(1)))
+    for need in ("arm64-v8a", "x86_64"):
+        if need not in abis:
+            rep.err("G-AND-8",
+                    f"16 KB 页对齐的 ABI 白名单缺 `{need}`（现为 {sorted(abis)}）—— "
+                    f"该 ABI 将失去 16 KB 合规，而 Google Play 的 16 KB 政策"
+                    f"覆盖 arm64-v8a 与 x86_64 **两者**（docs/12 §3.2/§3.5）。")
+            return
+    if "armeabi-v7a" in abis:
+        rep.err("G-AND-8",
+                f"16 KB 页对齐的 ABI 白名单**含 `armeabi-v7a`**（现为 {sorted(abis)}）—— "
+                f"docs/12 §3.2 明文「armeabi-v7a 保持 4 KB、明确不做 16 KB 对齐」"
+                f"（32 位 ELF 页大小由设备 4 KB 页硬件决定）。")
+        return
+
+    # ---- (a) 必须存在 ABI 分支 -----------------------------------------
+    m_if = re.search(
+        r'^\s*if\(\s*_?recon_abi\s+IN_LIST\s+RECON_16KB_ABIS\s*\)', text, re.M)
+    if not m_if:
+        # 允许等价写法（直接 IN_LIST 常量，或 STREQUAL 枚举），但必须真的按 ABI 分支。
+        alt = re.search(r'^\s*if\([^\n)]*\b(?:IN_LIST|STREQUAL)\b[^\n)]*\)',
+                        text, re.M)
+        if not alt:
+            rep.err("G-AND-8",
+                    "仓库根 CMakeLists.txt 里找不到**按 ABI 分支**的 `if(...)` —— "
+                    "16 KB 参数疑似被**无条件**挂载（CI #11 的真实缺陷形态："
+                    "armeabi-v7a 的自建 .so 被抬到 0x4000，违反 docs/12 §3.2）。")
+            return
+        if_line = text[:alt.start()].count("\n")
+    else:
+        if_line = text[:m_if.start()].count("\n")
+
+    # 找该 if 对应的 `else()` / `endif()`（**行区间**，按配对计数）
+    depth = 0
+    else_line = None
+    endif_line = None
+    for i in range(if_line, len(lines)):
+        s = lines[i]
+        if re.match(r'^\s*if\s*\(', s):
+            depth += 1
+        elif re.match(r'^\s*endif\s*\(', s):
+            depth -= 1
+            if depth == 0:
+                endif_line = i
+                break
+        elif depth == 1 and else_line is None and re.match(r'^\s*else\s*\(', s):
+            else_line = i
+
+    # ---- (b) add_link_options 必须在分支内 ------------------------------
+    opt_line = None
+    for i, s in enumerate(lines):
+        if re.search(r'add_link_options\s*\(\s*\$\{RECON_LINK_ALIGN_FLAGS\}', s):
+            opt_line = i
+            break
+    if opt_line is None:
+        rep.err("G-AND-8",
+                "仓库根 CMakeLists.txt 里找不到 `add_link_options("
+                "${RECON_LINK_ALIGN_FLAGS})` —— 16 KB 页对齐参数根本没被挂载，"
+                "64 位 ABI 的 16 KB 合规无法保证（docs/12 §3.5）。")
+        return
+
+    hi = else_line if else_line is not None else endif_line
+    if endif_line is None or hi is None:
+        rep.err("G-AND-8",
+                "16 KB 参数的 `if(...)` 分支结构不完整（找不到配对的 "
+                "`else()`/`endif()`）—— 判据无法确定 add_link_options 的归属，"
+                "fail-closed 处理。")
+        return
+    if not (if_line < opt_line < hi):
+        rep.err("G-AND-8",
+                f"`add_link_options(${{RECON_LINK_ALIGN_FLAGS}})` 在第 {opt_line + 1} 行，"
+                f"但 ABI 分支体是第 {if_line + 1}..{hi} 行 —— 也就是说它落在"
+                f"**else 分支**或分支之外，等于**无条件**挂载。"
+                f"这会把 armeabi-v7a 也抬到 16 KB，违反 docs/12 §3.2"
+                f"（CI #11 的真实缺陷）。")
+        return
+
+    rep.note(f"G-AND-8 16 KB 参数按 ABI 分支挂载：白名单 {sorted(abis)} → "
+             f"add_link_options 在第 {opt_line + 1} 行（分支体 {if_line + 1}..{hi}）✓")
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def run(gates: set[str] | None = None) -> int:
@@ -946,7 +1086,7 @@ def run(gates: set[str] | None = None) -> int:
             print(f"::error::{e}")
         return 1
 
-    want = gates or {"1", "2", "3", "4", "5", "6"}
+    want = gates or {"1", "2", "3", "4", "5", "6", "8"}
 
     jni = collect_jni_symbols()
     cmake = collect_cmake_targets()
@@ -970,6 +1110,8 @@ def run(gates: set[str] | None = None) -> int:
                              collect_gradle_dependencies())
     if "6" in want:
         judge_g6_forwarder_path(rep)
+    if "8" in want:
+        judge_g8_align_by_abi(rep)
 
     for n in rep.notes:
         print(f"[android-contract] {n}")
@@ -978,7 +1120,7 @@ def run(gates: set[str] | None = None) -> int:
             print(f"::error::{e}")
         print(f"[android-contract] FAIL：{len(rep.errors)} 项违规")
         return 3
-    print("[android-contract] PASS：G-AND-1..6 全部通过")
+    print("[android-contract] PASS：G-AND-1..6 + G-AND-8 全部通过")
     return 0
 
 
@@ -986,11 +1128,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Android 侧静态契约闸门（无需 JDK/SDK/NDK）")
     ap.add_argument("--gates", default="",
-                    help="只跑指定判据，逗号分隔（1,2,3,4,5,6）。默认全跑。")
+                    help="只跑指定判据，逗号分隔（1,2,3,4,5,6,8）。默认全跑。")
     args = ap.parse_args()
     gates = {g.strip() for g in args.gates.split(",") if g.strip()}
-    if gates and not gates <= {"1", "2", "3", "4", "5", "6"}:
-        print(f"::error::未知判据：{sorted(gates - {'1','2','3','4','5','6'})}")
+    allowed = {"1", "2", "3", "4", "5", "6", "8"}
+    if gates and not gates <= allowed:
+        print(f"::error::未知判据：{sorted(gates - allowed)}")
         return 1
     return run(gates or None)
 

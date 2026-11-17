@@ -31,10 +31,14 @@
 
 用法
 ----
-  # 判据：这些 .so 的每个 LOAD 段 p_align 必须 >= 0x4000
+  # 判据（64 位）：这些 .so 的每个 LOAD 段 p_align 必须 >= 0x4000
   python tools/elf_load_align.py --min-align 0x4000 lib/*.so
 
-  # 报告模式：只打印，不判定（用于 armeabi-v7a 的 4 KB 现状留档）
+  # 判据（32 位，**反向**）：每个 LOAD 段 p_align 必须 <= 0x1000
+  #   —— 即「不得被 16 KB 对齐」；见 docs/12 §3.2 的 armeabi-v7a 行。
+  python tools/elf_load_align.py --max-align 0x1000 lib/armeabi-v7a/*.so
+
+  # 报告模式：只打印，不判定（用于现状留档）
   python tools/elf_load_align.py --report lib/armeabi-v7a/*.so
 
   # 自检（造合成 ELF，证伪解析与判定）
@@ -185,32 +189,57 @@ def _make_elf64(aligns: list[int]) -> bytes:
     return bytes(buf)
 
 
-def _judge(aligns: list[int], min_align: int) -> bool:
-    """与 run() 里的判定**同一逻辑**（下方 run 也调它，避免两处实现漂移）。"""
+def _judge(aligns: list[int], min_align: int | None = None,
+           max_align: int | None = None) -> bool:
+    """与 run() 里的判定**同一逻辑**（下方 run 也调它，避免两处实现漂移）。
+
+    两种方向互斥：
+      · min_align：每个 LOAD 段 **>=** 阈值（64 位 ABI 的 16 KB 要求）
+      · max_align：每个 LOAD 段 **<=** 阈值（32 位 ABI **不得**被 16 KB 对齐）
+
+    为什么要有 max 方向 —— 见 `check_16kb.sh` 检查 3 的注释：那里原先用
+    「`--min-align 0x4000` 必须失败」来反推「32 位是 4 KB」，这个反推
+    **逻辑上不成立**（集合里只要有一个第三方 4 KB 库，`all(a >= 0x4000)`
+    就恒为假，判据恒判通过 → 零检测力）。故把方向做成**显式参数**。
+    """
     if not aligns:
         raise ElfError("未读到任何 LOAD 段 —— 判据会退化成恒真，必须失败")
     if any(a == 0 for a in aligns):
         return False
-    return all(a >= min_align for a in aligns)
+    if min_align is not None and max_align is not None:
+        raise ElfError("--min-align 与 --max-align 互斥，不能同时给")
+    if min_align is not None:
+        return all(a >= min_align for a in aligns)
+    if max_align is not None:
+        return all(a <= max_align for a in aligns)
+    raise ElfError("既未给 --min-align 也未给 --max-align —— 判据无方向")
 
 
 def self_test() -> int:
     import tempfile
 
+    # (名称, LOAD 段 align 列表, min_align, max_align, 期望结果)
+    #   min/max 恰有一个非 None —— 两种方向都要有反例覆盖。
     cases = [
-        ("ok-16k",          [0x4000],            0x4000, True),
-        ("ok-16k-multi",    [0x4000, 0x4000],    0x4000, True),
-        ("bad-4k",          [0x1000],            0x4000, False),
-        ("bad-second-load", [0x4000, 0x1000],    0x4000, False),  # 抓「只看第一个」
-        ("bad-mixed32",     [0x1000, 0x4000],    0x4000, False),
-        ("bad-zero-align",  [0x4000, 0x0],       0x4000, False),
-        ("ok-larger",       [0x10000],           0x4000, True),
-        ("ok-4k-mode",      [0x1000],            0x1000, True),
-        ("bad-4k-mode",     [0x800],             0x1000, False),
+        ("ok-16k",          [0x4000],            0x4000, None, True),
+        ("ok-16k-multi",    [0x4000, 0x4000],    0x4000, None, True),
+        ("bad-4k",          [0x1000],            0x4000, None, False),
+        ("bad-second-load", [0x4000, 0x1000],    0x4000, None, False),  # 抓「只看第一个」
+        ("bad-mixed32",     [0x1000, 0x4000],    0x4000, None, False),
+        ("bad-zero-align",  [0x4000, 0x0],       0x4000, None, False),
+        ("ok-larger",       [0x10000],           0x4000, None, True),
+        ("ok-4k-mode",      [0x1000],            0x1000, None, True),
+        ("bad-4k-mode",     [0x800],             0x1000, None, False),
+        # ---- max-align 方向（32 位 ABI：不得被 16 KB 对齐）----
+        ("ok-max-4k",       [0x1000],            None,   0x1000, True),
+        ("ok-max-4k-multi", [0x1000, 0x1000],    None,   0x1000, True),
+        ("bad-max-16k",     [0x4000],            None,   0x1000, False),  # 本案真实缺陷形态
+        ("bad-max-mixed",   [0x1000, 0x4000],    None,   0x1000, False),  # 抓「只看第一个」
+        ("bad-max-zero",    [0x1000, 0x0],       None,   0x1000, False),
     ]
     n_bad = 0
     with tempfile.TemporaryDirectory(prefix="recon-elfalign-") as td:
-        for name, aligns, thresh, want_ok in cases:
+        for name, aligns, min_a, max_a, want_ok in cases:
             p = pathlib.Path(td) / f"{name}.so"
             p.write_bytes(_make_elf64(aligns))
             try:
@@ -224,12 +253,16 @@ def self_test() -> int:
                       f"!= 写入值 {[hex(a) for a in aligns]}")
                 n_bad += 1
                 continue
-            ok = _judge(got_aligns, thresh)
+            ok = _judge(got_aligns, min_a, max_a)
             mark = "✓" if ok == want_ok else "✗"
             if ok != want_ok:
                 n_bad += 1
+            if min_a is not None:
+                crit = f">= {hex(min_a)}"
+            else:
+                crit = f"<= {hex(max_a)}"
             print(f"  {mark} {name:16s} aligns={[hex(a) for a in aligns]} "
-                  f"阈值={hex(thresh)} → {'通过' if ok else '失败'}"
+                  f"判据={crit} → {'通过' if ok else '失败'}"
                   f"（期望{'通过' if want_ok else '失败'}）")
 
         # 反空约束：空的 program header 表必须**失败**而不是"无 LOAD 即通过"
@@ -258,15 +291,24 @@ def self_test() -> int:
         print(f"\n[self-test] FAIL：{n_bad} 项不符合预期")
         return 3
     print(f"\n[self-test] PASS：{len(cases) + 2} 项全部符合预期"
-          f"（含「混合对齐」「第二个 LOAD 掉到 4 KB」两个关键反例）")
+          f"（含「混合对齐」「第二个 LOAD 掉到 4 KB」「32 位反向判据」三个关键反例）")
     return 0
 
 
-def run(files: list[str], min_align: int, report_only: bool,
-        cross_check: bool) -> int:
+def run(files: list[str], min_align: int | None, max_align: int | None,
+        report_only: bool, cross_check: bool) -> int:
     if not files:
         print("::error::未指定任何 .so 文件 —— 判据没有目标对象", file=sys.stderr)
         return 1
+    if min_align is None and max_align is None:
+        print("::error::必须给出 --min-align 或 --max-align 之一（判据须有方向）",
+              file=sys.stderr)
+        return 1
+
+    bound = min_align if min_align is not None else max_align
+    direction = ">=" if min_align is not None else "<="
+    what = ("16 KB 页对齐要求" if min_align is not None
+            else "32 位 ABI 不得做 16 KB 对齐（docs/12 §3.2）")
 
     misses: list[str] = []
     n_checked = 0
@@ -306,13 +348,13 @@ def run(files: list[str], min_align: int, report_only: bool,
             print(f"报告  {p.name}: LOAD p_align = {pretty}")
             continue
 
-        ok = _judge(aligns, min_align)
+        ok = _judge(aligns, min_align, max_align)
         if ok:
-            print(f"说明  {p.name}: ✅ LOAD p_align = {pretty}（>= {hex(min_align)}）")
+            print(f"说明  {p.name}: ✅ LOAD p_align = {pretty}"
+                  f"（{direction} {hex(bound)}）")
         else:
             print(f"::error::{p.name}: ❌ LOAD p_align = {pretty}，"
-                  f"存在 < {hex(min_align)} 的段（16 KB 页对齐不满足，"
-                  f"docs/12 §3.5）")
+                  f"存在不满足 {direction} {hex(bound)} 的段（{what}）")
             fails += 1
 
     if misses:
@@ -325,15 +367,20 @@ def run(files: list[str], min_align: int, report_only: bool,
         print("::error::一个 .so 都没能成功检查 —— 判据已失效（反空约束）")
         return 3
 
-    print(f"[elf-align] 检查 {n_checked} 个文件，失败 {fails} 个")
+    print(f"[elf-align] 检查 {n_checked} 个文件，失败 {fails} 个"
+          f"（判据：p_align {direction} {hex(bound)}）")
     return 3 if fails else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ELF LOAD 段 16 KB 页对齐检查")
     ap.add_argument("files", nargs="*", help="待检查的 .so 路径")
-    ap.add_argument("--min-align", default="0x4000",
-                    help="要求的最小 p_align（默认 0x4000 = 16 KB）")
+    ap.add_argument("--min-align", default=None,
+                    help="要求 p_align **>=** 此值（默认 0x4000 = 16 KB；"
+                         "64 位 ABI 用）")
+    ap.add_argument("--max-align", default=None,
+                    help="要求 p_align **<=** 此值（0x1000；32 位 ABI 用 —— "
+                         "docs/12 §3.2 要求 armeabi-v7a 保持 4 KB）")
     ap.add_argument("--report", action="store_true",
                     help="只报告不判定（用于 armeabi-v7a 的现状留档）")
     ap.add_argument("--no-cross-check", action="store_true",
@@ -344,14 +391,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
 
-    try:
-        min_align = int(args.min_align, 0)
-    except ValueError:
-        print(f"用法错误：--min-align 无法解析为整数：{args.min_align}",
+    # 两个方向都没给时，沿用旧默认（>= 0x4000），保持向后兼容；
+    # 但两者都给是用法错误（方向互斥）。
+    if args.min_align is None and args.max_align is None:
+        args.min_align = "0x4000"
+    if args.min_align is not None and args.max_align is not None:
+        print("用法错误：--min-align 与 --max-align 互斥，不能同时给",
               file=sys.stderr)
         return 1
 
-    return run(args.files, min_align, args.report, not args.no_cross_check)
+    try:
+        min_align = int(args.min_align, 0) if args.min_align is not None else None
+        max_align = int(args.max_align, 0) if args.max_align is not None else None
+    except ValueError as e:
+        print(f"用法错误：--min-align/--max-align 无法解析为整数：{e}",
+              file=sys.stderr)
+        return 1
+
+    return run(args.files, min_align, max_align, args.report,
+               not args.no_cross_check)
 
 
 if __name__ == "__main__":

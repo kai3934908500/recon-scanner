@@ -105,10 +105,46 @@ endif()
 # toolchain 被替换/覆盖后静默产出不合规产物。
 if(RECON_PLATFORM_ANDROID)
   add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
-  if(NOT DEFINED RECON_LINK_ALIGN_FLAGS)
-    set(RECON_LINK_ALIGN_FLAGS "-Wl,-z,max-page-size=16384")
+  # 16 KB 页对齐（docs/12 §3.5）**只对 64 位 ABI** 生效。
+  #
+  # ⚠️ 这里曾把 `-Wl,-z,max-page-size=16384` **无条件**加到全部 ABI 上，
+  #    CI #11 的真实产物证实了后果：armeabi-v7a 下本案自建的
+  #    librecon_core.so / librecon_platform_android.so 的 LOAD p_align
+  #    被抬成了 **0x4000（16 KB）**，而 docs/12 §3.2 明文要求
+  #    「armeabi-v7a：**不适用**，保持 4 KB 页对齐」并把它列入
+  #    「**明确不做**：不在 armeabi-v7a 上做 16 KB 对齐」。
+  #    32 位 ELF 的页大小由设备 4 KB 页硬件决定（Google 的 16 KB 政策
+  #    也只覆盖 64 位 ABI）；强行 16 KB 对齐会因对齐填充虚增 4 KB 设备上
+  #    的 .so 体积。
+  #    反证：**同一构建**里 NDK 出品的 libc++_shared.so 在 armeabi-v7a 下
+  #    恰为 0x1000 —— 说明「NDK r28 默认 16 KB」只对 64 位成立，是这里的
+  #    显式参数把 32 位改坏的。
+  #    回归防线：tools/check_16kb.sh 检查 3（正向判据 `--max-align 0x1000`，
+  #    范围收敛到本案自建 .so）+ elf_load_align.py --self-test 的 bad-max-*。
+  #
+  # 判据落点说明：`ANDROID_ABI` 通常由 `-DANDROID_ABI=<abi>` 传入（Gradle /
+  # NDK 官方 toolchain），本仓库的 toolchain 亦会归一化设置 `CMAKE_ANDROID_ARCH_ABI`。
+  # 两者取先有的那个，避免任一路径下取值为空而**静默**不给 64 位加参数。
+  set(_recon_abi "${ANDROID_ABI}")
+  if(_recon_abi STREQUAL "" AND DEFINED CMAKE_ANDROID_ARCH_ABI)
+    set(_recon_abi "${CMAKE_ANDROID_ARCH_ABI}")
   endif()
-  add_link_options(${RECON_LINK_ALIGN_FLAGS})
+  set(RECON_16KB_ABIS "arm64-v8a" "x86_64")
+  if(_recon_abi IN_LIST RECON_16KB_ABIS)
+    if(NOT DEFINED RECON_LINK_ALIGN_FLAGS)
+      set(RECON_LINK_ALIGN_FLAGS "-Wl,-z,max-page-size=16384")
+    endif()
+    add_link_options(${RECON_LINK_ALIGN_FLAGS})
+    message(STATUS "Android ${_recon_abi}：启用 16 KB 页对齐（docs/12 §3.5）")
+  else()
+    if(_recon_abi STREQUAL "")
+      message(WARNING
+        "Android 构建未能取到 ABI（ANDROID_ABI / CMAKE_ANDROID_ARCH_ABI 均为空）——"
+        " 已按「不给 16 KB 参数」处理。若目标是 64 位 ABI，这会让 16 KB 页对齐"
+        " 门禁（docs/12 §3.5）失败；请检查 toolchain 设置。")
+    endif()
+    message(STATUS "Android ${_recon_abi}：**不**启用 16 KB 页对齐，保持 4 KB（docs/12 §3.2）")
+  endif()
 
   if(ANDROID_NDK_VERSION AND ANDROID_NDK_VERSION VERSION_LESS 28.0.13004108)
     message(FATAL_ERROR
@@ -847,6 +883,18 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
       "未找到 C++ 编译器 —— 跳过 ctest 的 jni_bridge_syntax（该闸门需要编译器；"
       "Android CI 的 static-contract job 里仍会跑，找不到编译器时它硬失败）。")
   endif()
+
+  # 「按 ABI 分别判页对齐」判据的负向注入（缺口 AY，2026-11-17 新增）。
+  # 背景：`check_16kb.sh` 的检查 3 曾是**假闸门** —— 它靠「--min-align 0x4000
+  # 失败」反推「32 位是 4 KB」，而 armeabi-v7a 目录里混有第三方 4 KB 库
+  # （libarcore_sdk_* / libc++_shared）→ `all(a >= 0x4000)` 恒为假 →
+  # 恒判通过。CI #11 的真实产物里，本案自建的 32 位 .so 实际是 0x4000
+  # （违反 docs/12 §3.2）而闸门毫无反应。
+  # 本测试用**合成 ELF** 作判据的目标对象，故不需要 Android SDK / NDK，
+  # 任何机器可跑；它同时覆盖 CMake 根因侧的静态判据 G-AND-8。
+  add_test(NAME abi_align_negative
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_abi_align_negative.py"
+            --root "${RECON_REPO_ROOT}")
 endif()
 endif()
 
