@@ -414,7 +414,7 @@ def collect_checkable(root: str, require_pipefail: bool = True):
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--root", default=".",
-                    help="仓库根（默认 .；CI 传 ${CMAKE_CURRENT_SOURCE_DIR}）")
+                    help="仓库根（默认 .；CI 由 tools/ci_run_gates.sh 传 ${ROOT}）")
     ap.add_argument("--self-test", action="store_true",
                     help="只跑内嵌样本自检，不读仓库")
     ap.add_argument("--min-scripts", type=int, default=DEFAULT_MIN_SCRIPTS)

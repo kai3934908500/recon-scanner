@@ -52,7 +52,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IOS = os.path.join(ROOT, "platform", "ios")
 
 # docs/12 §4.6
-DEPLOYMENT_TARGET = "15.0"
+# ── 为什么是 17.0（v1.3 UI 重构裁决，2026-11-02）────────────────────────────
+# 本值为 iOS 部署目标的**唯一软件侧真源**（另两处：cmake/toolchains/ios.cmake
+# 的 RECON_IOS_DEPLOYMENT_TARGET、tools/build_metal_shaders.sh 的 DEPLOY 默认值）。
+# 三者必须一致，否则出现「库按一个版本编、App 按另一个版本链」的静默漂移
+# （CI 的 minos 断言就是钉死这件事的）。
+#
+# 从 15.0 提到 17.0 的原因：UI 重构后要使用 `NavigationStack` +
+# `navigationDestination`（iOS 16+）、`.scrollContentBackground`（iOS 16+）
+# 等**替代式**现代 API。取 17 而非 16：17 是这些 API 的成熟/推荐部署线，
+# 且 17 起 Liquid Glass 相关 SwiftUI 行为与 `.toolbarBackground` 协同稳定。
+# 15.0 只能手写 `NavigationView` + `NavigationLink(isActive:)` 递归栈。
+DEPLOYMENT_TARGET = "17.0"
 SWIFT_VERSION = "5.0"
 
 # docs/12 §4.2 关键 Build Settings（逐条转写）
@@ -92,7 +103,8 @@ def gen_xcconfig() -> None:
         "// Recon.xcconfig — iOS 构建设置（由 tools/gen_ios_project.py 生成）",
         "//",
         "// 契约：docs/12_构建与打包.md §4.2（Xcode Build Settings 关键项）、",
-        "//       §4.5（Bitcode）、§4.6（最低部署版本 = 15.0）、§4.7（arm64 only）。",
+        f"//       §4.5（Bitcode）、§4.6（最低部署版本 = {DEPLOYMENT_TARGET}）、"
+        "§4.7（arm64 only）。",
         "//",
         "// ⚠️ 本文件由脚本生成，请不要手改 —— 改 tools/gen_ios_project.py 后重跑。",
         "//    理由：规格值需要可审查、可在 diff 中复核；手改会与生成器漂移。",
@@ -142,7 +154,7 @@ import PackageDescription
 let package = Package(
     name: "Recon",
     platforms: [
-        .iOS(.v15),          // docs/12 §4.6
+        .iOS(.v17),          // docs/12 §4.6
     ],
     products: [
         // 名字必须与 C ABI 头里的模块名、docs/12 §4.3 的产物名一致：
@@ -166,7 +178,14 @@ let package = Package(
 # 拢进一个 App target。由 macOS 侧的 CI 跑 `xcodegen generate` 生成 .xcodeproj。
 PROJECT_YML = '''# project.yml — Recon iOS App 容器定义（XcodeGen）
 #
-# 契约：docs/12_构建与打包.md §4.2（混编配置）、§4.6（部署目标 15.0）。
+# 契约：docs/12_构建与打包.md §4.2（混编配置）、§4.6（部署目标 __DEPLOY_TARGET__）。
+#
+# ⚠️ 字符串里出现「部署目标占位符」的地方，在 gen_container() 里由
+#    DEPLOYMENT_TARGET 常量替换。为什么不用 f-string：本字符串大量包含
+#    shell 变量 `${PLATFORM_NAME}` / `${BUILT_PRODUCTS_DIR}`，f-string 会把
+#    它们当表达式，需逐个转义成 `${{...}}`，极易漏改。占位符方案让部署目标
+#    仍然只有 DEPLOYMENT_TARGET **一个**来源（避免 MEMORY.md 记的「两份事实
+#    来源必然漂移」）。
 #
 # 为什么需要本文件：UI 层（ui/ios/）与桥接层（platform/ios/Recon/）在仓库里是
 # **物理分离**的两个目录树，而 SwiftPM 不允许 target 源码位于包根之外，无法用
@@ -193,7 +212,7 @@ PROJECT_YML = '''# project.yml — Recon iOS App 容器定义（XcodeGen）
 name: Recon
 options:
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "__DEPLOY_TARGET__"
   createIntermediateGroups: true
 
 configs:
@@ -203,7 +222,7 @@ configs:
 settings:
   base:
     SWIFT_VERSION: "5.0"                       # docs/12 §4.1
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"         # docs/12 §4.6
+    IPHONEOS_DEPLOYMENT_TARGET: "__DEPLOY_TARGET__"         # docs/12 §4.6
     TARGETED_DEVICE_FAMILY: "1"                # 仅 iPhone
     SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"      # 零警告标准
     GCC_TREAT_WARNINGS_AS_ERRORS: "YES"
@@ -375,10 +394,10 @@ targets:
           # （见 tools/build_metal_shaders.sh 的长论证）。**必须传** ——
           # 不传则脚本回落默认值，而默认值与 target 的 Build Settings 是
           # 两处事实来源，迟早漂移（MEMORY.md）。
-          # ⚠️ 刻意**读 Xcode 注入的构建设置**而不是在此再写一遍 "15.0"：
+          # ⚠️ 刻意**读 Xcode 注入的构建设置**而不是在此再写一遍 "__DEPLOY_TARGET__"：
           #    该变量与 target 的 IPHONEOS_DEPLOYMENT_TARGET 同源，
           #    改一处即全链路生效。为空时**不覆盖**（让脚本用自带默认值，
-          #    并由脚本内的 `>= 15` 断言把关 —— fail-closed 而非静默降级）。
+          #    并由脚本内的 `>= 17` 断言把关 —— fail-closed 而非静默降级）。
           if [ -n "${IPHONEOS_DEPLOYMENT_TARGET:-}" ]; then
             export RECON_IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET}"
           fi
@@ -416,7 +435,9 @@ schemes:
 
 def gen_container() -> None:
     base = os.path.join(IOS, "Container")
-    write(os.path.join(base, "project.yml"), PROJECT_YML)
+    # 部署目标占位符唯一来源是 DEPLOYMENT_TARGET（见 PROJECT_YML 上方说明）。
+    write(os.path.join(base, "project.yml"),
+          PROJECT_YML.replace("__DEPLOY_TARGET__", DEPLOYMENT_TARGET))
     write(os.path.join(base, "README.md"), CONTAINER_README)
 
 

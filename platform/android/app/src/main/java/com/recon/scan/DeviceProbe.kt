@@ -29,7 +29,7 @@
 // |---|---|---|
 // | `hasCamera` | `PackageManager.FEATURE_CAMERA_ANY` | ✓ 不需要权限 |
 // | `hasImu` | `SensorManager` 的 GYROSCOPE / ACCELEROMETER 非空 | ✓ |
-// | `hasTof` | `PackageManager.FEATURE_CAMERA_DEPTH` | ✓ 硬件特性声明 |
+// | `hasTof` | Camera2 `REQUEST_AVAILABLE_CAPABILITIES` 含 `..._DEPTH_OUTPUT`（API 30+）| ✓ 读特性不需权限 |
 // | `hasLidar` | `false`（常量） | ✓ Android 无 LiDAR 类硬件 |
 // | `hasAlgoDepth` | — | ✗ **见下方「已知缺口」** |
 // | `supportsGpu` | `ActivityManager.deviceConfigurationInfo.reqGlEsVersion` | ✓ |
@@ -75,6 +75,7 @@ import android.hardware.Sensor
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.os.Build
 import android.util.Size
 
 /**
@@ -118,9 +119,16 @@ object DeviceProbe {
         val hasImu = hasGyro || hasAccel
 
         // ── 硬件深度（ToF / 结构光）──────────────────────────────────────
-        // FEATURE_CAMERA_DEPTH 表示设备提供深度输出（docs/11 §3.4 提到的
-        // DEPTH_OUTPUT 能力）。这是**硬件**事实，与 ARCore 的软件深度无关。
-        val hasTof = pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_DEPTH)
+        // ≥API 30 用 Camera2 的 `REQUEST_AVAILABLE_CAPABILITIES` 是否含
+        // `REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT` 判定（docs/11 §3.4.2 第 3 行）。
+        // 这是**硬件**事实（相机能直出深度），与 ARCore 的软件推断深度无关。
+        //
+        // ⚠️ 修法缘由（一次真实编译失败，2026-11-02 CI）：原实现写了
+        //    `PackageManager.FEATURE_CAMERA_DEPTH` —— **该常量在 Android SDK 中
+        //    根本不存在**，`compileDebugKotlin` 直接报 unresolved reference
+        //    （见本文件头「探测期必须不申请权限」表的 `hasTof` 行与下方
+        //    [hasDepthOutput] 的说明）。
+        val hasTof = hasDepthOutput(cm)
 
         // ── GPU ──────────────────────────────────────────────────────────
         // 清单已 `uses-feature glEsVersion=0x30000 required=true`，故此项
@@ -178,6 +186,53 @@ object DeviceProbe {
             totalMemoryBytes = totalMem,
             availableMemoryBytes = availMem,
         )
+    }
+
+    /**
+     * 判定设备是否具备**硬件深度直出**能力（ToF / 结构光）。
+     *
+     * 口径来自 docs/11 §3.4.2 第 3 行：
+     *   读后置相机的 `CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES`，
+     *   看是否含 `REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT`（API 30+ 正式能力位）。
+     *
+     * ⚠️ 这里刻意**不**用 `PackageManager.hasSystemFeature(...)` 查深度 —— 原因：
+     *    Android SDK **没有** `FEATURE_CAMERA_DEPTH` 这个常量（2026-11-02 CI 的
+     *    真实编译失败就是写了它）。深度能力的权威事实源是 Camera2 的能力位。
+     *
+     * ⚠️ 低版本（< API 30）如实返回 false，**不猜**：那时没有正式的深度能力位，
+     *    厂商私有口径不可移植；报 false 让内核走 MONO 分支是**诚实的降级**
+     *    （与文件头 `hasAlgoDepth` 的处置同一立场：不偷填 true 凑分支）。
+     *
+     * 与探测期约束的关系：读 `CameraCharacteristics` **不需要打开相机、不需要
+     * CAMERA 权限**（与 [cameraFormatCap] 同一前提，docs/11 §1.3）。
+     */
+    private fun hasDepthOutput(cm: CameraManager?): Boolean {
+        if (cm == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        val ids = try {
+            cm.cameraIdList
+        } catch (e: Exception) {
+            return false
+        }
+        for (id in ids) {
+            val chars = try {
+                cm.getCameraCharacteristics(id)
+            } catch (e: Exception) {
+                continue
+            }
+            // 只看后置相机（本产品采集后置视角）。
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            if (facing != null && facing != CameraCharacteristics.LENS_FACING_BACK) continue
+            val caps = try {
+                chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            if (caps.contains(
+                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT)) {
+                return true
+            }
+        }
+        return false
     }
 
     /**

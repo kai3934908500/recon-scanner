@@ -26,21 +26,33 @@
 # ---------------------------------------------------------------------------
 set(CMAKE_SYSTEM_NAME iOS)
 
-# CMAKE_SYSTEM_VERSION 即 IPHONEOS_DEPLOYMENT_TARGET（docs/12 §4.6 结论：iOS 15.0）。
-# 选 15.0 的三条理由（12 §4.6 原文）：sceneDepth 支持面完整、ARFrame.sceneDepth
-# 语义稳定（沿光轴 z，与 02 §5.5 F-1 一致）、SwiftUI 生命周期 API 完整。
+# CMAKE_SYSTEM_VERSION 即 IPHONEOS_DEPLOYMENT_TARGET（docs/12 §4.6 结论：iOS 17.0）。
+# ── 为什么从 15.0 提到 17.0（v1.3 UI 重构裁决）────────────────────────────
+# 产品方向由「极简工程风」改为「企业级现代 UI」（docs/09 §0 v1.3 修订）。
+# 该方向依赖三样 iOS 16+ 才有的能力，且它们都是**替代式**的（没有 iOS 15 的
+# 等价写法，写兼容分支即等于两套 UI 实现并存，违反「同一逻辑不写两遍」）：
+#   ① `NavigationStack` + `navigationDestination`（iOS 16+）
+#      —— 现代导航栏/大标题/转场的基础，替代 iOS 15 的 `NavigationView` 手写栈；
+#   ② `.scrollContentBackground` / 新版 `Form` 分组（iOS 16+）
+#      —— 企业级设置页/参数页的分组卡片外观；
+#   ③ `NavigationStack` 的 `.toolbarBackground` 与玻璃工具栏协同（iOS 16+）。
+# 取 17.0 而非 16.0：16.0 只是这些 API 的**首次出现**版本，其早期实现在
+# 导航栈 diff、`@Observable`（iOS 17）等方面有已知行为差异；iOS 17 是它们
+# 稳定后的第一个版本，也是当前企业 App 的主流下限。sceneDepth / 时间同步
+# 的下限理由（15.0）依旧满足 —— 17.0 是其超集。
 if(NOT DEFINED RECON_IOS_DEPLOYMENT_TARGET)
-  set(RECON_IOS_DEPLOYMENT_TARGET "15.0")
+  set(RECON_IOS_DEPLOYMENT_TARGET "17.0")
 endif()
 set(CMAKE_SYSTEM_VERSION ${RECON_IOS_DEPLOYMENT_TARGET})
-# 部署目标下限硬断言：低于 15.0 直接拒绝。
-# 原因：15.0 之前 sceneDepth 支持面不完整、ARSession 回调频率不稳定，会直接
-# 破坏 02 文档的时间同步精度预算（τ_pipeline）。若放宽会静默降低内核精度。
-if(RECON_IOS_DEPLOYMENT_TARGET VERSION_LESS 15.0)
+# 部署目标下限硬断言：低于 17.0 直接拒绝。
+# 原因：本版 UI 依赖上述 iOS 16+/17 的**替代式** API（无旧平台等价写法）。
+# 若放宽，`NavigationStack` 等会直接编译失败；即便用 `if #available` 分叉，
+# 也会形成两套并存的导航实现（同一逻辑写两遍 → 必然漂移）。
+if(RECON_IOS_DEPLOYMENT_TARGET VERSION_LESS 17.0)
   message(FATAL_ERROR
-    "RECON_IOS_DEPLOYMENT_TARGET='${RECON_IOS_DEPLOYMENT_TARGET}' 低于下限 15.0。"
-    "见 docs/12_构建与打包.md §4.6：iOS 15.0 是本项目的最低部署版本，"
-    "低于该值会破坏 sceneDepth 语义与时间同步精度。")
+    "RECON_IOS_DEPLOYMENT_TARGET='${RECON_IOS_DEPLOYMENT_TARGET}' 低于下限 17.0。"
+    "见 docs/12_构建与打包.md §4.6：iOS 17.0 是本项目当前的最低部署版本"
+    "（v1.3 UI 重构裁决；低于该值无法使用 NavigationStack 等替代式现代 API）。")
 endif()
 
 # ---------------------------------------------------------------------------

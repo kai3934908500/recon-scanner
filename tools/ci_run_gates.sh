@@ -261,7 +261,7 @@ if wants generate; then
 fi
 
 if wants ios; then
-  step "iOS 静态契约闸门（G1..G18）" "${PY}" tools/check_ios_contract.py
+  step "iOS 静态契约闸门（G1..G20）" "${PY}" tools/check_ios_contract.py
 fi
 if wants neg-ios; then
   step "iOS 静态契约负向注入（证明 G 判据非假闸门）" \

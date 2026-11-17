@@ -259,7 +259,25 @@ def build_injections() -> list[Injection]:
             f"{CPP}/CMakeLists.txt",
             'get_filename_component(RECON_REPO_ROOT\n    "${CMAKE_CURRENT_LIST_DIR}/',
             'get_filename_component(RECON_REPO_ROOT\n    "${CMAKE_SOURCE_DIR}/'),
-
+        # ── G-AND-6(c)：根 CMakeLists.txt 用 CMAKE_CURRENT_SOURCE_DIR ──────
+        # 复现 2026-11-02 的**第二次** Android CI 失败：转发壳 include() 后
+        # CMAKE_CURRENT_SOURCE_DIR 仍是壳目录 → 根文件里的仓库相对路径全指错。
+        PatchInjection(
+            "G-AND-6c/root-source-dir",
+            "G-AND-6",
+            "根 CMakeLists.txt 把 RECON_REPO_ROOT 锚点换回 CMAKE_CURRENT_SOURCE_DIR"
+            "（Android include() 场景下会指向壳目录）",
+            C,
+            'get_filename_component(RECON_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)',
+            'get_filename_component(RECON_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)'),
+        # ── G-AND-6(c) 反空：把锚点引用整批删掉（判据不得恒真通过）────────
+        PatchInjection(
+            "G-AND-6c/root-anchor-removed",
+            "G-AND-6",
+            "根 CMakeLists.txt 的 RECON_REPO_ROOT 引用被整批抹掉 → 反空约束必须触发",
+            C,
+            "get_filename_component(RECON_REPO_ROOT \"${CMAKE_CURRENT_LIST_DIR}\" ABSOLUTE)",
+            "# anchor removed by negative test"),
         DeleteFileInjection(
             "env/cmake-missing",
             "env",

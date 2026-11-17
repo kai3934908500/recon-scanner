@@ -15,9 +15,9 @@
 #
 # ⚠️ `-target` 不是可选项（2026-11-01 CI 实证）：
 #   `metal` 从 target 三元组的 OS 版本**推导** `__METAL_VERSION__`。不传则取
-#   SDK 默认版本（高于本项目的最低部署目标 iOS 15.0），产物在部署下限机型上
+#   SDK 默认版本（高于本项目的最低部署目标 iOS 17.0），产物在部署下限机型上
 #   运行期抛 `Function is using language version 3.0 which is incompatible
-#   with this OS`。三元组由 `RECON_IOS_DEPLOYMENT_TARGET`（默认 15.0）与
+#   with this OS`。三元组由 `RECON_IOS_DEPLOYMENT_TARGET`（默认 17.0）与
 #   `RECON_IOS_SDK`（iphoneos / iphonesimulator）共同决定。
 #
 # 运行时加载（docs/12 MT-1 / MT-2）：
@@ -64,9 +64,9 @@ SDK="${RECON_IOS_SDK:-iphoneos}"
 OUT_DIR="${RECON_METALLIB_OUT_DIR:-build/ios/Recon.app}"
 AIR_DIR="${RECON_METAL_AIR_DIR:-build/ios/metal-air}"
 REQUIRE="${RECON_REQUIRE_METAL:-0}"
-# 最低部署目标（docs/12 §4.6：iOS 15.0）。**它不是可有可无的元数据** ——
+# 最低部署目标（docs/12 §4.6：iOS 17.0）。**它不是可有可无的元数据** ——
 # 由它推出 `-target` 三元组，进而决定 `__METAL_VERSION__`（见下）。
-DEPLOY="${RECON_IOS_DEPLOYMENT_TARGET:-15.0}"
+DEPLOY="${RECON_IOS_DEPLOYMENT_TARGET:-17.0}"
 
 METAL_SRC_DIR="shaders/metal"
 
@@ -96,7 +96,7 @@ echo "[metal-shaders] out       : ${OUT_DIR}/default.metallib"
 #     · 编译期一切正常（设备 SDK 下 CI 曾 16/16 全绿）；
 #     · 真机运行期在 iOS 15 设备上抛
 #       `Function … is using language version 3.0 which is incompatible
-#        with this OS` —— 而本项目的部署下限正是 iOS 15.0（docs/12 §4.6）。
+#        with this OS` —— 而本项目的部署下限正是 iOS 17.0（docs/12 §4.6）。
 #
 # 这是「静默失效」的典型形态：构建成功、静态闸门全绿，问题只在目标机型上
 # 出现。**必须在编译期就按部署目标锁定语言版本**。
@@ -107,7 +107,7 @@ echo "[metal-shaders] out       : ${OUT_DIR}/default.metallib"
 # **错了**：正确做法不是"不指定"，而是指定 **`-target`** —— 由工具链自己
 # 从 OS 版本推出匹配的语言版本。两者语义完全不同：
 #     `-std=metal3.0`    → 强制语言版本（可能高于部署目标 → 真机不可用）
-#     `-target …ios15.0` → 语言版本由部署目标**推导**（必然与目标一致）
+#     `-target …ios17.0` → 语言版本由部署目标**推导**（必然与目标一致）
 # Apple 论坛同一贴明确指出："When building Metal shaders from Xcode 14.2
 # there is no `-std` or `-mios-version-min`. Instead there is just
 # `-target air64-apple-ios16.2`."
@@ -115,11 +115,13 @@ echo "[metal-shaders] out       : ${OUT_DIR}/default.metallib"
 # ── 部署目标下限硬断言 ────────────────────────────────────────────────────
 # 与 cmake/toolchains/ios.cmake 同一条判据，此处是**第二道关口** —— 因为本
 # 脚本也会被 Xcode Build Phase 直接调用（那时不经过 CMake 工具链）。
-# 低于 15.0 会破坏 sceneDepth 语义与时间同步精度（docs/12 §4.6），硬失败。
+# 低于 17.0 会破坏 sceneDepth 语义与时间同步精度（docs/12 §4.6），硬失败。
+# （下限随 v1.3 UI 重构从 15.0 提到 17.0；与 gen_ios_project.py 的
+#   DEPLOYMENT_TARGET、ios.cmake 的 RECON_IOS_DEPLOYMENT_TARGET 三者同源。）
 DEPLOY_MAJOR="${DEPLOY%%.*}"
-if ! [ "${DEPLOY_MAJOR}" -ge 15 ] 2>/dev/null; then
-  echo "[metal-shaders] FAIL：RECON_IOS_DEPLOYMENT_TARGET='${DEPLOY}' 低于下限 15.0。"
-  echo "[metal-shaders] 见 docs/12_构建与打包.md §4.6（iOS 15.0 为最低部署版本）。"
+if ! [ "${DEPLOY_MAJOR}" -ge 17 ] 2>/dev/null; then
+  echo "[metal-shaders] FAIL：RECON_IOS_DEPLOYMENT_TARGET='${DEPLOY}' 低于下限 17.0。"
+  echo "[metal-shaders] 见 docs/12_构建与打包.md §4.6（iOS 17.0 为最低部署版本）。"
   exit 1
 fi
 

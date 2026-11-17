@@ -990,7 +990,7 @@ NON_UI_COPY_ALLOWLIST = {
     "非法色值字面量 '\\(hex)'：应为 #RRGGBB 或 #AARRGGBB",
     # Liquid Glass 降级说明（开发者诊断信息，经 GlassRole 暴露给调试面板，
     # 不属 §5 文案表；若将来要呈现给用户，须先入表）。
-    "当前构建使用 Xcode 15.4 基线（iOS 17 SDK），无法编译 Liquid Glass 材质，界面使用系统半透明材质替代。",
+    "当前构建所用的 Xcode 不支持 Liquid Glass（需 Xcode 26+ / iOS 26 SDK），界面使用系统半透明材质替代。",
     "当前系统版本低于 iOS 26，界面使用系统半透明材质替代 Liquid Glass。",
     # 演示/占位**数据**（文件路径与会话名），不是 UI 文案。
     "/Documents/陶瓷杯.glb",
@@ -2461,6 +2461,96 @@ def gate_swift_access_level(rep: Report) -> None:
                  f"`public` 成员暴露 ✓")
 
 
+def gate_depvar_exists(rep: Report) -> None:
+    """G20 构建脚本里引用的「部署目标/平台变量」必须真实存在。
+
+    为什么需要本闸门（2026-11-02 发现的**真实假闸门**）：
+      根 `CMakeLists.txt` 的 iOS 守卫写作
+          if(IOS_DEPLOYMENT_TARGET AND IOS_DEPLOYMENT_TARGET VERSION_LESS 15.0)
+      而 `IOS_DEPLOYMENT_TARGET` **全仓从未定义** —— 工具链（`cmake/toolchains/
+      ios.cmake`）用的是 `RECON_IOS_DEPLOYMENT_TARGET` 并把
+      `CMAKE_OSX_DEPLOYMENT_TARGET` 设为它。CMake 里未定义变量展开为**空串**
+      → `if("" AND ...)` **恒假** → 这条自称「双保险」的断言**从未触发过一次**。
+      它的负向注入（`build_verify_desktop/_ios_toolchain_negative.*`）只覆盖了
+      工具链文件、没覆盖 CMakeLists，所以久未被发现。
+
+    判据（落在**目标对象**上，可负向证伪）：
+      CMakeLists.txt / *.cmake 里所有 `if(<VAR> ... VERSION_LESS ...)` 守卫
+      （**不限名字**，避免靠"名字像不像"过滤而漏检），其 `<VAR>` 必须是：
+        · CMake 内建变量（CMAKE_ 前缀），或
+        · 在本仓库的 .cmake/CMakeLists 里被 `set(...)` 过（含 function/macro 形参）。
+      否则报错——因为未定义变量会让整条守卫恒假。
+      （实测覆盖 4 条守卫：ANDROID_NDK_VERSION ×2、CMAKE_OSX_DEPLOYMENT_TARGET、
+        RECON_IOS_DEPLOYMENT_TARGET；全部真实存在、零误报。）
+
+    反空约束：若一条都扫不到（正则失效），报错而非放过。
+    """
+    gate = "G20/depvar-exists"
+    cmake_files: list[str] = []
+    for dp, _dn, fns in os.walk(ROOT):
+        # 只扫仓库自身的构建脚本，跳过第三方与构建产物
+        if any(seg in dp.replace("\\", "/") for seg in
+               ("/third_party/", "/build", "/build_", "/out/", "/.git/")):
+            continue
+        for fn in fns:
+            if fn == "CMakeLists.txt" or fn.endswith(".cmake"):
+                cmake_files.append(os.path.join(dp, fn))
+    if not cmake_files:
+        rep.err(gate, "未找到任何 CMakeLists.txt / .cmake —— 判据扫描范围失效")
+        return
+
+    all_text = "\n".join(read_text(p) for p in cmake_files)
+    # 收集所有被 set(...) 的变量名（含 CACHE）与函数参数形参。
+    defined: set[str] = set()
+    for m in re.finditer(r"^\s*set\s*\(\s*([A-Za-z_]\w*)", all_text, re.M):
+        defined.add(m.group(1))
+    for m in re.finditer(r"\bset\s*\(\s*([A-Za-z_]\w*)", all_text):
+        defined.add(m.group(1))
+    # function/macro 形参也算「存在」（在函数作用域内有效）。
+    for m in re.finditer(r"^\s*(?:function|macro)\s*\(\s*[A-Za-z_]\w*\s+([^)]*)\)",
+                         all_text, re.M):
+        for tok in m.group(1).split():
+            if re.fullmatch(r"[A-Za-z_]\w*", tok):
+                defined.add(tok)
+    # 环境变量形式 `$ENV{...}` 不算（反正也匹配不到裸 VAR）。
+
+    # 目标对象：`if(<VAR> ... VERSION_LESS ...)` 里的 <VAR>。
+    # ⚠️ 必须先把注释剥掉、再把文本**展平**成单行后匹配 —— CMake 的 `if(...)`
+    #    常按参数逐个换行（本闸门第一版就是**逐行**正则，于是漏检了跨行写法的
+    #    目标 bug，负向注入时暴露：闸门自己有 bug = 又一次假闸门）。
+    #    记下的行号仅用于定位，做法是回原文里搜首个含该变量的行。
+    target_re = re.compile(
+        r"\b(?:if|elseif)\s*\(\s*([A-Za-z_]\w*)\b[^)]{0,400}?\bVERSION_LESS\b")
+    hits = 0
+    for path in cmake_files:
+        raw = read_text(path)
+        # 剥掉行注释（避免注释里的示例/说明误报），再展平所有空白。
+        code = "\n".join(ln.split("#", 1)[0] for ln in raw.splitlines())
+        flat = re.sub(r"\s+", " ", code)
+        raw_lines = raw.splitlines()
+        for m in target_re.finditer(flat):
+            var = m.group(1)
+            hits += 1
+            if var.startswith("CMAKE_") or var in defined:
+                continue          # CMake 内建 / 仓库内已 set(...)
+            # 定位行号（供人看）：找首个含该变量的原始行
+            lineno = next((i for i, ln in enumerate(raw_lines, 1)
+                           if re.search(rf"\b{re.escape(var)}\b", ln)), 0)
+            rep.err(
+                gate,
+                f"{rel(path)}:{lineno} 的部署守卫引用了变量 `{var}`，但它在本仓库"
+                f"里**从未被定义** → `if(\"\" AND ...)` 恒假，该守卫**永不触发**"
+                f"（假闸门）。修法：改用真实存在的变量（本项目 iOS 侧实际是 "
+                f"`CMAKE_OSX_DEPLOYMENT_TARGET`，由 `cmake/toolchains/ios.cmake` "
+                f"设为 `RECON_IOS_DEPLOYMENT_TARGET`）。")
+    if hits == 0:
+        rep.err(gate, "未扫到任何 `if(<VAR> ... VERSION_LESS ...)` 部署守卫 —— "
+                      "要么判据正则失效，要么守卫被删（两者都要查）")
+    else:
+        rep.note(f"构建部署守卫变量存在性：扫描 {len(cmake_files)} 个 CMake "
+                 f"文件、{hits} 条守卫，引用的变量均真实存在 ✓")
+
+
 def main() -> int:
     rep = Report()
     if not os.path.isdir(UI_IOS):
@@ -2486,6 +2576,7 @@ def main() -> int:
     gate_locale_resource_layout(rep)
     gate_system_api_denylist(rep)
     gate_swift_access_level(rep)
+    gate_depvar_exists(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -2510,7 +2601,7 @@ def main() -> int:
           "G13 错误码映射穷举 / G14 平台平面缓冲纪律 / "
           "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
           "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 / "
-          "G19 Swift 访问级别自洽 全部通过。")
+          "G19 Swift 访问级别自洽 / G20 构建部署守卫变量存在性 全部通过。")
     return 0
 
 

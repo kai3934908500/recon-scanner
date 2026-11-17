@@ -216,7 +216,7 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
         "从 CMakeLists.txt 的 recon_shaders_metal 清单里删掉一个 .metal",
         "清单**漏列**了这些 .metal",
         [(CMAKE_LISTS,
-          '      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/yuv.metal"\n',
+          '      "${RECON_REPO_ROOT}/shaders/metal/yuv.metal"\n',
           "")],
     ),
     # --------------------------------------------------------------------

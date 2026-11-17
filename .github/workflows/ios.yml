@@ -10,12 +10,12 @@
 #       这些检查与编译器无关，故不必耗 macOS 分钟数。
 #       （闸门 → 命令的映射集中在 tools/ci_run_gates.sh，可用 workflow_dispatch
 #        的 `gates` 输入收窄；见该脚本文件头。）
-#   build-xcframework —— 跑在 macos-15 上，真正编译三个静态库并打包 xcframework。
+#   build-xcframework —— 跑在 macos-26 上，真正编译三个静态库并打包 xcframework。
 #   shaders-vulkan   —— 跑在 ubuntu 上，用 glslangValidator 把 8 个 `.comp`
 #       **真编译**为 SPIR-V。补的是"8 个 Vulkan 着色器从未过编译器"的盲区：
 #       shader_parity.py 只做两端源码层比对，查不出 GLSL 自身的语法错误。
 #       （Metal 侧相反，只能靠 `xcrun metal`，故在 macOS job 内。）
-#   build-app        —— 跑在 macos-15 上，编整机 App。两轮编译：① simulator
+#   build-app        —— 跑在 macos-26 上，编整机 App。两轮编译：① simulator
 #       （验证 Swift/ObjC++ 可编译 + zlib 链入判据）；② device **归档** →
 #       手工打**未签名 IPA**（`Payload/` + zip，不用 `-exportArchive`：它强制
 #       签名，而 CI 无 Apple 凭据）→ 产物结构判据 P-1..P-9 → 上传 artifact。
@@ -32,16 +32,23 @@
 #   以及 pull_request 段缺 gen_ios_project.py 等闸门脚本自身。
 #   改任一段时请对照另一段。
 #
-# ⚠️ 关于 Xcode 版本（本 workflow 的一个关键决策，留档以免被"顺手升级"破坏）
-#   · macos-15 镜像预装 Xcode 16.0–16.4 **与** 26.0.1–26.3，默认 16.4。
-#   · **Xcode 26 起 Metal 工具链被从 Xcode 中剥离**，需另行
-#     `xcodebuild -downloadComponent MetalToolchain`（约 700 MB，且**需要
-#     Apple ID 登录**，CI 上未登录会 401 失败 —— 见 CircleCI 支持文档与
-#     Apple 开发者论坛）。
-#   · 本项目**必须编译 Metal 着色器**（shaders/metal/*.metal），故**显式 pin
-#     Xcode 16.4** —— 它自带 `metal` / `metallib`，无需下载、无需登录。
-#   · 若将来要升到 Xcode 26，必须**同时**加上 Metal Toolchain 的
-#     export/import 两步（`-exportPath` + 导入资产），不能只改版本号。
+# ⚠️ 关于 Xcode 版本（v1.3 UI 重构的决策，留档以免被"顺手降级/乱升"破坏）
+#   · 本项目 v1.3 起 UI 采用 **Liquid Glass**（`.glassEffect` / GlassEffectContainer），
+#     该 API 需 **iOS 26 SDK**（Swift 6.2 起可用）。故 CI 必须用 Xcode 26，
+#     使 `#if compiler(>=6.2)` 走**真玻璃**分支（否则永远走 `.ultraThinMaterial`
+#     回退 —— 代码写了但从未被编过，是「静默失效」的一类）。
+#   · **Xcode 26 起 Metal 工具链被从 Xcode 中剥离**为按需下载组件，独立装需
+#     `xcodebuild -downloadComponent MetalToolchain`（约 700 MB，且需 Apple ID
+#     登录，匿名会 401）。**但 GitHub Actions 的 `macos-26` 镜像已预置该工具链**
+#     （runner-images 已确认可直接构建 Metal；已知问题仅出现在使用
+#     `codeql-action/init` 之后，与本项目无关）。故改用 macos-26 而非
+#     "在 macos-15 上下载工具链"。
+#   · 本项目**必须编译 Metal 着色器**（shaders/metal/*.metal）与 RealityKit，
+#     两者都需 Metal 编译器。**选择 Xcode 的步骤里当场断言 `xcrun --find metal`
+#     可用** —— fail-closed：若镜像哪天不再预置，CI 会在十几秒内明确报错，
+#     而不是等到 CompileMetalFile 阶段才抛 "missing Metal Toolchain"。
+#   · 若将来镜像或 Xcode 版本变化，改这里的 Xcode 选择式即可；**不要**退回
+#     macos-15/Xcode 16.4 —— 那会让 `.glassEffect` 永远走不到真分支。
 
 name: iOS
 
@@ -174,8 +181,8 @@ jobs:
   # 真正编译静态库 + 打包 xcframework（macOS）
   # ===========================================================================
   build-xcframework:
-    name: 构建 ReconCore.xcframework（macos-15 / Xcode 16.4）
-    runs-on: macos-15
+    name: 构建 ReconCore.xcframework（macos-26 / Xcode 26）
+    runs-on: macos-26
     needs: static-contract
     steps:
       - uses: actions/checkout@v4
@@ -184,13 +191,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      # --- 显式 pin Xcode 16.4（自带 Metal 工具链，见文件头说明）-------------
-      - name: 选择 Xcode 16.4
+      # --- 选择 Xcode 26（Liquid Glass 需 iOS 26 SDK；Metal 工具链见文件头）----
+      - name: 选择 Xcode 26
         run: |
           set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode_16.4.app
+          # macos-26 镜像预装 Xcode 26.x（可能多个小版本）。取镜像自带的默认
+          # 26.x：不硬编具体小版本，避免镜像更新后路径不存在而整体挂掉。
+          # 优先显式挑一个已知存在的大版本目录，找不到则用默认。
+          if [ -d /Applications/Xcode_26.0.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.0.app
+          fi
           xcode-select -p
           xcodebuild -version
+          # 断言：所选 Xcode 的主版本必须是 26（否则 #if compiler(>=6.2) 恒假，
+          # .glassEffect 会被静默跳过 —— 那正是本 job 要防的「静默失效」）。
+          XV=$(xcodebuild -version | awk '/^Xcode /{print $2}')
+          echo "Xcode 主版本 = ${XV}"
+          case "${XV}" in
+            26.*) : ;;
+            *) echo "::error::Xcode 版本为 ${XV}，本 workflow 要求 26.x（Liquid Glass / iOS 26 SDK）"; exit 1 ;;
+          esac
           # 证实 metal 编译器可用 —— 这是本 job 存在的前提，缺了就要早失败，
           # 而不是等到 CompileMetalFile 阶段才报 "missing Metal Toolchain"。
           xcrun -sdk iphoneos --find metal
@@ -402,12 +422,25 @@ jobs:
           echo "OK: 无网络框架"
 
           echo "== 部署目标一致性（docs/12 §4.6「与静态库切片的关系」）=="
+          # 判据落点的部署目标值**从真源读取**，不在此再写一遍常量：
+          #   cmake/toolchains/ios.cmake 的 RECON_IOS_DEPLOYMENT_TARGET 默认值
+          #   是唯一真源（与 tools/gen_ios_project.py 的 DEPLOYMENT_TARGET、
+          #   tools/build_metal_shaders.sh 的 DEPLOY 默认值三者同源）。
+          # 此前本处硬编 '15.0' —— 属第二事实来源，改部署目标时必然漏改而
+          # 静默放过（正是本关要防的那类漂移）。现改为解析真源。
+          EXPECTED_MINOS=$(grep -oE 'RECON_IOS_DEPLOYMENT_TARGET "[0-9]+\.[0-9]+"' \
+                             cmake/toolchains/ios.cmake | head -1 | grep -oE '[0-9]+\.[0-9]+')
+          if [ -z "${EXPECTED_MINOS}" ]; then
+            echo "::error::未能从 cmake/toolchains/ios.cmake 解析出部署目标真源 —— 判据已失效"
+            exit 1
+          fi
+          echo "部署目标真源（ios.cmake）= ${EXPECTED_MINOS}"
           # 判据落在**切片产物**上。为什么必须有这一关（第 5 轮 CI 的真实事故）：
           #   工具链只设了 CMAKE_SYSTEM_VERSION，没设 CMAKE_OSX_DEPLOYMENT_TARGET
           #   → CMake 的 Xcode generator 把它留空 → 交给 SDK 默认值（当时 18.5）。
-          #   于是归档里每个 `.o` 的 min-version 都是 18.5，而 App 按 15.0 链接：
+          #   于是归档里每个 `.o` 的 min-version 都是 18.5，而 App 按部署目标链接：
           #     ld: warning: object file (...png_encoder.o) was built for newer
-          #                 'iOS-simulator' version (18.5) than being linked (15.0)
+          #                 'iOS-simulator' version (18.5) than being linked (<部署目标>)
           #   ⚠️ 这只是 **warning** —— 构建照样"成功"。也就是说：**没有本关，
           #      这个漂移可以一路通过 CI 且在日志里只表现为噪声**。故必须断言钉死。
           #
@@ -420,7 +453,7 @@ jobs:
           #        LC_BUILD_VERSION，实现最简，故选它。
           #   这里用 ②：直接 `otool -l` 归档，再用 awk 只取 LC_BUILD_VERSION 段的
           #   `minos` 字段。LC_VERSION_MIN_IPHONEOS 段（旧式）一并兜住 ——
-          #   Xcode 16.4 用 LC_BUILD_VERSION，但旧工具链可能写后者。
+          #   Xcode 26 用 LC_BUILD_VERSION，但旧工具链可能写后者。
           for slice in ios-arm64/libReconCore.a ios-arm64_x86_64-simulator/libReconCore.a; do
             echo "--- ${slice} ---"
             otool -l "$XCF/${slice}" > /tmp/mo.txt 2>&1 || true
@@ -437,13 +470,13 @@ jobs:
               head -60 /tmp/mo.txt
               exit 1
             fi
-            stale=$(sort -u /tmp/minos.txt | grep -v '^15\.0$' || true)
+            stale=$(sort -u /tmp/minos.txt | grep -v "^${EXPECTED_MINOS}\$" || true)
             if [ -n "${stale}" ]; then
-              echo "::error::${slice} 存在非 15.0 的 minos：${stale}（契约 docs/12 §4.6）"
+              echo "::error::${slice} 存在非 ${EXPECTED_MINOS} 的 minos：${stale}（契约 docs/12 §4.6）"
               exit 1
             fi
           done
-          echo "OK: 两个切片的 minos 均为 15.0（与 docs/12 §4.6 一致）"
+          echo "OK: 两个切片的 minos 均为 ${EXPECTED_MINOS}（与 docs/12 §4.6 一致）"
 
       # --- 产物层验证 default.metallib（此前从未真正编过）------------------
       # ⚠️ 路径按 iOS **扁平** bundle 写：非本地化资源在包根，无 `Contents/`
@@ -638,7 +671,7 @@ jobs:
   #   所以"关掉它 = 少验证一层"这件事在日志里是显式的（该 job 显示 skipped）。
   build-app:
     name: 编 Recon.app（simulator 校验 + device 归档）+ 打未签名 IPA
-    runs-on: macos-15
+    runs-on: macos-26
     needs: build-xcframework
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_build_app }}
     steps:
@@ -648,11 +681,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 选择 Xcode 16.4
+      - name: 选择 Xcode 26
         run: |
           set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode_16.4.app
+          # 与 build-xcframework 同一套选择逻辑（见该 job 的注释）。
+          if [ -d "/Applications/Xcode_26.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_26.0.app
+          fi
           xcodebuild -version
+          XV=$(xcodebuild -version | awk '/^Xcode /{print $2}')
+          case "${XV}" in
+            26.*) : ;;
+            *) echo "::error::Xcode 版本为 ${XV}，本 workflow 要求 26.x"; exit 1 ;;
+          esac
 
       # ⚠️ `path` 必须**就是** xcframework 目录名，因为 artifact 里不带这一层。
       #    CI 实证（build-app 第一轮失败即此）：upload-artifact 以「上传路径的公共

@@ -111,6 +111,9 @@ CAMERA_CAPTURE = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Platform",
                               "CameraCapture.swift")
 WIREFRAME_RENDERER = os.path.join(ROOT, "platform", "ios", "Recon",
                                   "WireframeRenderer.swift")
+# G20 的目标对象：根 CMakeLists.txt 的 iOS 部署守卫（此前引用了一个从未定义的
+# 变量 IOS_DEPLOYMENT_TARGET，使整条守卫恒假 —— 2026-11-02 发现并修正）。
+ROOT_CMAKELISTS = os.path.join(ROOT, "CMakeLists.txt")
 
 
 def slurp(path: str) -> str:
@@ -521,6 +524,22 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
         "非 public",
         [(SWIFT_CORE, "public struct PreviewMesh {", "struct PreviewMesh {")],
     ),
+    # --- G20：构建部署守卫引用的变量必须真实存在 ---------------------------
+    # 复现 2026-11-02 发现的**真实假闸门**：根 CMakeLists.txt 的 iOS 守卫写作
+    # `if(IOS_DEPLOYMENT_TARGET AND ... < 15.0)`，而该变量全仓从未定义 →
+    # `if("" AND ...)` 恒假 → 守卫**从未触发**。注入 = 把正确的
+    # `CMAKE_OSX_DEPLOYMENT_TARGET` 换回不存在的 `IOS_DEPLOYMENT_TARGET`。
+    (
+        "G20-a-undefined-deployment-var",
+        "把 CMakeLists 部署守卫的变量换成从未定义的 IOS_DEPLOYMENT_TARGET"
+        "（复现 2026-11-02 发现的真实假闸门）",
+        "从未被定义",
+        [(ROOT_CMAKELISTS,
+          "  if(CMAKE_OSX_DEPLOYMENT_TARGET AND\n"
+          "     CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 17.0)",
+          "  if(IOS_DEPLOYMENT_TARGET AND\n"
+          "     IOS_DEPLOYMENT_TARGET VERSION_LESS 17.0)")],
+    ),
 ]
 
 
@@ -536,7 +555,8 @@ def main() -> int:
     for p in (GATE, SWIFT_CORE, STAGE_MAP, CONTROLLER, C_API_HEADER,
               LOCALIZATION, ZH_JSON, EN_JSON, CAPABILITY_VIEW,
               FRAME_PIPELINE, FRAME_CONVERTER, BRIDGING_HEADER, METAL_BACKEND,
-              CONTAINER_YML, GEN_IOS_PROJECT, LICENSES_CMAKE, IOS_WORKFLOW):
+              CONTAINER_YML, GEN_IOS_PROJECT, LICENSES_CMAKE, IOS_WORKFLOW,
+              ROOT_CMAKELISTS):
         if not os.path.isfile(p):
             print(f"[negative] 环境错误：找不到 {p}", file=sys.stderr)
             return 1
@@ -608,7 +628,7 @@ def main() -> int:
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
           f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 / "
-          f"G18 / G19 均有效）")
+          f"G18 / G19 / G20 均有效）")
     return 0
 
 

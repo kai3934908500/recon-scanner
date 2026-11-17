@@ -3,7 +3,7 @@
 // Package.swift — Recon iOS 侧依赖描述（由 tools/gen_ios_project.py 生成）
 //
 // 契约：docs/12_构建与打包.md §4.1（Swift 5.0 / Xcode 15.4）、
-//       §4.6（最低部署 iOS 15.0）、§1.1 B-1（CMake 是唯一构建入口）。
+//       §4.6（最低部署 iOS 17.0）、§1.1 B-1（CMake 是唯一构建入口）。
 //
 // ── 边界（必读）────────────────────────────────────────────────────────
 // 本 Package **不编译 `core/`**。核心库的编译入口是 CMake（B-1），产物为
@@ -26,7 +26,7 @@ import PackageDescription
 let package = Package(
     name: "Recon",
     platforms: [
-        .iOS(.v15),          // docs/12 §4.6
+        .iOS(.v17),          // docs/12 §4.6
     ],
     products: [
         // 名字必须与 C ABI 头里的模块名、docs/12 §4.3 的产物名一致：

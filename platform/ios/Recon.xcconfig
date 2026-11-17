@@ -1,12 +1,12 @@
 // Recon.xcconfig — iOS 构建设置（由 tools/gen_ios_project.py 生成）
 //
 // 契约：docs/12_构建与打包.md §4.2（Xcode Build Settings 关键项）、
-//       §4.5（Bitcode）、§4.6（最低部署版本 = 15.0）、§4.7（arm64 only）。
+//       §4.5（Bitcode）、§4.6（最低部署版本 = 17.0）、§4.7（arm64 only）。
 //
 // ⚠️ 本文件由脚本生成，请不要手改 —— 改 tools/gen_ios_project.py 后重跑。
 //    理由：规格值需要可审查、可在 diff 中复核；手改会与生成器漂移。
 
-IPHONEOS_DEPLOYMENT_TARGET = 15.0
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
 SWIFT_VERSION = 5.0
 ENABLE_BITCODE = NO
 SKIP_INSTALL = YES

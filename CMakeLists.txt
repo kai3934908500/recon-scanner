@@ -26,6 +26,41 @@ option(RECON_USE_VULKAN "启用 Vulkan 计算后端" OFF)
 option(RECON_USE_METAL "启用 Metal 计算后端" OFF)
 
 # ---------------------------------------------------------------------------
+# RECON_REPO_ROOT：本顶层构建的**仓库根**（唯一路径锚点）
+# ---------------------------------------------------------------------------
+# ⚠️ 为什么需要它、以及为什么**不能用** `CMAKE_CURRENT_SOURCE_DIR`：
+#
+#   Android 侧（`platform/android/app/src/main/cpp/CMakeLists.txt`）与 iOS 侧
+#   共用本文件，但 Android 的顶层是一个**转发壳** —— 它只做
+#       include("<repo>/CMakeLists.txt")
+#   而 `include()` **不会**改变 `CMAKE_CURRENT_SOURCE_DIR`（那是「当前处理的
+#   source 目录」，即最早 `project()` 的目录 —— Android 下就是 `<repo>/
+#   platform/android/app/src/main/cpp`）。
+#
+#   于是本文件里任何 `${CMAKE_CURRENT_SOURCE_DIR}/tools/...`（原写法）在
+#   Android 构建里都会解析成
+#       <repo>/platform/android/app/src/main/cpp/tools/...   ← 不存在
+#   首次撞上的是 `include(cmake/ThirdParty.cmake)`（第 147 行），报
+#   `include could not find requested file` → `configureCMakeRelease` 失败。
+#   **桌面构建不受影响**（桌面在本文件所在目录 `project()`）—— 又一类
+#   「只有 CI 能发现」的错误（与缺口 AW 的转发壳层数错同源，都是 Android
+#   顶层结构 + 路径推导的陷阱）。
+#
+#   修法：用 `CMAKE_CURRENT_LIST_DIR`（**会**随 `include()` 更新，指向本文件
+#   所在目录 = 仓库根）锚定一个 `RECON_REPO_ROOT`，全文件路径一律挂在它下面。
+#   这是仓库既有技法（`cmake/Licenses.cmake:27` 早已这么用）。
+#   回归防线：`tools/check_android_contract.py` 的 **G-AND-6**。
+#
+# 取 `ABSOLUTE` 归一化，避免 `..` 段残留影响 `EXISTS` 判定与缓存键。
+get_filename_component(RECON_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+
+if(NOT EXISTS "${RECON_REPO_ROOT}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "RECON_REPO_ROOT='${RECON_REPO_ROOT}' 下没有 CMakeLists.txt —— "
+    "路径锚点失效（见本节注释）。")
+endif()
+
+# ---------------------------------------------------------------------------
 # 平台检测
 # ---------------------------------------------------------------------------
 if(ANDROID)
@@ -59,18 +94,25 @@ endif()
 # ---------------------------------------------------------------------------
 # iOS 专属编译/链接选项（docs/12 §4.1「版本要求」、§4.6「最低部署版本」）
 # ---------------------------------------------------------------------------
-# 部署目标 15.0 双保险断言 + 架构白名单 + 零网络硬约束声明。
+# 部署目标 17.0 双保险断言 + 架构白名单 + 零网络硬约束声明。
 # toolchain（cmake/toolchains/ios.cmake）已检一次；此处再检一次，防止 toolchain
 # 被替换/覆盖后静默产出不合规产物（与 Android 块的处理方式保持一致）。
 if(RECON_PLATFORM_IOS)
   if(NOT CMAKE_SYSTEM_VERSION OR CMAKE_SYSTEM_VERSION STREQUAL "")
     message(FATAL_ERROR
       "iOS 构建必须显式指定 CMAKE_SYSTEM_VERSION（= IPHONEOS_DEPLOYMENT_TARGET）。"
-      "见 docs/12_构建与打包.md §4.6，最低部署版本为 15.0。")
+      "见 docs/12_构建与打包.md §4.6，最低部署版本为 17.0。")
   endif()
-  if(IOS_DEPLOYMENT_TARGET AND IOS_DEPLOYMENT_TARGET VERSION_LESS 15.0)
+  # ⚠️ 判据变量必须是 **CMAKE_OSX_DEPLOYMENT_TARGET**（工具链在本文件被 include
+  #    之前，已把它 `set(... CACHE STRING)` 为 ${RECON_IOS_DEPLOYMENT_TARGET}）。
+  #    2026-11-02 修正：原写作 `IOS_DEPLOYMENT_TARGET` —— 该变量**全仓从未定义**，
+  #    CMake 中未定义变量展开为空字符串 → `if("" AND ...)` **恒假** → 这条自称
+  #    「双保险」的断言**从未触发过一次**（典型假闸门；其负向注入此前只覆盖了
+  #    工具链文件，没覆盖这里，故久未被发现）。改回真实存在的变量后本断言才生效。
+  if(CMAKE_OSX_DEPLOYMENT_TARGET AND
+     CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 17.0)
     message(FATAL_ERROR
-      "IOS_DEPLOYMENT_TARGET='${IOS_DEPLOYMENT_TARGET}' 低于下限 15.0，"
+      "CMAKE_OSX_DEPLOYMENT_TARGET='${CMAKE_OSX_DEPLOYMENT_TARGET}' 低于下限 17.0，"
       "见 docs/12_构建与打包.md §4.6。")
   endif()
 
@@ -106,11 +148,11 @@ endif()
 set(RECON_FORBIDDEN_LICENSES
     "GPL-3" "GPL-2" "AGPL-3" "AGPL" "LGPL-3" "LGPL-2.1" "FIPL" "Commons Clause")
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+if(EXISTS "${RECON_REPO_ROOT}/third_party")
   file(GLOB_RECURSE _tp_license_files
-       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/*/LICENSE*"
-       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/*/COPYING*"
-       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/*/COPYRIGHT*")
+       "${RECON_REPO_ROOT}/third_party/*/LICENSE*"
+       "${RECON_REPO_ROOT}/third_party/*/COPYING*"
+       "${RECON_REPO_ROOT}/third_party/*/COPYRIGHT*")
 
   set(_tp_violations "")
   foreach(_f IN LISTS _tp_license_files)
@@ -137,8 +179,8 @@ endif()
 # ---------------------------------------------------------------------------
 # ThirdParty.cmake 是「四表一致」链条的唯一真源；Licenses.cmake 由它派生
 # THIRD_PARTY_LICENSES.txt，并登记平台化嵌入路径（iOS / Android / 桌面）。
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ThirdParty.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Licenses.cmake")
+include("${RECON_REPO_ROOT}/cmake/ThirdParty.cmake")
+include("${RECON_REPO_ROOT}/cmake/Licenses.cmake")
 
 # ---------------------------------------------------------------------------
 # 核心库
@@ -204,7 +246,7 @@ add_library(recon_core ${RECON_CORE_LIB_TYPE} ${RECON_CORE_SOURCES})
 add_library(recon::core ALIAS recon_core)
 
 target_include_directories(recon_core PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/core/include")
+    "${RECON_REPO_ROOT}/core/include")
 
 if(MSVC)
   target_compile_options(recon_core PRIVATE /W4 /permissive-)
@@ -238,8 +280,8 @@ if(ZLIB_FOUND)
   target_compile_definitions(recon_core PRIVATE RECON_HAVE_ZLIB=1)
   target_compile_definitions(recon_core PUBLIC RECON_TEST_HAVE_ZLIB=1)
   message(STATUS "recon: 使用系统 zlib ${ZLIB_VERSION_STRING}（PNG/3MF 压缩）")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB/zlib.h")
-  set(_recon_zlib_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PoissonRecon-master/ZLIB")
+elseif(EXISTS "${RECON_REPO_ROOT}/third_party/PoissonRecon-master/ZLIB/zlib.h")
+  set(_recon_zlib_dir "${RECON_REPO_ROOT}/third_party/PoissonRecon-master/ZLIB")
   add_library(recon_zlib STATIC
       "${_recon_zlib_dir}/adler32.c"
       "${_recon_zlib_dir}/compress.c"
@@ -339,7 +381,7 @@ endif()
 add_library(recon_shaders_common INTERFACE)
 add_library(recon::shaders_common ALIAS recon_shaders_common)
 target_include_directories(recon_shaders_common INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common")
+    "${RECON_REPO_ROOT}/shaders/common")
 
 # --- Metal 侧 --------------------------------------------------------------
 # 空 INTERFACE target；`RECON_COMPILE_SHADERS=ON && RECON_PLATFORM_IOS` 时才
@@ -352,7 +394,7 @@ add_library(recon::shaders_metal ALIAS recon_shaders_metal)
 # --- Vulkan 侧 -------------------------------------------------------------
 add_library(recon_shaders_vulkan INTERFACE)
 add_library(recon::shaders_vulkan ALIAS recon_shaders_vulkan)
-set(RECON_VULKAN_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan")
+set(RECON_VULKAN_SHADER_DIR "${RECON_REPO_ROOT}/shaders/vulkan")
 file(GLOB RECON_VULKAN_SHADER_SOURCES CONFIGURE_DEPENDS
      "${RECON_VULKAN_SHADER_DIR}/*.comp" "${RECON_VULKAN_SHADER_DIR}/*.glsl")
 if(RECON_VULKAN_SHADER_SOURCES)
@@ -415,10 +457,10 @@ if(RECON_COMPILE_SHADERS AND RECON_PLATFORM_IOS)
             "RECON_IOS_DEPLOYMENT_TARGET=${RECON_IOS_DEPLOYMENT_TARGET}"
             "RECON_METALLIB_OUT_DIR=${RECON_METALLIB_OUT_DIR}"
             "RECON_METAL_AIR_DIR=${RECON_METALLIB_AIR_DIR}"
-            bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_metal_shaders.sh"
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/build_metal_shaders.sh
-            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common/gpu_algo.h"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            bash "${RECON_REPO_ROOT}/tools/build_metal_shaders.sh"
+    DEPENDS ${RECON_REPO_ROOT}/tools/build_metal_shaders.sh
+            "${RECON_REPO_ROOT}/shaders/common/gpu_algo.h"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "编译 Metal 着色器 → default.metallib（docs/12 §4.4）"
     VERBATIM)
   add_custom_target(recon_metallib DEPENDS "${RECON_METALLIB_OUT}")
@@ -430,13 +472,13 @@ if(RECON_COMPILE_SHADERS AND RECON_PLATFORM_IOS)
   #    漏列不会让构建失败，而是让该 .metal 静默不进 build phase，属
   #    MEMORY.md「静默丢弃最难查」。由 tools/shader_parity.py 的 P-12 判据守护。
   target_sources(recon_shaders_metal INTERFACE
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/mvs.metal"
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/tsdf.metal"
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/yuv.metal"
+      "${RECON_REPO_ROOT}/shaders/metal/mvs.metal"
+      "${RECON_REPO_ROOT}/shaders/metal/tsdf.metal"
+      "${RECON_REPO_ROOT}/shaders/metal/yuv.metal"
       # 预览线框渲染（iOS 独有，非双端 compute 算法 —— 故**不**注册进
       # gpu_algo.h，理由见 shaders/metal/wireframe.metal 文件头）。
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/wireframe.metal"
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/metal/gpu_common.h"
+      "${RECON_REPO_ROOT}/shaders/metal/wireframe.metal"
+      "${RECON_REPO_ROOT}/shaders/metal/gpu_common.h"
       "${RECON_METALLIB_OUT}")
   add_dependencies(recon_shaders_metal recon_metallib)
 endif()
@@ -452,15 +494,15 @@ if(RECON_COMPILE_SHADERS AND (RECON_PLATFORM_ANDROID OR RECON_PLATFORM_DESKTOP))
   # 但消费方 include 不到内联头（属 MEMORY.md「静默丢弃最难查」）。
   set(RECON_SPIRV_OUT_DIR "${CMAKE_BINARY_DIR}/vulkan/spirv")
   set(RECON_SPIRV_HEADER_OUT "${CMAKE_BINARY_DIR}/vulkan/recon_shaders_vulkan_spv.h")
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh")
+  if(EXISTS "${RECON_REPO_ROOT}/tools/build_vulkan_shaders.sh")
     add_custom_target(recon_spirv
       COMMAND "${CMAKE_COMMAND}" -E env
               "RECON_SPIRV_DIR=${RECON_SPIRV_OUT_DIR}"
               "RECON_SPIRV_HEADER=${RECON_SPIRV_HEADER_OUT}"
-              bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh"
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_vulkan_shaders.sh"
-              "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common/gpu_algo.h"
-      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+              bash "${RECON_REPO_ROOT}/tools/build_vulkan_shaders.sh"
+      DEPENDS "${RECON_REPO_ROOT}/tools/build_vulkan_shaders.sh"
+              "${RECON_REPO_ROOT}/shaders/common/gpu_algo.h"
+      WORKING_DIRECTORY "${RECON_REPO_ROOT}"
       COMMENT "编译 Vulkan 着色器 → SPIR-V（docs/12 §1.3）")
     # ── 缺口 B 的修复：把生成目标接进依赖图 ──────────────────────────────
     # 此前**没有**这一行，`recon_spirv` 是孤儿 custom target —— 任何构建都不会
@@ -497,14 +539,14 @@ add_library(recon_platform_common STATIC
     platform/common/src/yuv_convert.cpp)
 add_library(recon::platform_common ALIAS recon_platform_common)
 target_include_directories(recon_platform_common PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/platform/common/include")
+    "${RECON_REPO_ROOT}/platform/common/include")
 # 平台无关胶合层需要 core 的 **C ABI POD 类型**（如 `recon_imu_sample`）。
 # 只取类型，**绝不调用 RECON_API 函数** —— 那是各端桥接层（recon_platform_ios /
 # recon_platform_android）的职责。`imu_window.h` 直接复用 `recon_imu_sample`
 # 而非另定义同形结构体，正是为了消灭「第二事实来源」（两处同形定义必然漂移）。
 # 该边界由 tools/check_platform_parity.py 的闸门 8 静态守住。
 target_include_directories(recon_platform_common PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/core/include")
+    "${RECON_REPO_ROOT}/core/include")
 
 if(MSVC)
   target_compile_options(recon_platform_common PRIVATE /W4 /permissive-)
@@ -540,7 +582,7 @@ if(RECON_PLATFORM_ANDROID)
   target_include_directories(recon_platform_android PRIVATE
       # GPU 参数块的唯一事实来源（gpu_algo.h）。Vulkan 后端将来 include 它取
       # 工作组常量/参数块布局，不得在 Android 侧手抄一份（必然漂移）。
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common")
+      "${RECON_REPO_ROOT}/shaders/common")
   if(NOT MSVC)
     target_compile_options(recon_platform_android PRIVATE -Wall -Wextra -Wpedantic)
   endif()
@@ -576,7 +618,7 @@ if(RECON_PLATFORM_IOS)
       # 由 .mm 直接 include —— 不在 host 侧手抄一份结构体（必然漂移）。
       # 注：链接 recon_shaders_common 已传递该 include 目录，此处保留是为了
       # 让「为什么需要它」在目标定义处可见；两者指向同一路径，不产生第二来源。
-      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common")
+      "${RECON_REPO_ROOT}/shaders/common")
   target_compile_options(recon_platform_ios PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
@@ -724,41 +766,41 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
     add_test(NAME abi_drift
-      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/abi_drift_check.py"
-              --root "${CMAKE_CURRENT_SOURCE_DIR}")
+      COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/abi_drift_check.py"
+              --root "${RECON_REPO_ROOT}")
     add_test(NAME platform_parity
-      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_parity.py")
+      COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_platform_parity.py")
     add_test(NAME params_drift
-      COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_params.py")
+      COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_params.py")
   # iOS 侧静态契约闸门（locale / Liquid Glass 白名单 / U-X 禁令 / plist / C ABI）。
   # 该闸门不需要 macOS —— 它检查的是规格一致性，与编译器无关。
   add_test(NAME ios_contract
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ios_contract.py")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_ios_contract.py")
   # 着色器两端一致性闸门（docs/14 CT-6 / docs/12 MT-3）。
   # 同样不需要 macOS / glslang —— 它比对的是**源码结构**（算法名三方一致、
   # 参数块字段序列、workgroup 尺寸、跨端共享常量、缺口/差异标注同步）。
   # 在无着色器工具链的机器上，这是"两端算法同源"这一契约**唯一**可执行的检查。
   add_test(NAME shader_parity
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_parity.py")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/shader_parity.py")
   # 上述闸门自身的**负向注入**自检：对每类判据注入一个缺陷，要求闸门拒收。
   # 没有这条，"闸门通过"与"闸门根本没检查"无法区分（见该脚本文件头）。
   add_test(NAME shader_parity_negative
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_shader_parity_negative.py")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_shader_parity_negative.py")
   # iOS 契约闸门（G11 错误码逐值对等 / G12 阶段映射自洽）的负向注入自检。
   # 与 shader_parity_negative 同理：证明这两类**新增**判据真的会拒收，
   # 而不是「恒不触发」的假闸门。
   add_test(NAME ios_contract_negative
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_ios_contract_negative.py")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_ios_contract_negative.py")
   # 平台对等闸门（recon_status 数值集合 / JNI 数组布局条数）的负向注入自检。
   add_test(NAME platform_parity_negative
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_platform_parity_negative.py")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_platform_parity_negative.py")
   # ABI 漂移闸门（abi_drift_check）的负向注入自检。2026-11-02 新增：
   # 本轮实测踩到「闸门只锚表格行、散文计数无人守」→ docs/01 三处计数静默陈旧
   # （缺口 AQ，与缺口 AN 同型）。补了「散文计数对账」判据 + 反空约束后，
   # 必须同时证明新判据会拒收、且失锚时不会静默通过。
   add_test(NAME abi_drift_negative
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_abi_drift_negative.py"
-            --root "${CMAKE_CURRENT_SOURCE_DIR}")
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_abi_drift_negative.py"
+            --root "${RECON_REPO_ROOT}")
 endif()
 endif()
 
@@ -769,57 +811,57 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
   # 五阶段全量扫描 + 四表一致性（docs/12 §2.6.1 模式 C）
   add_custom_target(license_scan
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/license_scan.py"
-            --root "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
-            --registry "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ThirdParty.cmake"
-            --licenses-cmake "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Licenses.cmake"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/license_scan.py"
+            --root "${RECON_REPO_ROOT}/third_party"
+            --registry "${RECON_REPO_ROOT}/cmake/ThirdParty.cmake"
+            --licenses-cmake "${RECON_REPO_ROOT}/cmake/Licenses.cmake"
             --output "${CMAKE_BINARY_DIR}/license_scan_report.json"
             --fail-on-violation
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "扫描第三方依赖许可（GPL/AGPL 检测 + 四表一致性）")
 
   # 只做四表登记一致性（docs/12 §2.6.1 模式 A；对应 CI job license-registry）
   add_custom_target(license_registry
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/license_scan.py"
-            --registry "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ThirdParty.cmake"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/license_scan.py"
+            --registry "${RECON_REPO_ROOT}/cmake/ThirdParty.cmake"
             --check-registry
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "校验四表登记一致性（ThirdParty.cmake / docs 表 / third_party 目录）")
 
   # 校验已生成的许可清单与 third_party 逐字节一致（docs/12 §2.7）
   add_custom_target(license_manifest_verify
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/license_scan.py"
-            --licenses-cmake "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Licenses.cmake"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/license_scan.py"
+            --licenses-cmake "${RECON_REPO_ROOT}/cmake/Licenses.cmake"
             --licenses-text "${RECON_THIRD_PARTY_LICENSES_FILE}"
             --verify-licenses-cmake
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     DEPENDS licenses_manifest
     COMMENT "校验许可清单与 third_party 逐字节一致")
 
   # C ABI 契约漂移检测（docs/01 §2 裁定锚点的守护闸门，tools/abi_drift_check.py）
   add_custom_target(abi_drift_check
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/abi_drift_check.py"
-            --root "${CMAKE_CURRENT_SOURCE_DIR}"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/abi_drift_check.py"
+            --root "${RECON_REPO_ROOT}"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "检测 C ABI 契约漂移（真实头文件 vs docs/01 草案 vs 下游引用）")
 
   # 双端功能对等闸门（iOS / Android 同等对待铁律的守护，tools/check_platform_parity.py）
   add_custom_target(platform_parity_check
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_platform_parity.py"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_platform_parity.py"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "校验 iOS / Android 双端功能对等（权限 / 零网络 / 状态机序号 / C ABI 覆盖）")
 
   # 参数契约漂移闸门（docs/12 §6.2 任务 12，tools/check_params.py）
   add_custom_target(params_drift_check
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_params.py"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_params.py"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "检测参数契约漂移（白名单键 / 键名 / perf_ 组登记）")
 
   # iOS 侧静态契约闸门（docs/09 §1.2.1 LG-2 / §6.1 locale / docs/11 §1.1 权限）。
   # 与 macos 无关，故在桌面 CI 即可运行 —— 把 iOS 规格违规挡在提交之前。
   add_custom_target(ios_contract_check
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ios_contract.py"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/check_ios_contract.py"
+    WORKING_DIRECTORY "${RECON_REPO_ROOT}"
     COMMENT "校验 iOS 侧静态契约（locale 对等 / 玻璃白名单 / U-X 禁令 / 权限 / C ABI 覆盖）")
 endif()
 

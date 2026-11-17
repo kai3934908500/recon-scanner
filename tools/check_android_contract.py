@@ -81,8 +81,12 @@ G-AND-6  薄壳转发路径的上级层数（`src/main/cpp/CMakeLists.txt`）
          ⚠️ 这类错误的隐蔽性：**桌面构建完全不受影响**（仓库根有 CMakeLists.txt，
          ctest 全绿），是「只有 CI 能发现」的一类 —— 第四十九轮实测：
          Android CI 从 #3 到 #6 **四次全部**倒在这里，同一期间 iOS 侧闸门
-         + ctest 三十余项全绿。判据做两层：(a) 禁 `CMAKE_SOURCE_DIR`；
-         (b) **真的做路径解析**（不是数 `../` 的文本比对，那会随写法漂移而失锚）。
+         + ctest 三十余项全绿。判据做三层：(a) 禁 `CMAKE_SOURCE_DIR`；
+         (b) **真的做路径解析**（不是数 `../` 的文本比对，那会随写法漂移而失锚）；
+         (c) 根 CMakeLists.txt **禁 `CMAKE_CURRENT_SOURCE_DIR`**、必须用
+         `RECON_REPO_ROOT`（因为 include() 不改 CMAKE_CURRENT_SOURCE_DIR，
+         根文件里的仓库相对路径会全部指向壳目录 —— 2026-11-02 的第二次
+         Android CI 失败即此，与 (a)(b) 是**同一根因的两个层面**）。
 
 包含的**反假绿**设计（本项目反复踩过的坑，逐条都对应真实事故）
 --------------------------------------------------------------
@@ -789,6 +793,60 @@ def judge_g6_forwarder_path(rep: Report) -> None:
         return
 
     rep.note(f"G-AND-6 转发壳上级路径实测指到仓库根（{ups} 个 `../`）✓")
+
+    # --- (c) 根 CMakeLists.txt 不得用 CMAKE_CURRENT_SOURCE_DIR 锚路径 --------
+    # ⚠️ 第二层判据（2026-11-02 补，对应一次真实 CI 失败）：
+    #   转发壳 `include()` 根 CMakeLists.txt 后，**`CMAKE_CURRENT_SOURCE_DIR`
+    #   仍是壳目录**（include 不改它）。于是根文件里任何
+    #   `${CMAKE_CURRENT_SOURCE_DIR}/tools/...` 在 Android 构建里都解析成
+    #   `<repo>/platform/android/app/src/main/cpp/tools/...` → 不存在。
+    #   首次撞上的是 `include(cmake/ThirdParty.cmake)` → `include could not
+    #   find requested file` → `configureCMakeRelease` 失败；而**桌面不受影响**
+    #   （桌面在本文件目录 project()），又是「只有 CI 能发现」的一类。
+    #   必须改用 `RECON_REPO_ROOT`（由 `CMAKE_CURRENT_LIST_DIR` 推导，随
+    #   include 更新）。本判据在根文件里禁 `CMAKE_CURRENT_SOURCE_DIR`。
+    if not _require(rep, ROOT_CMAKE, "G-AND-6(c)：仓库根 CMakeLists.txt"):
+        return
+    root_text = strip_cmake_comments(read(ROOT_CMAKE))
+    hits = re.findall(r"\$\{CMAKE_CURRENT_SOURCE_DIR\}", root_text)
+    if hits:
+        rep.err("G-AND-6",
+                f"仓库根 CMakeLists.txt 出现 {len(hits)} 处 "
+                f"`${{CMAKE_CURRENT_SOURCE_DIR}}` —— Android 转发壳用 "
+                f"`include()` 引入本文件时该变量**不会**变成仓库根（仍是壳目录），"
+                f"于是这些路径全部指错 → `configureCMakeRelease` 失败。"
+                f"必须改用 `${{RECON_REPO_ROOT}}`（由 `CMAKE_CURRENT_LIST_DIR` 推导）。")
+        return
+    # 反空：锚点**定义**必须恰好一处，且必须由 CMAKE_CURRENT_LIST_DIR 推导。
+    # ⚠️ 第一版这里判的是「`${RECON_REPO_ROOT}` 引用数 >= 10」—— 那是错的：
+    #    负向注入只删掉锚点定义、62 处引用仍在，引用数照样 >= 10 → 判据恒真通过
+    #    （本轮负向注入实测暴露：`G-AND-6c/root-anchor-removed` 未被拒收）。
+    #    正确的反空点是**定义**本身：没有定义，后面所有 `use of undefined
+    #    variable` 只在 CMake 运行期才炸，静态闸门必须在此拦下。
+    anchor_defs = re.findall(
+        r"get_filename_component\s*\(\s*RECON_REPO_ROOT\s+"
+        r"\"\$\{([A-Za-z_]\w*)\}\"", root_text)
+    if not anchor_defs:
+        rep.err("G-AND-6",
+                "仓库根 CMakeLists.txt 未定义 `RECON_REPO_ROOT` 路径锚点 —— "
+                "Android 转发壳 include() 后 `CMAKE_CURRENT_SOURCE_DIR` 是壳目录，"
+                "必须有 `get_filename_component(RECON_REPO_ROOT \"${CMAKE_CURRENT_LIST_DIR}\" ...)`。")
+        return
+    if len(anchor_defs) > 1:
+        rep.err("G-AND-6",
+                f"仓库根 CMakeLists.txt 定义了 {len(anchor_defs)} 处 `RECON_REPO_ROOT`"
+                f"（应恰好一处）—— 多处定义必然漂移。")
+        return
+    if anchor_defs[0] != "CMAKE_CURRENT_LIST_DIR":
+        rep.err("G-AND-6",
+                f"`RECON_REPO_ROOT` 由 `${{{anchor_defs[0]}}}` 推导 —— 必须是 "
+                f"`${{CMAKE_CURRENT_LIST_DIR}}`（唯一随 `include()` 更新、"
+                f"且在 Android/POSIX/桌面下都指向本文件目录的变量）。")
+        return
+    n_use = root_text.count("${RECON_REPO_ROOT}")
+    rep.note(f"G-AND-6(c) 根 CMakeLists.txt 路径锚点自洽："
+             f"锚点由 `${{CMAKE_CURRENT_LIST_DIR}}` 定义 1 处、"
+             f"{n_use} 处引用、0 处 `${{CMAKE_CURRENT_SOURCE_DIR}}` ✓")
 
 
 # ---------------------------------------------------------------------------

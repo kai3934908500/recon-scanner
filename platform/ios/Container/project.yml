@@ -1,6 +1,13 @@
 # project.yml — Recon iOS App 容器定义（XcodeGen）
 #
-# 契约：docs/12_构建与打包.md §4.2（混编配置）、§4.6（部署目标 15.0）。
+# 契约：docs/12_构建与打包.md §4.2（混编配置）、§4.6（部署目标 17.0）。
+#
+# ⚠️ 字符串里出现「部署目标占位符」的地方，在 gen_container() 里由
+#    DEPLOYMENT_TARGET 常量替换。为什么不用 f-string：本字符串大量包含
+#    shell 变量 `${PLATFORM_NAME}` / `${BUILT_PRODUCTS_DIR}`，f-string 会把
+#    它们当表达式，需逐个转义成 `${{...}}`，极易漏改。占位符方案让部署目标
+#    仍然只有 DEPLOYMENT_TARGET **一个**来源（避免 MEMORY.md 记的「两份事实
+#    来源必然漂移」）。
 #
 # 为什么需要本文件：UI 层（ui/ios/）与桥接层（platform/ios/Recon/）在仓库里是
 # **物理分离**的两个目录树，而 SwiftPM 不允许 target 源码位于包根之外，无法用
@@ -27,7 +34,7 @@
 name: Recon
 options:
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "17.0"
   createIntermediateGroups: true
 
 configs:
@@ -37,7 +44,7 @@ configs:
 settings:
   base:
     SWIFT_VERSION: "5.0"                       # docs/12 §4.1
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"         # docs/12 §4.6
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"         # docs/12 §4.6
     TARGETED_DEVICE_FAMILY: "1"                # 仅 iPhone
     SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"      # 零警告标准
     GCC_TREAT_WARNINGS_AS_ERRORS: "YES"
@@ -209,10 +216,10 @@ targets:
           # （见 tools/build_metal_shaders.sh 的长论证）。**必须传** ——
           # 不传则脚本回落默认值，而默认值与 target 的 Build Settings 是
           # 两处事实来源，迟早漂移（MEMORY.md）。
-          # ⚠️ 刻意**读 Xcode 注入的构建设置**而不是在此再写一遍 "15.0"：
+          # ⚠️ 刻意**读 Xcode 注入的构建设置**而不是在此再写一遍 "17.0"：
           #    该变量与 target 的 IPHONEOS_DEPLOYMENT_TARGET 同源，
           #    改一处即全链路生效。为空时**不覆盖**（让脚本用自带默认值，
-          #    并由脚本内的 `>= 15` 断言把关 —— fail-closed 而非静默降级）。
+          #    并由脚本内的 `>= 17` 断言把关 —— fail-closed 而非静默降级）。
           if [ -n "${IPHONEOS_DEPLOYMENT_TARGET:-}" ]; then
             export RECON_IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET}"
           fi
