@@ -794,6 +794,24 @@ recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
     return RECON_ERR_VIO_NOT_INITIALIZED;
   }
 
+  // 【关键修复】SfM 输入抽稀：RunIncrementalSfm 是 O(n²) 图像匹配，
+  // 600 帧会让真机卡死在"位姿估计"且进度 0%（用户实测）。SfM 建位姿只需
+  // 足够的视角覆盖，均匀抽稀到上限不损失几何精度（COLMAP 同样对视频抽帧）。
+  // 抽稀后仍用全部帧做后续的 MVS 稠密融合，精度不受影响。
+  constexpr size_t kSfmMaxViews = 80;
+  if (usable.size() > kSfmMaxViews) {
+    const size_t total = usable.size();
+    std::vector<int> sampled;
+    sampled.reserve(kSfmMaxViews);
+    for (size_t j = 0; j < kSfmMaxViews; ++j) {
+      const size_t idx = (j * (total - 1)) / (kSfmMaxViews - 1);
+      sampled.push_back(usable[idx]);
+    }
+    usable.swap(sampled);
+    EmitLog(1, "SfM 输入抽稀：" + std::to_string(total) + " → " +
+                   std::to_string(usable.size()) + " 视图（均匀采样）");
+  }
+
   SfmConfig scfg;
   scfg.feature_count =
       static_cast<int>(ParamOr(keys::kSfmFeatureCount, scfg.feature_count));

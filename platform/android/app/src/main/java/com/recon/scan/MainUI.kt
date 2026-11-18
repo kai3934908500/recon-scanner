@@ -905,8 +905,11 @@ internal class MainUI(
                     null, android.graphics.Shader.TileMode.CLAMP)
                 style = Paint.Style.FILL }
             val empty = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(0x33, 0xFF, 0xFF, 0xFF); style = Paint.Style.FILL }
-            // 球体底
+                color = Color.argb(0xCC, 0x11, 0x18, 0x27); style = Paint.Style.FILL }
+            // 球体底：深色半透明底盘（之前 20% 白在亮画面上完全看不见）
+            canvas.drawCircle(cx, cy, r + dp(4).toFloat(),
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.argb(0x99, 0x00, 0x00, 0x00); style = Paint.Style.FILL })
             canvas.drawCircle(cx, cy, r, empty)
             // 36 个方位扇区：每个是一条竖直"瓜瓣"（椭圆弧），覆盖则绿
             val n = 36
@@ -918,8 +921,8 @@ internal class MainUI(
                 // 用球面经度投影：瓜瓣宽度随 cos(经度) 收窄，画到圆两侧
                 val mid = (a0 + a1) / 2f
                 val rad = Math.toRadians(mid.toDouble()).toFloat()
-                val x0 = cx + r * kotlin.math.sin(rad) * 0.18f
-                val x1 = cx + r * kotlin.math.sin(Math.toRadians(a1.toDouble()).toFloat()) * 0.18f
+                val x0 = cx + r * kotlin.math.sin(rad) * 0.85f
+                val x1 = cx + r * kotlin.math.sin(Math.toRadians(a1.toDouble()).toFloat()) * 0.85f
                 path.moveTo(cx, cy - r)
                 path.quadTo(x0, cy, x1, cy + r)
                 path.quadTo(cx, cy, cx, cy - r)
