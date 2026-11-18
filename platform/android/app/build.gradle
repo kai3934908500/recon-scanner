@@ -134,4 +134,9 @@ dependencies {
     // 故此处不引入 camera-camera2 依赖。ARCore 为 optional（见 AndroidManifest）。
     implementation 'com.google.ar:core:1.45.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+
+    // U2-Netp 显著性物体分割（端侧推理，识别扫描目标）。
+    // 用 CPU 版而非 GPU 版：低端机兼容性优先，4.4MB 模型在 CPU 上毫秒级。
+    // 模型 u2netp.onnx 放 assets/，MIT 许可，纯本地零网络。
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.18.0'
 }

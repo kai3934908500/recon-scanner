@@ -259,7 +259,9 @@ internal class MainUI(
             visibility = View.GONE
         }
         progressWrap.addView(logScroll)
-        content.addView(progressWrap)
+        // 进度卡挂在 column 独立层（与 infoScroll 平级），
+        // 这样重建时隐藏 infoScroll 也不会把它一起藏掉。
+        column.addView(progressWrap)
 
         statCard = Card(context, dp, context.getString(R.string.ui_section_overview))
         statGrid = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
@@ -376,10 +378,13 @@ internal class MainUI(
         stepper.visibility = if (on) View.GONE else View.VISIBLE
         infoScroll.visibility = if (on) View.GONE else View.VISIBLE
         progressWrap.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
-            setMargins(dp(16), dp(20), dp(16), dp(8))
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            if (on) 0 else ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            weight = if (on) 1f else 0f
+            setMargins(dp(16), dp(12), dp(16), if (on) dp(8) else dp(0))
         }
         progressWrap.setPadding(dp(18), dp(20), dp(18), dp(20))
+        if (on) progressWrap.visibility = View.VISIBLE
     }
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */

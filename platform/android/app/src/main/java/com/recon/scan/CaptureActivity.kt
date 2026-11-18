@@ -57,10 +57,11 @@ class CaptureActivity : ComponentActivity() {
     private var pendingCameraStart = false
     /** 陀螺仪方位覆盖追踪：驱动全景扫描式"球包裹"引导。 */
     private var coverageTracker: CoverageTracker? = null
-    /** 物体显著性检测：驱动绿色物体边框贴合物体。 */
-    private val objectDetector = ObjectDetector()
+    /** U²-Netp 显著性物体分割：真正识别扫描目标（端侧 ONNX 推理）。 */
+    private var u2netDetector: U2NetDetector? = null
     @Volatile private var detectedObjectMask: BooleanArray? = null
-    private var detectCounter = 0
+    @Volatile private var detecting = false
+    private var lastDetectMs = 0L
 
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
@@ -80,6 +81,7 @@ class CaptureActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         ui = MainUI(this) { action -> onAction(action) }
         coverageTracker = CoverageTracker(this)
+        u2netDetector = U2NetDetector(this)   // 模型加载失败时 available=false，自动降级
         val probe = DeviceProbe.probe(this)
         val branch = if (probe.hasTof) "支持硬件深度" else "单目视觉"
         val imu = if (probe.hasImu) "惯性传感器可用" else "无惯性传感器"
@@ -349,15 +351,24 @@ class CaptureActivity : ComponentActivity() {
         if (status == ReconStatus.OK) {
             ingestedFrames++
             coverageTracker?.markFrame()
-            // 每 8 帧做一次轻量物体检测（48×48 下采样，<1ms，不阻塞采集）
-            if (++detectCounter % 8 == 0) {
-                val result = objectDetector.detect(frame.bgra, frame.width, frame.height)
-                if (result.mask != null) {
-                    detectedObjectMask = result.mask
-                    mainHandler.post { ui.updateCaptureHud(ingestedFrames,
-                        coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates(), detectedObjectMask,
-                        coverageTracker?.speed() ?: 0.0) }
+            // U²-Netp 目标识别：节流 250ms，IO 线程推理，不阻塞采集。
+            // 模型不可用时保持旧 mask（不伪造识别结果）。
+            val now = System.currentTimeMillis()
+            if (!detecting && now - lastDetectMs >= 250) {
+                lastDetectMs = now
+                detecting = true
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val det = u2netDetector?.detect(frame.bgra, frame.width, frame.height)
+                    detecting = false
+                    if (det?.mask != null) {
+                        detectedObjectMask = det.mask
+                        mainHandler.post {
+                            ui.updateCaptureHud(ingestedFrames,
+                                coverageTracker?.coverage() ?: 0f,
+                                coverageTracker?.bucketStates(), detectedObjectMask,
+                                coverageTracker?.speed() ?: 0.0)
+                        }
+                    }
                 }
             }
         } else rejectedFrames++
@@ -499,7 +510,7 @@ class CaptureActivity : ComponentActivity() {
         arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
         coverageTracker?.reset()
         detectedObjectMask = null
-        detectCounter = 0
+        lastDetectMs = 0L
         ui.clearStageDetail()
         shell.setResultSummary(getString(R.string.projects_empty_body))
         shell.setPreviewMesh(null, null)
