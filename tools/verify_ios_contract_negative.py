@@ -127,6 +127,11 @@ CALIBRATION_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens"
                                 "CalibrationView.swift")
 REBUILD_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens",
                             "RebuildView.swift")
+# G22 的目标对象：许可清单的写入链（生成物 phase + 生成器源头 + 落位脚本）
+# 与读取端（许可页 Swift）。
+LICENSES_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens",
+                             "LicensesView.swift")
+STAGE_LICENSES_SH = os.path.join(ROOT, "tools", "stage_licenses.sh")
 
 
 def slurp(path: str) -> str:
@@ -174,6 +179,51 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "  \"msg.home.not_rebuilt\": \"Not rebuilt\",\n",
           "")],
     ),
+    # --- G1：locale 完成度判据（v1.3 新增 4 条 _meta 一致性 + 1 条废止「有键即 done」）
+    #     背景：docs/09 §5.9 预言的**恒真型假闸门**（缺口 BB 同型）。v1.2 的
+    #     `has_keys = any(...)` 判据在 18 个 locale 写入 32 个机器翻译键后会输出
+    #     「已完成翻译 20/20」而真实自有覆盖率仅 ≈9.2%。以下注入既证明**新判据**
+    #     会拒收，也证明**旧判据确实不能**达成（G1-e 反向坐实）。
+    (
+        "G1-a-mt-claims-done",
+        "机器翻译 locale 却把 translation_status 改成 done（冒充人工完成）",
+        "机器翻译**不得**声称已完成人工翻译",
+        [(os.path.join(ROOT, "ui", "ios", "Recon", "Resources", "locales",
+                       "de.json"),
+          "\"translation_status\": \"pending\"",
+          "\"translation_status\": \"done\"")],
+    ),
+    (
+        "G1-b-pending-with-unlabeled-keys",
+        "pending locale 预填了未标注机器翻译的键（「有键即完成」型假闸门）",
+        "未标注机器翻译的键",
+        [(os.path.join(ROOT, "ui", "ios", "Recon", "Resources", "locales",
+                       "de.json"),
+          "\"machine_translated\": true,",
+          "\"machine_translated\": false,")],
+    ),
+    (
+        "G1-c-mt-without-scope",
+        "标注 machine_translated 却删掉 machine_translated_new_keys（无法界定范围）",
+        "无法界定机器翻译范围",
+        [(os.path.join(ROOT, "ui", "ios", "Recon", "Resources", "locales",
+                       "de.json"),
+          "\"machine_translated_new_keys\": [",
+          "\"machine_translated_new_keys_unused\": [")],
+    ),
+    (
+        "G1-d-mt-bogus-key",
+        "machine_translated_new_keys 引用一个本 locale 不存在的键",
+        "引用了本 locale 不存在的键",
+        [(os.path.join(ROOT, "ui", "ios", "Recon", "Resources", "locales",
+                       "de.json"),
+          "\"machine_translated_new_keys\": [\n",
+          "\"machine_translated_new_keys\": [\n    \"msg.settings.__ghost__\",\n")],
+    ),
+    # 说明：G1-a..d 分别对应 gate_locales 中 (a)(b)(c)(d) 四个分支，各有一条注入
+    # 证伪。`done` 分支（人工翻译完成的 locale）由**基线**覆盖 —— 基线 rc=0 证明
+    # 该分支在 zh-CN/en-US 上不误报。此处**故意不**构造「有键但撤下机器翻译标注」
+    # 的 __NO_ERROR__ 反向注入：那恰恰是闸门**应当**拒收的冒充场景，不是合法写法。
     # --- G9：UI 文案无法反查（非中文用户会看到中文）------------------------
     (
         "G9-a-unresolvable-source",
@@ -593,6 +643,56 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           " { _, newSeg in\n"
           "            if let newSeg { lastStageIndex = newSeg }\n")],
     ),
+    # --- G22：许可清单必须真的进 iOS App 包（2026-11-18 实测发现的真实阻塞缺口）---
+    #   背景：U-13 许可清单页读**包根**的 THIRD_PARTY_LICENSES.txt，但该文件
+    #   此前**从不进包**（`install(... DESTINATION "Recon.app")` 只在 CMake
+    #   install 阶段生效，而 iOS 交付链走 xcodegen + xcodebuild，从不跑
+    #   `cmake --install`），→ 真机永远读到空、编译期与 G1..G21 全绿。
+    #   四条注入分别打生成物 / 生成器源头 / 读取端交叉对账 / 落位脚本 fail-closed。
+    (
+        "G22-a-container-phase-removed",
+        "把生成物 project.yml 里的 `Stage Third-Party Licenses` phase 删掉"
+        "（许可清单从不进包 → 许可页真机读到空，而编译期全绿）",
+        "许可清单**从不进 App 包**",
+        [(CONTAINER_YML,
+          "      - name: Stage Third-Party Licenses\n",
+          "")],
+    ),
+    (
+        "G22-b-generator-phase-removed",
+        "在生成器源头 gen_ios_project.py 里去掉该 phase（判据必须落在源头，"
+        "否则重生成即回退）",
+        "源头里没有 `Stage Third-Party Licenses` phase",
+        [(GEN_IOS_PROJECT,
+          "    postBuildScripts:\n"
+          "      - name: Stage Third-Party Licenses\n",
+          "    # NEGATIVE INJECTION: phase removed\n"
+          "    __disabled_postBuildScripts__:\n"
+          "      - name: Not-Stage-Licenses\n")],
+    ),
+    (
+        "G22-c-reader-subdir-mismatch",
+        "把读取端 LicensesView.swift 的查找方式改成带 subdirectory（读端指向"
+        "子目录、写端放包根 → 两端漂移，真机读不到）",
+        "带了 `subdirectory:`",
+        [(LICENSES_VIEW,
+          "        guard let url = Bundle.main.url(forResource: "
+          "\"THIRD_PARTY_LICENSES\",\n"
+          "                                       withExtension: \"txt\"),\n",
+          "        guard let url = Bundle.main.url(forResource: "
+          "\"THIRD_PARTY_LICENSES\",\n"
+          "                                       withExtension: \"txt\",\n"
+          "                                       subdirectory: \"Resources\"),\n")],
+    ),
+    (
+        "G22-d-stage-script-not-fail-closed",
+        "把落位脚本的 fail-closed 契约去掉（`REQUIRE` 不再绑定 "
+        "`RECON_REQUIRE_LICENSES` → 缺清单时产空文件冒充「依赖为零」）",
+        "不是 fail-closed",
+        [(STAGE_LICENSES_SH,
+          'REQUIRE="${RECON_REQUIRE_LICENSES:-0}"\n',
+          'REQUIRE="0"\n')],
+    ),
 ]
 
 
@@ -600,7 +700,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="check_ios_contract.py 的负向注入自检"
                     "（G6 / G7 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / "
-                    "G17 / G18 / G19 / G20 / G21）")
+                    "G17 / G18 / G19 / G20 / G21 / G22）")
     ap.add_argument("--keep-going", action="store_true",
                     help="全部跑完再汇总（默认也是全跑，此项保留语义）")
     args = ap.parse_args()
@@ -610,7 +710,8 @@ def main() -> int:
               LOCALIZATION, ZH_JSON, EN_JSON, CAPABILITY_VIEW,
               FRAME_PIPELINE, FRAME_CONVERTER, BRIDGING_HEADER, METAL_BACKEND,
               CONTAINER_YML, GEN_IOS_PROJECT, LICENSES_CMAKE, IOS_WORKFLOW,
-              ROOT_CMAKELISTS, CALIBRATION_VIEW, REBUILD_VIEW):
+              ROOT_CMAKELISTS, CALIBRATION_VIEW, REBUILD_VIEW,
+              LICENSES_VIEW, STAGE_LICENSES_SH):
         if not os.path.isfile(p):
             print(f"[negative] 环境错误：找不到 {p}", file=sys.stderr)
             return 1
@@ -693,7 +794,7 @@ def main() -> int:
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
           f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 / "
-          f"G18 / G19 / G20 / G21 均有效）")
+          f"G18 / G19 / G20 / G21 / G22 均有效）")
     return 0
 
 

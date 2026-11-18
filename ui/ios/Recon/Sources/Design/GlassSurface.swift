@@ -222,8 +222,10 @@ public struct GlassToolbarButton: View {
 
     public var body: some View {
         Button(action: action) {
+            // 图标尺寸固定（§1.8 图标 20pt 档），不随字号缩放 —— 否则大字体会
+            // 撑破 48×48 热区（§1.7）。故用 `fixedFont`。
             Image(systemName: systemImage)   // U-X-6：仅系统 SF Symbols
-                .font(.system(size: ReconFont.headline.size, weight: .regular))
+                .font(ReconFont.fixedFont(ReconFont.headline))
                 // §1.7：热区取严者 48×48（不是 controlHeight 的 44）。
                 .frame(width: ReconMetric.minTouchTarget, height: ReconMetric.minTouchTarget)
                 .contentShape(Rectangle())

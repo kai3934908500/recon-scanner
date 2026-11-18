@@ -111,44 +111,237 @@ public enum ReconColor {
 /// - 字体族：`Font.system`（SF Pro Text）；数值用 SF Mono。**不使用自定义字体**。
 /// - 字重仅 3 档：Regular / Medium(Android) / Semibold。**禁止 Bold、Black**。
 /// - 行高固定，不随内容自适应；字距 0，不使用 tracking。
+///
+/// ── Dynamic Type（docs/09 §3.11 U-S-1..6，v1.3 新增）────────────────────
+///
+/// **为什么需要 `textStyle` 字段**：v1.2 及以前，`Spec` 只有固定 `size`
+/// （如 `.system(size: 17)`）—— **固定字号对系统「文字大小」设置完全无响应**，
+/// 这正是 v1.1 下「字号匹配不好」的根因（U-S-4）。修法不是把 `size` 乘以某个
+/// 系数（那是绝对覆盖，会破坏可访问性放大），而是**改用 `Font.TextStyle`**
+/// —— 由系统按当前 Dynamic Type 设置解析出字号。
+///
+/// **为什么保留固定 `size`**：docs/09 §1.4 的 11 档固定字号与 Apple Dynamic Type
+/// 各 `TextStyle` 的**默认（Large）字号逐值相同**（§1.4 末映射表，U-S-5），
+/// 故两者**不是二选一**：`textStyle` 承载缩放基准，`size` 作为**默认档的等价真值**
+/// 保留，供两处使用 —— ① 非文字场景（§1.8 图标尺寸、§6.4「图形标记不随字号缩放」）；
+/// ② 单测/闸门核对「恒等映射」是否仍成立（差异列全 0 是判据）。
+///
+/// **禁止** `.system(size: 17, relativeTo: .body)` —— SwiftUI **不存在**该签名
+/// （`relativeTo:` 仅属 `Font.custom(_:size:relativeTo:)`）。v1.2 规格初稿误写此
+/// 形式，若照实现**编译不过**（U-S-4 订正登记）。
 public enum ReconFont {
 
-    /// 尺寸 / 行高（pt）。行高固定，由调用方通过 `lineSpacing` 落实。
+    /// 尺寸 / 行高（pt）+ Dynamic Type 缩放基准。
+    ///
+    /// - `textStyle`：缩放基准（U-S-4）。渲染文字**必须**经 `font(_:mono:)` 使用它，
+    ///   不得直接读 `size` 构造 `.system(size:)`。
+    /// - `size` / `lineHeight`：**默认档（Large）等价真值**，与 Apple 各
+    ///   `TextStyle` 的默认字号逐值相同（U-S-5）。供图标尺寸与映射校验使用。
     public struct Spec {
+        /// Dynamic Type 缩放基准（U-S-4）。
+        public let textStyle: Font.TextStyle
+        /// 默认档（Large）字号。**不参与系统缩放**，仅供图标与校验。
         public let size: CGFloat
+        /// 默认档行高（pt）。行高随字号缩放由 `lineSpacing`/容器自适应承载（U-S-6）。
         public let lineHeight: CGFloat
         public let weight: Font.Weight
 
         /// SwiftUI `Text.lineSpacing` 需要的是**行间距增量**，即 (行高 − 字号)。
+        ///
+        /// 注意这是**默认档**的增量。字号被 Dynamic Type 放大后，实际行高由
+        /// 系统按行高倍数同步放大（`Font.TextStyle` 自带），故此处无需重算
+        /// （U-S-6：系数施加点在字号，不在行高）。
         public var lineSpacing: CGFloat { max(0, lineHeight - size) }
     }
 
     /// 仅首页顶部项目名
-    public static let display = Spec(size: 34, lineHeight: 40, weight: .regular)
+    public static let display = Spec(textStyle: .largeTitle, size: 34, lineHeight: 40, weight: .regular)
     /// 结果页、导出页标题
-    public static let title1 = Spec(size: 28, lineHeight: 34, weight: .regular)
+    public static let title1 = Spec(textStyle: .title, size: 28, lineHeight: 34, weight: .regular)
     /// 区块标题
-    public static let title2 = Spec(size: 22, lineHeight: 28, weight: .regular)
+    public static let title2 = Spec(textStyle: .title2, size: 22, lineHeight: 28, weight: .regular)
     /// 界面标题
-    public static let title3 = Spec(size: 20, lineHeight: 25, weight: .regular)
+    public static let title3 = Spec(textStyle: .title3, size: 20, lineHeight: 25, weight: .regular)
     /// 列表主标题、按钮文字
-    public static let headline = Spec(size: 17, lineHeight: 22, weight: .semibold)
+    public static let headline = Spec(textStyle: .headline, size: 17, lineHeight: 22, weight: .semibold)
     /// 正文
-    public static let body = Spec(size: 17, lineHeight: 22, weight: .regular)
+    public static let body = Spec(textStyle: .body, size: 17, lineHeight: 22, weight: .regular)
     /// 长正文、次要说明
-    public static let callout = Spec(size: 16, lineHeight: 21, weight: .regular)
+    public static let callout = Spec(textStyle: .callout, size: 16, lineHeight: 21, weight: .regular)
     /// 列表副标题、控件标签
-    public static let subhead = Spec(size: 15, lineHeight: 20, weight: .regular)
+    public static let subhead = Spec(textStyle: .subheadline, size: 15, lineHeight: 20, weight: .regular)
     /// 辅助说明、单位、阈值
-    public static let footnote = Spec(size: 13, lineHeight: 18, weight: .regular)
+    public static let footnote = Spec(textStyle: .footnote, size: 13, lineHeight: 18, weight: .regular)
     /// 统计数值标签
-    public static let caption = Spec(size: 12, lineHeight: 16, weight: .regular)
+    public static let caption = Spec(textStyle: .caption, size: 12, lineHeight: 16, weight: .regular)
     /// 时间戳、文件路径尾段
-    public static let caption2 = Spec(size: 11, lineHeight: 13, weight: .regular)
+    public static let caption2 = Spec(textStyle: .caption2, size: 11, lineHeight: 13, weight: .regular)
 
-    /// 数值专用等宽字体（§1.4「数字」行：所有统计数值必须等宽 + 右对齐 + 千分位）。
-    public static func mono(_ spec: Spec) -> Font {
-        .system(size: spec.size, weight: spec.weight, design: .monospaced)
+    /// **非缩放**字体构造：固定字号，**仅限图标/图形标记**（§1.8 图标尺寸、
+    /// §6.4「图形标记不随字号缩放」）。
+    ///
+    /// 与 `.reconFont(...)` 的区别是语义，不是实现：本函数**刻意**不参与 Dynamic Type，
+    /// 因为规格要求这些元素尺寸固定（避免遮挡预览、避免图标随字号撑破工具栏）。
+    /// 名称中带 `Fixed` 以在调用点自证意图，审查时一眼可辨。
+    public static func fixedFont(_ spec: Spec, mono: Bool = false) -> Font {
+        .system(size: spec.size, weight: spec.weight,
+                design: mono ? .monospaced : .default)
+    }
+
+    /// **非缩放**字体构造（**裸字号**变体）。
+    ///
+    /// ⚠️ 仅供「规格尚未给出 token」的图形标记使用（如 §3.4 引导三角标记，
+    /// 规格写 12px 而实现为 24pt，**一致性未裁决**）。调用点**必须**写注释
+    /// 说明该数值的来源与为何不是 token —— 否则它就是 §1「不引入规格外取值」
+    /// 的违规点。新代码**不应**使用本重载；能在 §1.4 找到对应 token 的一律用
+    /// `fixedFont(_ spec:)`。
+    public static func fixedFont(size: CGFloat, mono: Bool = false) -> Font {
+        .system(size: size, weight: .regular,
+                design: mono ? .monospaced : .default)
+    }
+
+    /// 用户档位系数的**唯一施加点**（U-S-2）。
+    ///
+    /// 输入是**已被系统 Dynamic Type 缩放**的字号，输出是「再乘档位系数」后的最终
+    /// 字号。字体渲染与宽度估算（`SpecText` 的 40 字符截断上限）都经此函数，
+    /// 保证「系数只在字号上乘一次」这一逻辑**不写第二遍**。
+    ///
+    /// - Parameters:
+    ///   - systemScaled: 系统缩放后的字号（来自 `@ScaledMetric`）。
+    ///   - scale: 用户档位。
+    public static func applyScale(_ systemScaled: CGFloat, scale: ReconFontScale) -> CGFloat {
+        systemScaled * scale.factor
+    }
+}
+
+// ===========================================================================
+// MARK: - §3.11 U-S-1..3 字号档位（Dynamic Type 系数）
+// ===========================================================================
+
+/// 字号档位（docs/09 §3.11 U-S-2）。
+///
+/// 三档 = **在系统缩放之上再乘一个系数**（0.9 / 1.0 / 1.15），**不做绝对字号覆盖**
+/// —— 保留 Dynamic Type 的可访问性放大能力（U-S-2）。
+public enum ReconFontScale: String, CaseIterable, Sendable {
+    /// `跟随系统`（U-S-1）：不施加额外系数，完全采用 Dynamic Type。
+    case system
+    /// `小`：×0.9
+    case small
+    /// `标准`：×1.0
+    case standard
+    /// `大`：×1.15
+    case large
+
+    /// 施加在系统缩放之上的系数（U-S-2）。
+    ///
+    /// `system` 档也返回 1.0 —— 它的语义是「不额外乘系数」，与 `standard` 在
+    /// **数值**上等价，但**语义不同**（前者表示"跟随系统"，后者表示"用户显式选了标准档"），
+    /// 故保留为两个 case，不合并。
+    public var factor: CGFloat {
+        switch self {
+        case .system, .standard: return 1.0
+        case .small:             return 0.9
+        case .large:             return 1.15
+        }
+    }
+
+    /// §3.11 U-S-3：locale 无关的 `UserDefaults` 键 `dynamic_type_override`。
+    ///
+    /// 该键**不是 locale 键**，不进 §5 文案表（U-S-3 明文）。
+    public static let defaultsKey = "dynamic_type_override"
+}
+
+// ===========================================================================
+// MARK: - 唯一的字体缩放入口（U-S-4：文字必须走此路径）
+// ===========================================================================
+
+private struct ReconFontScaleKey: EnvironmentKey {
+    static let defaultValue: ReconFontScale = .system
+}
+
+public extension EnvironmentValues {
+    /// 当前字号档位（由 `RootView` 从 `UserDefaults` 读出后注入）。
+    var reconFontScale: ReconFontScale {
+        get { self[ReconFontScaleKey.self] }
+        set { self[ReconFontScaleKey.self] = newValue }
+    }
+}
+
+/// **文字的统一缩放修饰器**：系统 Dynamic Type × 用户档位系数。
+///
+/// 这是全 App **唯一**的字体缩放实现（U-S-4「所有 `ReconFont.*` 必须走缩放路径」），
+/// `SpecText` 与所有直接挂字体的按钮/标签都经它取字体，避免各写各的。
+///
+/// 机制（U-S-1 + U-S-2 的合成）：
+/// 1. `@ScaledMetric(relativeTo: spec.textStyle)` —— 以 `spec.size` 为**默认档初值**，
+///    由系统按当前 Dynamic Type 设置缩放出实际字号。因 `spec.size` 与 Apple 该
+///    `TextStyle` 的默认字号**逐值相同**（U-S-5 的恒等映射），系统处于默认档时
+///    结果 == `spec.size`，与 §1.4 表逐值一致；
+/// 2. 再乘 `reconFontScale.factor`（0.9 / 1.0 / 1.15）—— 这是「再乘一个系数」，
+///    不是绝对覆盖，故系统放大到 200% 时仍是 200% × factor（U-S-2 可访问性保留）。
+private struct ScaledFontModifier: ViewModifier {
+    let spec: ReconFont.Spec
+    let mono: Bool
+
+    /// 系统缩放后的字号（默认档初值 = `spec.size`）。
+    @ScaledMetric private var scaledSize: CGFloat
+    /// 用户档位系数（U-S-2），由环境注入。
+    @Environment(\.reconFontScale) private var scale
+
+    init(spec: ReconFont.Spec, mono: Bool) {
+        self.spec = spec
+        self.mono = mono
+        // `relativeTo:` 取 `spec.textStyle` —— 缩放曲线与该文本样式对齐。
+        _scaledSize = ScaledMetric(wrappedValue: spec.size, relativeTo: spec.textStyle)
+    }
+
+    func body(content: Content) -> some View {
+        content.font(
+            .system(size: ReconFont.applyScale(scaledSize, scale: scale),
+                    weight: spec.weight,
+                    design: mono ? .monospaced : .default)
+        )
+    }
+}
+
+/// 供**宽度估算**用的「当前实际字号」（默认档初值 × 系统缩放 × 档位系数）。
+///
+/// 与 `ScaledFontModifier` 共用 `ReconFont.applyScale`，故「系数只乘一次」不写两遍。
+/// 用途：`SpecText` 的单行 40 字符截断上限 —— 字号放大后容器上限须同步放宽，
+/// 否则 §6.4「200% 时允许两行」会被过早截断破坏。
+public struct ScaledFontMetrics<Content: View>: View {
+    private let spec: ReconFont.Spec
+    private let render: (_ renderedSize: CGFloat) -> Content
+
+    @ScaledMetric private var scaledSize: CGFloat
+    @Environment(\.reconFontScale) private var scale
+
+    public init(spec: ReconFont.Spec,
+                @ViewBuilder render: @escaping (_ renderedSize: CGFloat) -> Content) {
+        self.spec = spec
+        self.render = render
+        _scaledSize = ScaledMetric(wrappedValue: spec.size, relativeTo: spec.textStyle)
+    }
+
+    public var body: some View {
+        render(ReconFont.applyScale(scaledSize, scale: scale))
+    }
+}
+
+public extension View {
+    /// 按字号 token 挂字体，**自动响应系统 Dynamic Type 与用户档位**（U-S-1..4）。
+    ///
+    /// - Parameters:
+    ///   - spec: 字号 token（`ReconFont.*`）。
+    ///   - mono: 数值用等宽（§1.4「数字」行）。
+    ///   - withLineSpacing: 是否同时设置 `Spec.lineSpacing`（多行正文用 `true`，
+    ///     单行文本用默认 `false` 以免无谓的行距）。
+    ///
+    /// 图标/图形标记**不要**用本修饰器，用 `ReconFont.fixedFont(_:)`（§1.8 / §6.4）。
+    func reconFont(_ spec: ReconFont.Spec, mono: Bool = false,
+                   withLineSpacing: Bool = false) -> some View {
+        modifier(ScaledFontModifier(spec: spec, mono: mono))
+            .lineSpacing(withLineSpacing ? spec.lineSpacing : 0)
     }
 }
 

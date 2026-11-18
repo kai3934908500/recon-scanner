@@ -84,9 +84,17 @@ public struct HomeView: View {
                     .accessibilityAddTraits(.isHeader)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button(L10n.t(.homeSettings)) { /* 推入设置页（§2 未列入 U-01..U-10，占位） */ }
-                    .font(.system(size: ReconFont.footnote.size))
+                // U-01 导航栏右「设置」按钮 → U-11 设置页（docs/09 §2 U-11 行 /
+                // §3.11）。此前这里是**空实现**（`/* 占位 */`），是 §3.11 登记说明
+                // 里点名的「按钮已渲染、规格却没登记、目的地为零」那一处。
+                // 键用 `home.settings`（按钮）而非 `settings.title`（页面标题），
+                // 依据 §5.9 复用辨析第 3 条 —— 同文案双键，语义域不同，不得合并。
+                Button(L10n.t(.homeSettings)) { router.push(.settings) }
+                    .reconFont(ReconFont.footnote)
                     .foregroundStyle(ReconColor.txtAccent)   // 按下态即 accent
+                    // §1.7：文字按钮同样要满足 48×48 热区。
+                    .frame(minWidth: ReconMetric.minTouchTarget,
+                           minHeight: ReconMetric.minTouchTarget, alignment: .trailing)
             }
         }
     }
@@ -127,7 +135,7 @@ public struct HomeView: View {
             }
             Spacer(minLength: ReconMetric.space2)
             Button(L10n.t(.homeDetail)) { router.push(.capability) }
-                .font(.system(size: ReconFont.footnote.size))
+                .reconFont(ReconFont.footnote)
                 .foregroundStyle(ReconColor.txtAccent)
         }
         .padding(.vertical, ReconMetric.space3)
@@ -182,7 +190,7 @@ public struct HomeView: View {
                     Button("\(L10n.t(.homeAllProjects)) (\(allProjectsCount))") {
                         /* 推入全部项目列表 */
                     }
-                        .font(.system(size: ReconFont.footnote.size))
+                        .reconFont(ReconFont.footnote)
                         .foregroundStyle(ReconColor.txtAccent)
                 }
             }
@@ -209,7 +217,7 @@ public struct HomeView: View {
                     router.push(item.hasResult ? .result(sessionID: item.id)
                                                : .rebuild(sessionID: item.id))
                 }
-                .font(.system(size: ReconFont.footnote.size))
+                .reconFont(ReconFont.footnote)
                 .foregroundStyle(ReconColor.txtAccent)
                 // §1.7：文字按钮同样要满足 48×48 热区。
                 .frame(minWidth: ReconMetric.minTouchTarget, minHeight: ReconMetric.minTouchTarget,
@@ -225,14 +233,14 @@ public struct HomeView: View {
     private var bottomBar: some View {
         HStack {
             Button(L10n.t(.homeParams)) { router.push(.params) }
-                .font(.system(size: ReconFont.footnote.size))
+                .reconFont(ReconFont.footnote)
                 .foregroundStyle(ReconColor.txtAccent)
                 .frame(minWidth: ReconMetric.minTouchTarget, minHeight: ReconMetric.minTouchTarget)
 
             Spacer()
 
             Button(L10n.t(.homeExportHistory)) { /* 推导出历史 */ }
-                .font(.system(size: ReconFont.footnote.size))
+                .reconFont(ReconFont.footnote)
                 .foregroundStyle(ReconColor.txtAccent)
                 .frame(minWidth: ReconMetric.minTouchTarget, minHeight: ReconMetric.minTouchTarget)
                 .disabled(true)                          // 无记录时禁用（§3.1）

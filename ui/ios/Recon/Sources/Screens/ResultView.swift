@@ -67,7 +67,7 @@ public struct ResultView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button(L10n.t(.exportTitle)) { router.push(.export(sessionID: sessionID)) }
-                    .font(.system(size: ReconFont.headline.size, weight: .semibold))
+                    .reconFont(ReconFont.headline)
                     .foregroundStyle(ReconColor.txtAccent)
                     .disabled(!(info?.exportable ?? false))   // 重建未成功则禁用
             }

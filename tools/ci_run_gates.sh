@@ -32,7 +32,7 @@
 #   generate  生成 iOS 工程描述（其余 iOS 类闸门的**前置**）
 #   ios       iOS 静态契约 G1..G21
 #   neg-ios   上条的负向注入
-#   ipa       未签名 IPA 打包器的判据本体自检（stage_ios_ipa.py 的 P-1..P-9）
+#   ipa       未签名 IPA 打包器的判据本体自检（stage_ios_ipa.py 的 P-1..P-10）
 #             —— 合成产物 + 逐条证伪，**不需要 macOS 与任何 Apple 工具**
 #   parity    双端功能对等（1..9）
 #   neg-parity
@@ -270,19 +270,19 @@ if wants generate; then
 fi
 
 if wants ios; then
-  step "iOS 静态契约闸门（G1..G21）" "${PY}" tools/check_ios_contract.py
+  step "iOS 静态契约闸门（G1..G22）" "${PY}" tools/check_ios_contract.py
 fi
 if wants neg-ios; then
   step "iOS 静态契约负向注入（证明 G 判据非假闸门）" \
     "${PY}" tools/verify_ios_contract_negative.py
 fi
 
-# --- 未签名 IPA 打包器（P-1..P-9）的判据本体自检 ----------------------------
+# --- 未签名 IPA 打包器（P-1..P-10）的判据本体自检 ----------------------------
 # 为什么放在这里而不是 macOS job：它是**纯 Python 标准库**实现（zipfile +
 # 自研 Mach-O 解析），合成产物即可证伪 —— 不需要 Xcode / lipo / zip。
 # 这与 `elf` 能力点的理由一致：核心资源的**判据实现本体**必须先于产物被验证。
 if wants ipa; then
-  step "未签名 IPA 打包器自检（P-1..P-9，合成产物 + 逐条证伪）" \
+  step "未签名 IPA 打包器自检（P-1..P-10，合成产物 + 逐条证伪）" \
     "${PY}" tools/stage_ios_ipa.py --self-test
 fi
 

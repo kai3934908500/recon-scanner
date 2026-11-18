@@ -160,7 +160,7 @@ public struct ScanView: View {
                 showEndConfirm = true                  // U-NAV-3：先确认
             } label: {
                 Image(systemName: "xmark")             // U-X-6：仅 SF Symbols
-                    .font(.system(size: ReconFont.headline.size))
+                    .font(ReconFont.fixedFont(ReconFont.headline))
             }
             .foregroundStyle(ReconColor.txtPrimary)
             .frame(width: ReconMetric.minTouchTarget, height: ReconMetric.minTouchTarget)
@@ -309,9 +309,20 @@ public struct ScanView: View {
             }
 
             // §3.4：引导模式下预览中央有定向标记（线框中的 △）。
+            //
+            // ⚠️ 尺寸不一致（**未裁决，勿擅自改**）：规格 §3.4「静态标记」原文为
+            //    「预览内 **12px** 等腰三角形」，而此处用 SF Symbol + 24pt ——
+            //    且 24pt 是 §1.8 分配给「结果页统计区」的档位，场景用错。
+            //    又规格要求「形态仅两种：2px 短线段 或 12px 等腰三角形」，
+            //    而 SF Symbol 的形态不受此约束。三处均对不上，属**规格↔实现
+            //    不一致**，须先由用户裁决是改规格（承认 SF Symbol 方案）还是
+            //    改实现（改用 Path 绘制 12px 三角形）。
+            //    **本处只做「固定不缩放」这一确定正确的改动**（§6.4 明文
+            //    「图形标记为固定像素尺寸，不随字号缩放」），**数值保持 24 不变**
+            //    —— 改数值属未授权的视觉变更。登记见 docs/14 缺口表。
             if mode == .guided {
                 Image(systemName: "arrowtriangle.up")
-                    .font(.system(size: 24))
+                    .font(ReconFont.fixedFont(size: 24))
                     .foregroundStyle(ReconColor.txtPrimary)
             }
         }

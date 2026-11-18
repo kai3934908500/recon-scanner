@@ -26,6 +26,10 @@ import SwiftUI
 /// 3. §1.4「上限」：单行 **40 个半角字符**超出即尾部 `…` 截断 —— 由
 ///    `truncateWidth` 参数配合 `lineLimit(1)` 落实（宽度按 `footnote` 字号
 ///    估算 40 个半角字符的合理宽度）；多行最多 3 行。
+///
+/// **字号走 Dynamic Type**（docs/09 §3.11 U-S-1..4）：字体由 `.reconFont(...)`
+/// 施加，响应系统「文字大小」与用户档位系数；行高增量随之下发。**不**直接写
+/// `.system(size: spec.size)` —— 那会对系统字号设置完全无响应（v1.1 的根因）。
 public struct SpecText: View {
     let text: String
     let spec: ReconFont.Spec
@@ -53,24 +57,28 @@ public struct SpecText: View {
     /// §1.4 上限：单行 40 个半角字符。
     private static let singleLineCharLimit = 40
 
-    /// 需要截断时按当前字号估算的宽度上限（40 个半角字符 ≈ 0.5 em 宽）。
-    private var truncateWidth: CGFloat? {
-        guard applyCharLimit, maxLines == 1 else { return nil }
-        return CGFloat(Self.singleLineCharLimit) * spec.size * 0.5
+    public var body: some View {
+        // 宽度上限须按**当前实际字号**（含 Dynamic Type 缩放与档位系数）估算：
+        // 若用固定的默认档 `spec.size`，字号被放大后截断会**过早触发**，
+        // 破坏 §6.4「200% 时允许两行」。故经 `ScaledFontMetrics` 取实际字号。
+        ScaledFontMetrics(spec: spec) { renderedSize in
+            Text(text)
+                .reconFont(spec, mono: mono, withLineSpacing: true)
+                .foregroundStyle(color)
+                .lineLimit(maxLines)
+                .frame(maxWidth: truncateWidth(renderedSize: renderedSize),
+                       alignment: .leading)
+                .truncationMode(.tail)
+        }
     }
 
-    public var body: some View {
-        let font: Font = mono
-            ? .system(size: spec.size, weight: spec.weight, design: .monospaced)
-            : .system(size: spec.size, weight: spec.weight)
-
-        Text(text)
-            .font(font)
-            .foregroundStyle(color)
-            .lineSpacing(spec.lineSpacing)
-            .lineLimit(maxLines)
-            .frame(maxWidth: truncateWidth, alignment: .leading)
-            .truncationMode(.tail)
+    /// 需要截断时按**当前实际字号**估算的宽度上限（40 个半角字符 ≈ 0.5 em 宽）。
+    ///
+    /// `maxLines != 1` 或未开启字符上限时返回 `nil`（不限宽，由容器与
+    /// `lineLimit` 决定布局，符合 §6.4「文本容器不得固定高度」）。
+    private func truncateWidth(renderedSize: CGFloat) -> CGFloat? {
+        guard applyCharLimit, maxLines == 1 else { return nil }
+        return CGFloat(Self.singleLineCharLimit) * renderedSize * 0.5
     }
 }
 
@@ -138,11 +146,11 @@ public struct MonoNumber: View {
     public var body: some View {
         HStack(spacing: ReconMetric.space1) {
             Text(value)
-                .font(.system(size: spec.size, weight: spec.weight, design: .monospaced))
+                .reconFont(spec, mono: true)
             if let unit {
                 // 单位与数值之间留一个半角空格（§1.4）。
                 Text(unit)
-                    .font(.system(size: spec.size, weight: spec.weight))
+                    .reconFont(spec)
             }
         }
         .foregroundStyle(color)
@@ -197,7 +205,7 @@ public struct PrimaryButton: View {
         VStack(alignment: .leading, spacing: ReconMetric.space1) {
             Button(action: action) {
                 Text(title)
-                    .font(.system(size: ReconFont.headline.size, weight: .semibold))
+                    .reconFont(ReconFont.headline)
                     .foregroundStyle(ReconColor.txtOnSolid)
                     .frame(maxWidth: .infinity)
                     .frame(height: ReconMetric.controlHeight)
@@ -231,7 +239,7 @@ public struct SecondaryButton: View {
     public var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: ReconFont.headline.size, weight: .semibold))
+                .reconFont(ReconFont.headline)
                 .foregroundStyle(ReconColor.accent)
                 .frame(maxWidth: .infinity)
                 .frame(height: ReconMetric.controlHeight)
@@ -319,8 +327,10 @@ public struct InlineNotice: View {
     public var body: some View {
         // §1.5：容器用 8pt 圆角 + 底色，**不用阴影**（U-X-2）；用 1px 描边区分。
         HStack(alignment: .top, spacing: ReconMetric.space2) {
+            // 图标尺寸**固定**，不随字号缩放（§6.4「图形标记不随字号缩放」；
+            // §1.8 图标尺寸亦为固定值）。故用 `fixedFont` 而非 `.reconFont`。
             Image(systemName: symbol)
-                .font(.system(size: ReconFont.footnote.size))
+                .font(ReconFont.fixedFont(ReconFont.footnote))
                 .foregroundStyle(tint)
             SpecText(text, spec: ReconFont.footnote, color: tint, maxLines: 3)
             Spacer(minLength: 0)
@@ -351,7 +361,7 @@ public struct Chip: View {
 
     public var body: some View {
         Text(title)
-            .font(.system(size: ReconFont.caption2.size, weight: .regular))
+            .reconFont(ReconFont.caption2)
             .foregroundStyle(ReconColor.txtAccent)
             .padding(.horizontal, ReconMetric.space1)
             .padding(.vertical, 1)

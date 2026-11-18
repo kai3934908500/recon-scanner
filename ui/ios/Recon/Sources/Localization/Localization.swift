@@ -76,6 +76,28 @@ public enum AppLocale: String, CaseIterable {
 
     /// 文件名（§6.1）。
     public var fileName: String { "\(rawValue).json" }
+
+    /// 语言名（以**当前界面语言**呈现），供 U-11「语言」行 / U-12「当前语言」行。
+    ///
+    /// ── 为什么不用 locale 键 ──────────────────────────────────────────────
+    /// 20 个语言名是**语言自称/他称**，属「内容本身」而非 UI 文案（§6.5 L-4
+    /// 同类）；且它须随**界面语言**本地化（界面切到德语时，「日语」要显示成
+    /// `Japanisch`）——这是 20×20 的组合，用 locale 键会变成 400 个键。故走系统
+    /// `Locale.localizedString(forIdentifier:)`，与 iOS 系统设置里的语言列表同源。
+    ///
+    /// ── `ua` 的纠正（不静默改规格）───────────────────────────────────────
+    /// §6.1 的乌克兰语标识符是 `ua`，**不是有效 ISO 639-1 码**（正确码是 `uk`）→
+    /// 系统 API 对它返回 `nil`。此处**仅在取显示名时**换成 `uk`：
+    /// `rawValue` 仍是 `ua`（文件名 `ua.json`、`UserDefaults` 存取、`AppLocale`
+    /// 的 `allCases` 顺序**全都不变**）。取不到时**如实回退标识符原文**，不伪造名字。
+    ///
+    /// 该映射全仓**仅此一处**（U-11 / U-12 共用），不各写一遍。
+    public var displayName: String {
+        // 观察者语言 = 当前界面语言，故显示名随界面语言切换。
+        let observer = Locale(identifier: L10n.current.rawValue)
+        let identifier = (self == .ua) ? "uk" : rawValue
+        return observer.localizedString(forIdentifier: identifier) ?? rawValue
+    }
 }
 
 // ===========================================================================
@@ -705,6 +727,49 @@ public enum L10nKey: String, CaseIterable {
     //     docs/09 §5 文案表**尚未收录**本条，已登记为文档缺口；不谎报为
     //     `msg.result.preparing_preview`（那条语义是「准备中」，会误导用户等待）。
     case resultPreviewPending   = "msg.result.preview_pending"
+
+    // --- 设置页 U-11（§3.11 / §5.9，v1.3 新增）---------------------------
+    //     键名与文案真值见 docs/09 §5.9；此处为**逐条转写**（不许代码先行）。
+    case settingsTitle          = "msg.settings.title"
+    case settingsSectionScan    = "msg.settings.section.scan"
+    case settingsSectionDisplay = "msg.settings.section.display"
+    case settingsSectionData    = "msg.settings.section.data"
+    case settingsDefaultMode    = "msg.settings.default_mode"
+    case settingsScaleReference = "msg.settings.scale_reference"
+    case settingsLanguage       = "msg.settings.language"
+    case settingsFontSize       = "msg.settings.font_size"
+    case settingsAppearance     = "msg.settings.appearance"
+    case settingsVersionLicense = "msg.settings.version_license"
+    case settingsGlassSupport   = "msg.settings.glass_support"
+    case settingsGlassNative    = "msg.settings.glass_native"
+    case settingsGlassFallback  = "msg.settings.glass_fallback"
+    /// `跟随系统`（语言 / 字号 / 外观三行共用的值）。
+    case settingsFontSystem     = "msg.settings.font_system"
+    case settingsFontSmall      = "msg.settings.font_small"
+    case settingsFontStandard   = "msg.settings.font_standard"
+    case settingsFontLarge      = "msg.settings.font_large"
+    case settingsAppearanceLight = "msg.settings.appearance_light"
+    case settingsAppearanceDark  = "msg.settings.appearance_dark"
+    case settingsExportCountZero = "msg.settings.export_count_zero"
+
+    // --- 关于页 U-12（§3.12 / §5.9，v1.3 新增）--------------------------
+    case aboutTitle             = "msg.about.title"
+    case aboutAppName           = "msg.about.app_name"
+    case aboutLocalProcessing   = "msg.about.local_processing"
+    case aboutGlassTitle        = "msg.about.glass_title"
+    /// LG-4 强制可见的降级说明（回退时**不允许**静默降级）。
+    case aboutGlassFallbackNote = "msg.about.glass_fallback_note"
+    case aboutOpenSource        = "msg.about.open_source"
+
+    // --- 开源许可清单页 U-13（§3.13 / §5.9，v1.3 新增）-------------------
+    case licensesTitle          = "msg.licenses.title"
+    case licensesIntro          = "msg.licenses.intro"
+
+    // --- 设置/关于页的格式串（§5.9 的 `fmt.*`）---------------------------
+    case fmtAboutVersion        = "fmt.about.version"
+    case fmtAboutBuild          = "fmt.about.build"
+    case fmtAboutLanguage       = "fmt.about.language"
+    case fmtSettingsExportCount = "fmt.settings.export_count"
 }
 
 // ===========================================================================

@@ -73,7 +73,7 @@ public struct ParamsView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 // `完成`：关闭面板，写回 ParamSet。
                 Button(L10n.t(.paramsDone)) { router.pop() }
-                    .font(.system(size: ReconFont.headline.size, weight: .semibold))
+                    .reconFont(ReconFont.headline)
                     .foregroundStyle(ReconColor.txtAccent)
             }
         }
@@ -118,7 +118,7 @@ public struct ParamsView: View {
                              color: ReconColor.txtSecondary, maxLines: 2)
                     Spacer(minLength: ReconMetric.space2)
                     Button(L10n.t(.commonView)) { /* 展开差异清单（§3.8.3） */ }
-                        .font(.system(size: ReconFont.footnote.size))
+                        .reconFont(ReconFont.footnote)
                         .foregroundStyle(ReconColor.txtAccent)
                         .frame(minWidth: ReconMetric.minTouchTarget,
                                minHeight: ReconMetric.minTouchTarget)
@@ -192,7 +192,7 @@ public struct ParamsView: View {
             .tint(ReconColor.accent)
 
             Button(L10n.t(.paramsRestoreFactory)) { showFactoryConfirm = true }
-                .font(.system(size: ReconFont.footnote.size))
+                .reconFont(ReconFont.footnote)
                 .foregroundStyle(ReconColor.txtError)
                 .frame(minWidth: ReconMetric.minTouchTarget, minHeight: ReconMetric.minTouchTarget)
         }

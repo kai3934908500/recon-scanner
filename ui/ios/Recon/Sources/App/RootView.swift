@@ -15,6 +15,10 @@ public struct RootView: View {
     /// —— 与 `L10n.catalog` 指向同一个对象（两份实例会让「当前语言」分叉）。
     @StateObject private var l10n = L10nBootstrap.shared
 
+    /// 字号档位（docs/09 §3.11 U-S-1..3）。初值从 `UserDefaults` 的
+    /// `reconFontScale` 键读出；设置页改档后由 `AppSettings` 更新并回写。
+    @StateObject private var settings = AppSettings.shared
+
     public init() {}
 
     public var body: some View {
@@ -49,6 +53,8 @@ public struct RootView: View {
         }
         // §1.6：仅使用系统默认转场（iOS push），不做自定义动画。
         .environment(\.l10n, l10n.catalog)
+        // §3.11 U-S-1..3：字号档位注入全树，`reconFont` 据此乘系数。
+        .environment(\.reconFontScale, settings.fontScale)
     }
 
     /// 路由 → 界面（与 `AppRoute` 一一对应，docs/09 §2 的 `route` 列）。
@@ -79,6 +85,12 @@ public struct RootView: View {
             CalibrationView()
         case .export(let id):
             ExportView(sessionID: id)
+        case .settings:
+            SettingsView()
+        case .about:
+            AboutView()
+        case .licenses:
+            LicensesView()
         }
     }
 }

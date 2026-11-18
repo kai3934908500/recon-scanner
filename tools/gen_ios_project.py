@@ -411,6 +411,47 @@ targets:
           export RECON_METALLIB_OUT_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
           export RECON_METAL_AIR_DIR="${DERIVED_FILE_DIR}/metal-air"
           bash "${SRCROOT}/tools/build_metal_shaders.sh"
+    # 「Stage Third-Party Licenses」Build Phase（docs/09 §3.13 U-L-3；
+    # docs/12 §2.7「嵌入位置」）。
+    #
+    # ── 为什么必须有这么一步（2026-11-18 发现并修复的真实阻塞缺口）──────────
+    #   U-13 许可清单页读包内 `Recon.app/THIRD_PARTY_LICENSES.txt`，但该文件
+    #   **此前从不进包**：`cmake/Licenses.cmake` 的 `install(... DESTINATION
+    #   "Recon.app")` 只在 CMake install 阶段生效，而 iOS 交付链
+    #   （xcodegen + xcodebuild）**从不跑 `cmake --install`**；project.yml 的
+    #   sources 里也没有它；`stage_ios_ipa.py` 也不注入。→ U-13 在真机上永远
+    #   读到空，且编译期与既有闸门全绿（「静默失效」形态，与 G15 的 metallib
+    #   落位、缺口 J 的 RGB 丢弃同型）。
+    #
+    # ── 为什么放在 postBuildScripts（**位于** Compile Sources 之后）─────────
+    #   与 metallib 相反：metallib 是**编译输入**（Metal 源码的编译产物，需在
+    #   Compile Sources 前就位），而许可清单**不参与编译**，只是要进最终包。
+    #   放在 postBuildScripts 更贴合语义，也避免拖慢编译前置阶段。
+    #   ⚠️ 两者的**共同点**是落位目录都取 `UNLOCALIZED_RESOURCES_FOLDER_PATH`
+    #      （iOS = 包根，扁平 bundle 无 `Contents/`）——这是 G15-c 守的事实。
+    #
+    # ── fail-closed（RECON_REQUIRE_LICENSES=1）───────────────────────────
+    #   脚本优先用 `cmake -P cmake/Licenses.cmake` 现场生成（真值来自
+    #   `cmake/ThirdParty.cmake`），失败才回退仓内既有产物并**打印警告**；
+    #   两份都没有时硬失败 —— 不产空文件、不让许可页在真机上读到空。
+    postBuildScripts:
+      - name: Stage Third-Party Licenses
+        script: |
+          set -euo pipefail
+          # 缺清单即硬失败（合规义务 U-L-1/U-L-3，不得静默降级）。
+          export RECON_REQUIRE_LICENSES=1
+          # 与 metallib 同因：变量为空意味着构建设置语义变了，猜一个目录会把
+          # 文件写到不会被读取的位置（静默失效）。故 fail-closed。
+          if [ -z "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" ]; then
+            echo "FAIL: UNLOCALIZED_RESOURCES_FOLDER_PATH 为空 —— 无法确定许可清单落位" >&2
+            exit 1
+          fi
+          # ⚠️ 用 BUILT_PRODUCTS_DIR（**未经签名的**构建产物目录）而非
+          #    TARGET_BUILD_DIR（可能指向已签名的安装路径）。二者在普通 build
+          #    下相同，但差异只在特定配置下显现；用 BUILT_PRODUCTS_DIR 与
+          #    metallib 步保持一致，避免出现两套落位语义。
+          export RECON_LICENSES_OUT_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          bash "${SRCROOT}/tools/stage_licenses.sh"
 
 # 显式 scheme：`xcodebuild -scheme Recon` 需要有共享 scheme。
 # XcodeGen 会为 application target 自动生成 scheme，但**显式声明**才能保证

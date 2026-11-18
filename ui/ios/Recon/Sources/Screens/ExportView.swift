@@ -193,7 +193,7 @@ public struct ExportView: View {
                         Image(systemName: hasRunValidation
                               ? (c.passed ? "checkmark.circle" : "xmark.circle")
                               : "circle.dashed")
-                            .font(.system(size: ReconFont.footnote.size))
+                            .font(ReconFont.fixedFont(ReconFont.footnote))
                             .foregroundStyle(hasRunValidation
                                              ? (c.passed ? ReconColor.success : ReconColor.error)
                                              : ReconColor.txtTertiary)

@@ -61,13 +61,16 @@ stage_ios_ipa.py —— 把归档出来的 Recon.app 打成**未签名 IPA** 并
        不匹配时 20 个 locale 全部落进 `LocaleCatalog.missingFiles`，
        UI 全部回退到键名，**且无任何报错**（与本项目既往「静默失效」同构）。
   P-9  `PrivacyInfo.xcprivacy` 位于**包根**（docs/11 §1.5 / docs/12 §4.8）。
+  P-10 `THIRD_PARTY_LICENSES.txt` 位于**包根**且**非空**（docs/09 §3.13 U-L-3
+       「许可全文随 App 打包」）。这是缺口 BC 的**产物面**判据 —— 静态 G22 只守
+       「生成链里确有一次嵌入动作」，而静态绿灯**不等于**产物里真有该文件。
 
 ────────────────────────────────────────────────────────────────────────────
 可被证伪（`--self-test`）
 ────────────────────────────────────────────────────────────────────────────
 `--self-test` 现场合成一个**结构正确的** `.app`（真实 Mach-O64 头、binary
-plist、metallib、20 个 locale json、PrivacyInfo），打成 IPA 断言 P-1..P-9 全过；
-然后**逐条**破坏一个事实，断言**恰好对应的那条判据**拒收。
+plist、metallib、20 个 locale json、PrivacyInfo、许可清单），打成 IPA 断言
+P-1..P-10 全过；然后**逐条**破坏一个事实，断言**恰好对应的那条判据**拒收。
 ⇒ 每条判据都不是恒真的：把判定写反 / 漏掉某条 / 正则零命中（退化成"没东西
    可查所以通过"）都会立刻被自检抓到。
 
@@ -436,6 +439,25 @@ def verify_ipa(ipa_path: str, rep: Result) -> None:
             rep.err("P-9", f"缺少 `{priv}` —— docs/11 §1.5 / docs/12 §4.8 要求它"
                            f"位于 App 包**根目录**（上架校验项）")
 
+        # ---- P-10 许可清单在包根（缺口 BC 的**产物面**判据）------------------
+        # 为什么需要（静态 G22 之外的第二道）：
+        #   G22 守的是「生成链里确有一次嵌入动作 + 落位变量取包根」——**静态**。
+        #   但静态绿灯**不等于**产物里真的有该文件（例如構建 phase 因路径/变量
+        #   差异静默写到了别处、或被后续步骤覆盖）。本判据直接读 IPA 内容，
+        #   与 G15（metallib）/ G17（locale）的产物面 P-4 / P-8 同一手法。
+        lic = f"{root}/THIRD_PARTY_LICENSES.txt"
+        if lic not in names:
+            rep.err("P-10", f"缺少 `{lic}` —— docs/09 §3.13 U-L-3 要求许可全文随 "
+                            f"App 打包（供 U-13 许可清单页读取）。该文件此前**从不"
+                            f"进包**（缺口 BC），致许可页在真机上 `Bundle.main.url` "
+                            f"恒返回 nil、永远读到空。")
+        else:
+            info = zf.getinfo(lic)
+            if info.file_size == 0:
+                rep.err("P-10", f"`{lic}` 存在但为 0 字节 —— 空清单会被许可页 "
+                                f"如实判为「读不到」，等于没有（不得以空文件冒充"
+                                f"「依赖为零」）。")
+
 
 def _check_arch(exe_path: str, rep: Result) -> None:
     try:
@@ -486,7 +508,7 @@ def run_verify(ipa_path: str) -> int:
     print()
     print("结论：P-1 容器结构 / P-2 Info.plist / P-3 仅 arm64 / P-4 metallib 在包根 / "
           "P-5 无 Contents 层 / P-6 Bundle ID 对账 / P-7 未签名 / P-8 locale 落位 / "
-          "P-9 PrivacyInfo 在包根 —— 全部通过。")
+          "P-9 PrivacyInfo 在包根 / P-10 许可清单在包根 —— 全部通过。")
     return 0
 
 
@@ -513,6 +535,8 @@ def _build_synthetic_app(base: str, *, bundle_id: str = "cn.qingfeng.recon",
                          metallib_bytes: bytes = b"\xbf\xba\x00metallib",
                          locales_subdir: str = "locales",
                          privacy_root: bool = True,
+                         license_root: bool = True,
+                         license_bytes: bytes = b"===== poisson_recon =====\nMIT\n",
                          contents_layer: bool = False,
                          code_signature: bool = False) -> str:
     app = os.path.join(base, f"{exe}.app")
@@ -537,6 +561,9 @@ def _build_synthetic_app(base: str, *, bundle_id: str = "cn.qingfeng.recon",
         with open(os.path.join(app, "PrivacyInfo.xcprivacy"), "w",
                   encoding="utf-8") as fh:
             fh.write("<plist/>")
+    if license_root:
+        with open(os.path.join(app, "THIRD_PARTY_LICENSES.txt"), "wb") as fh:
+            fh.write(license_bytes)
     if contents_layer:
         d = os.path.join(app, "Contents", "Resources")
         os.makedirs(d, exist_ok=True)
@@ -590,7 +617,7 @@ def self_test() -> int:
             fails.append(f"基线应当通过，却报错：{rep.errors}")
             print(f"  基线：失败 {rep.errors}")
         else:
-            print("  基线：P-1..P-9 全部通过 ✓")
+            print("  基线：P-1..P-10 全部通过 ✓")
 
         def from_kwargs(name: str, **kw):
             app = _build_synthetic_app(os.path.join(td, name), **kw)
@@ -638,6 +665,10 @@ def self_test() -> int:
              lambda: from_kwargs("p8", locales_subdir="")),
             ("P-9-PrivateInfo不在包根", "P-9",
              lambda: from_kwargs("p9", privacy_root=False)),
+            ("P-10-缺失许可清单", "P-10",
+             lambda: from_kwargs("p10miss", license_root=False)),
+            ("P-10-空许可清单", "P-10",
+             lambda: from_kwargs("p10empty", license_bytes=b"")),
         ]
 
         for name, expect, make in cases:
@@ -660,7 +691,8 @@ def self_test() -> int:
         print(f"\n[negative] 失败：{len(fails)}/{n_cases} 项未按预期拒收")
         return 3
     print(f"\n[negative] PASS：基线通过 + {n_cases} 项注入全部被正确拒收"
-          f"（P-1 / P-2 / P-3 / P-4 / P-5 / P-6 / P-7 / P-8 / P-9 判据均有效）")
+          f"（P-1 / P-2 / P-3 / P-4 / P-5 / P-6 / P-7 / P-8 / P-9 / P-10 "
+          f"判据均有效）")
     return 0
 
 

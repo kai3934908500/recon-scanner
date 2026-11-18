@@ -155,7 +155,7 @@ public struct RebuildView: View {
                     .padding(.top, ReconMetric.space2)
                 if outcome.dismissible {
                     Button(L10n.t(.commonClose)) { dismissedOutcome = true }
-                        .font(.system(size: ReconFont.footnote.size))
+                        .reconFont(ReconFont.footnote)
                         .foregroundStyle(ReconColor.txtAccent)
                         .frame(minWidth: ReconMetric.minTouchTarget,
                                minHeight: ReconMetric.minTouchTarget, alignment: .leading)
@@ -182,7 +182,7 @@ public struct RebuildView: View {
             showCancelConfirm = true
         } label: {
             Text(cancelling ? L10n.t(.rebuildCancelling) : L10n.t(.rebuildCancel))
-                .font(.system(size: ReconFont.headline.size, weight: .semibold))
+                .reconFont(ReconFont.headline)
                 .foregroundStyle(ReconColor.txtError)
                 .frame(maxWidth: .infinity)
                 .frame(height: ReconMetric.controlHeight)

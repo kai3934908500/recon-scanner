@@ -71,7 +71,7 @@ public struct CalibrationView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 VStack(alignment: .trailing, spacing: ReconMetric.space1) {
                     Button(L10n.t(.calibSkip)) { router.pop() }
-                        .font(.system(size: ReconFont.footnote.size))
+                        .reconFont(ReconFont.footnote)
                         .foregroundStyle(ReconColor.txtAccent)
                         .disabled(!canSkip)          // BRANCH_MONO 且无手动值时禁用
                     if !canSkip {
@@ -230,7 +230,7 @@ public struct CalibrationView: View {
                 // §3.9「应用」：把长边毫米值写入内核（recon_set_manual_scale）。
                 // 真实结果记入 `lastScale`；失败时不改 UI 状态（不静默）。
                 Button(L10n.t(.calibApply)) { applyManualScale() }
-                    .font(.system(size: ReconFont.footnote.size))
+                    .reconFont(ReconFont.footnote)
                     .foregroundStyle(ReconColor.txtAccent)
                     .disabled(!manualInputValid)     // 输入非法时禁用
                     .frame(minWidth: ReconMetric.minTouchTarget,
@@ -275,7 +275,7 @@ private struct DimensionField: View {
     var body: some View {
         HStack(spacing: ReconMetric.space1) {
             TextField("", text: $text)
-                .font(.system(size: ReconFont.footnote.size, design: .monospaced))
+                .reconFont(ReconFont.footnote, mono: true)
                 .keyboardType(.decimalPad)
                 .multilineTextAlignment(.trailing)
                 .frame(width: 72, height: ReconMetric.controlHeight)

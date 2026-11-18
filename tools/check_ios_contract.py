@@ -95,6 +95,30 @@ G17 locale 资源落位纪律（folder reference + 与 Swift 查找方式交叉�
            ITMS 类错误）。本判据守住"不要为了统一而把资源 source 全改成
            folder"这条边界。
 
+G22 许可清单嵌入包根（第三方许可清单必须真的进 iOS App 包）
+   U-13 许可清单页在运行期读 `Bundle.main` 包根的 `THIRD_PARTY_LICENSES.txt`
+   （docs/09 §3.13 U-L-3「许可全文随 App 打包，不强依赖网络」）。
+   **2026-11-18 实测发现：该文件此前从不进包** ——
+   `cmake/Licenses.cmake` 的 `install(... DESTINATION "Recon.app")` 只在
+   **CMake install 阶段**生效，而 iOS 交付链（`xcodegen` + `xcodebuild`）走的是
+   另一条路、**从不跑 `cmake --install`**；`project.yml` 的 sources 里也没有它；
+   `stage_ios_ipa.py` 也不注入。→ 许可页在真机上 `Bundle.main.url` 恒返回 nil、
+   **永远读到空**，而编译期与 G1..G21 **全绿**（本项目反复记录的「静默失效」
+   形态，与 G15 的 metallib 落位、缺口 J 的 RGB 丢弃同型）。
+   **G15-c 守的是「不得用 `Contents/`」，它不守「这一步必须存在」** —— 两回事。
+   故本关判据（落在生成物与生成器源头 + 与读取端交叉对账）：
+     G22-a 生成物 `project.yml` 必须有名为 `Stage Third-Party Licenses` 的
+           Build Phase，其落位行 `RECON_LICENSES_OUT_DIR=...` 必须取
+           `${UNLOCALIZED_RESOURCES_FOLDER_PATH}`（**包根**），且调用
+           `tools/stage_licenses.sh`（判据的单一实现）。
+     G22-b 生成器源头 `tools/gen_ios_project.py` 同禁（否则重生成即回退）。
+     G22-c **交叉对账**：`LicensesView.swift` 的读取端必须指向**包根**
+           （`Bundle.main.url(forResource:withExtension:)` **不得**带
+           `subdirectory:`）—— 读端与写端指向同一目录层，改任一侧即失败。
+     G22-d `tools/stage_licenses.sh` 必须存在且 **fail-closed**
+           （`set -euo pipefail` + `RECON_REQUIRE_LICENSES` 硬失败路径）——
+           缺清单时宁可让构建失败，也不产空文件冒充「依赖为零」。
+
 退出码：0 = 全部通过；1 = 有违规；2 = 工具自身错误（文件缺失等）。
 """
 
@@ -382,8 +406,14 @@ def gate_locales(rep: Report) -> None:
         if not miss and not xtra:
             rep.note(f"二级回退 {FALLBACK_LOCALE} 与源语言键集合完全一致（{len(fb_keys)} 键）")
 
-    # 其余 locale：允许 pending（用 _meta 声明），但必须显式声明
+    # 其余 locale：区分「人工完成的真值」与「机器翻译子集」。
+    # ⚠️ v1.3（2026-11-18）：**废止「有键即 done」判据**（缺口 BB 同型恒真假闸门，
+    #    见 docs/09 §5.9 末 / #158）。原因：18 个 pending locale 按用户裁决写入
+    #    32 个机器翻译键后，原判据会输出「已完成翻译 20/20」而真实自有覆盖率仅
+    #    ≈9.2%。新判据为**覆盖率**：done 仅收录「显式未声明 pending、且未标注
+    #    machine_translated」的 locale；机器翻译子集一律留在 pending 并单列覆盖率。
     pending, done = [], []
+    mt_report: list[str] = []
     for loc in EXPECTED_LOCALES:
         if loc in (SOURCE_LOCALE, FALLBACK_LOCALE):
             continue
@@ -391,18 +421,61 @@ def gate_locales(rep: Report) -> None:
         if doc is None:
             continue
         meta = doc.get("_meta") if isinstance(doc.get("_meta"), dict) else {}
-        status = meta.get("translation_status")
-        has_keys = any(not k.startswith("_") for k in doc)
-        if has_keys or status == "done":
-            done.append(loc)
-        elif status == "pending":
+        status = str(meta.get("translation_status", "")).lower()
+        own_keys = {k for k in doc if not k.startswith("_")}
+        cov = len(own_keys) / len(src_keys) if src_keys else 0.0
+        mt = bool(meta.get("machine_translated"))
+        mt_keys = meta.get("machine_translated_new_keys")
+
+        # (a) 标注机器翻译却声明人工完成 → 矛盾（注入：把 translation_status 改 done）
+        if mt and status != "pending":
+            rep.err(gate,
+                    f"{loc}.json 标注 machine_translated 但 translation_status="
+                    f"{status!r} —— 机器翻译**不得**声称已完成人工翻译（docs/09 §5.9）")
+        # (c) machine_translated 必须界定范围，否则无法统计机器翻译覆盖率。
+        #     ⚠️ 必须放在 `status == "pending"` 分支**之前**：pending locale 正是
+        #     机器翻译的发生地，若写在 continue 之后则该判据对其目标对象不可达
+        #     （即写成恒真假判据，2026-11-18 自查拦截）。
+        #     （注入：删掉 machine_translated_new_keys 字段）
+        elif mt and not isinstance(mt_keys, list):
+            rep.err(gate,
+                    f"{loc}.json 标注 machine_translated 却缺少 "
+                    f"_meta.machine_translated_new_keys（无法界定机器翻译范围）")
+        # (d) 声明的机器翻译键必须真实存在于本 locale。
+        #     （注入：往 machine_translated_new_keys 塞一个不存在的键）
+        elif isinstance(mt_keys, list):
+            bogus = sorted(k for k in mt_keys if k not in own_keys)
+            if bogus:
+                rep.err(gate,
+                        f"{loc}.json 的 _meta.machine_translated_new_keys 引用了"
+                        f"本 locale 不存在的键：{bogus[:6]}")
+
+        # (b) 声明 pending 却预填了未标注机器翻译的键 → 「有键即完成」型假闸门。
+        #     （注入：删掉 _meta.machine_translated 但保留 32 键）
+        if status == "pending":
+            if own_keys and not mt:
+                rep.err(gate,
+                        f"{loc}.json 声明 translation_status=pending 却预填了 "
+                        f"{len(own_keys)} 个未标注机器翻译的键 —— 要么改 status，"
+                        f"要么加 _meta.machine_translated 显式标注（禁止冒充完成）")
             pending.append(loc)
+            mt_report.append(
+                f"{loc}: 自有{len(own_keys)}/{len(src_keys)}={cov:.1%}"
+                f"{'（机器翻译）' if mt else ''}")
+            continue
+        if own_keys:
+            done.append(loc)
         else:
             rep.err(gate,
                     f"{loc}.json 既无译文键也未声明 _meta.translation_status=pending"
                     "（不许用空文件冒充完成）")
-    rep.note(f"已完成翻译的 locale：{len(done) + 2}/20（含源与二级回退）")
-    rep.note(f"待翻译（已显式声明 pending）：{len(pending)} 个 → {' '.join(pending) if pending else '无'}")
+    rep.note(f"已完成人工翻译的 locale：{len(done) + 2}/20（含源与二级回退）")
+    rep.note(f"待翻译（含机器翻译子集）：{len(pending)} 个 → "
+             f"{' '.join(pending) if pending else '无'}")
+    # 覆盖率**如实输出**（本条为 note，不可证伪；可证伪的是上面 (a)..(d) 四条）。
+    if mt_report:
+        rep.note("机器翻译覆盖率（自有键 / 源键，**未经人工校订**）："
+                 f"{'；'.join(mt_report[:6])}{' …' if len(mt_report) > 6 else ''}")
 
 
 # ===========================================================================
@@ -893,13 +966,23 @@ def load_locale_tables() -> tuple[dict[str, dict[str, str]], dict[str, str]]:
             raw = json.load(f)
         table = {k: v for k, v in raw.items() if isinstance(v, str)}
         tables[loc] = table
-        if table:
-            status[loc] = "full"
-            continue
+        # ⚠️ 判据顺序（2026-11-18 修正 —— G1 恒真型假闸门，缺口 BB 同型）：
+        #    **显式声明优先于「有键」**。
+        #    v1.3 起，18 个 pending locale 按用户裁决（docs/09 §5.9）写入了 32 个
+        #    **机器翻译**键；若仍按 v1.2 的「有任意字符串键即 full」判定，这 18 个
+        #    locale 会被**误判为已完成翻译**（实测输出「已翻译 20/20」而真实自有
+        #    覆盖率仅 32/349 ≈ 9.2%）—— 这正是 §5.9 预言的恒真型假闸门。
+        #    正确语义：`translation_status=pending` 声明的是**人工翻译未完成**；
+        #    机器翻译子集的写入**不改变**该状态。
         meta = raw.get("_meta")
-        declared = isinstance(meta, dict) and \
+        declared_pending = isinstance(meta, dict) and \
             str(meta.get("translation_status", "")).lower() == "pending"
-        status[loc] = "pending" if declared else "empty"
+        if declared_pending:
+            status[loc] = "pending"
+        elif table:
+            status[loc] = "full"
+        else:
+            status[loc] = "empty"
     return tables, status
 
 
@@ -1947,15 +2030,26 @@ def gate_bundle_layout(rep: Report) -> None:
     #        `THIRD_PARTY_LICENSES` 又出现 `Recon.app/Contents/`」——
     #        只有"把许可清单放进 App bundle 的 Contents"这一种写法会被命中，
     #        其余提及 `Contents/` 的上下文一律放过。
-    #     ③ **豁免缺口登记行**：docs/14 的缺口表里，登记行的职责就是
-    #        **引用当初写错的那个值**（如缺口 AN 行必须写出
-    #        `Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt` 才能说明
-    #        漂移是什么）。若把登记行也判进来，等于「禁止记录 bug」—— 那是
-    #        判据**范围过宽**，不是文档错。故按行首编号模式 `| A<大写字母> |`
-    #        显式跳过（**只跳登记行，不跳整份文档**：docs/14 的散文段落仍在
-    #        扫描范围内；注入项 G15-d-doc14-prose 专门证明这个豁免是**窄**的）。
-    #     ④ 扫描面 = `docs/*.md` 全文（成本可忽略）。
-    _GAP_ROW = re.compile(r"^\|\s*A[A-Z](-[0-9]+)?\s*\|")
+#     ③ **豁免缺口登记行**：docs/14 的缺口表里，登记行的职责就是
+#        **引用当初写错的那个值**（如缺口 AN 行必须写出
+#        `Recon.app/Contents/Resources/THIRD_PARTY_LICENSES.txt` 才能说明
+#        漂移是什么）。若把登记行也判进来，等于「禁止记录 bug」—— 那是
+#        判据**范围过宽**，不是文档错。故按行首编号形态 `| <单/双大写字母>
+#        [数字后缀] |` 显式跳过（**只跳登记行，不跳整份文档**：docs/14 的散文
+#        段落仍在扫描范围内；注入项 G15-d-doc14-prose-not-exempt 专门证明这个
+#        豁免是**窄**的）。
+#        ⚠️ **2026-11-18 订正（判据范围跟不上目标对象）**：原正则只认 `A[A-Z]`
+#           （即 A 段编号 AD/AE/AN…）。但缺口编号体系已演进到 **B 段**
+#           （BA/BB，本轮登记 BC/BD）→ 这两个新登记行**同样必须引用错误值**，
+#           却落在原正则视野外 → 闸门对**合法登记行为**报错（假红）。
+#           这是 LESSONS §C「判据范围要跟上代码位置」的又一次实证。
+#           现放宽为 `[A-Z]{1,2}`（单字母 A 段 + 双字母 AA/BA 段）。
+#           **已知边界（如实登记）**：该正则是按**行首形态**豁免的，理论上也会
+#           覆盖「任何以 1–2 个大写字母为首列的表格行」。当前实测：docs 全量中
+#           同时满足「含 `THIRD_PARTY_LICENSES` 且含 `Recon.app/Contents/`」前置
+#           条件的仅 AN/BC 两行（均为缺口登记行），故无实际误豁免；若将来出现
+#           首列形如 `CB-5` 之类的**非缺口表**且恰含该共现，需再收紧。
+    _GAP_ROW = re.compile(r"^\|\s*[A-Z]{1,2}(-[0-9]+)?\s*\|")
     for doc in sorted(glob.glob(os.path.join(ROOT, "docs", "*.md"))):
         for lineno, raw in enumerate(read_text(doc).splitlines(), 1):
             if "THIRD_PARTY_LICENSES" not in raw:
@@ -2702,6 +2796,167 @@ def gate_compiler_visible(rep: Report) -> None:
                  f"（回归防线 —— 只覆盖两类已实证形态，不替代 macOS CI 真编译）")
 
 
+# ===========================================================================
+# G22 许可清单嵌入包根（第三方许可清单必须真的进 iOS App 包）
+# ===========================================================================
+#
+# 为什么需要这一关（2026-11-18 实测发现的**真实阻塞缺口**）：
+#
+#   U-13 许可清单页在运行期读**包根**的 `THIRD_PARTY_LICENSES.txt`
+#   （docs/09 §3.13 U-L-3：「许可全文随 App 打包，不强依赖网络」）。
+#   但该文件**此前从不进 iOS App 包**，三处证据：
+#     ① `cmake/Licenses.cmake` 的
+#        `install(FILES ... DESTINATION "Recon.app")`
+#        只在 **CMake install 阶段**生效，而 iOS 交付链（CI `build-app`）走的是
+#        `xcodegen` + `xcodebuild`，**从不跑 `cmake --install`**；
+#     ② `platform/ios/Container/project.yml` 的 `sources` 里**没有**该文件条目；
+#     ③ `tools/stage_ios_ipa.py`（打未签名 IPA）也不注入它。
+#   于是 U-13 在真机上 `Bundle.main.url(...)` 恒返回 nil、**永远读到空**，
+#   而编译期与既有 G1..G21 **全绿** —— 本项目反复记录的「静默失效」形态
+#   （与 G15 的 metallib 落位、缺口 J 的 RGB 帧被丢弃同型）。
+#
+#   ⚠️ 为什么 G15-c **不**覆盖它（不得误以为已有防线）：
+#     G15-c 守的是「许可清单嵌入位置**不得**写成 `Recon.app/Contents/...`」
+#     这一**负面**事实（落位写错）。它**不守**「必须真的有一次嵌入动作」这一
+#     **正面**事实 —— 把整段 phase 删掉，G15-c 依然全绿（无 `Contents/` 可查）。
+#     这是判据**方向**不同、不是疏漏；故需要独立一关。
+#
+# 判据（落在生成物 + 生成器源头 + 与读取端交叉对账，四处共同锚定同一事实）：
+#   G22-a 生成物 `project.yml` 必须有名为 `Stage Third-Party Licenses` 的
+#          Build Phase；其落位行 `RECON_LICENSES_OUT_DIR=...` 必须取
+#          `${UNLOCALIZED_RESOURCES_FOLDER_PATH}`（**包根**，iOS 扁平 bundle）；
+#          且必须调用 `tools/stage_licenses.sh`（判据的单一实现）。
+#   G22-b 生成器源头 `tools/gen_ios_project.py` 同禁 —— 否则「手改生成物」会被
+#          下一次重生成覆盖回去（判据必须落在源头，与 G15-b/G17-b 同纪律）。
+#   G22-c **交叉对账**：`LicensesView.swift` 的**读取端**必须指向包根 ——
+#          `Bundle.main.url(forResource:withExtension:)` **不得**带
+#          `subdirectory:` 实参。写端（Build Phase）与读端（Swift）指向同一
+#          目录层，改任一侧即失败（与 G17-c 同手法：把「两处事实来源」对起来）。
+#   G22-d `tools/stage_licenses.sh` 必须存在，且必须 **fail-closed**：
+#          含 `set -euo pipefail`，且缺清单时（`RECON_REQUIRE_LICENSES` 路径）
+#          有硬失败分支 —— 缺清单宁可构建失败，也不产空文件冒充「依赖为零」。
+#
+# 负向注入见 `tools/verify_ios_contract_negative.py` 的 G22-a/b/c/d 四项。
+# ===========================================================================
+
+def gate_licenses_embed(rep: Report) -> None:
+    gate = "G22/licenses-embed"
+
+    container_yml = os.path.join(IOS_DIR, "Container", "project.yml")
+    gen = os.path.join(ROOT, "tools", "gen_ios_project.py")
+    stage_sh = os.path.join(ROOT, "tools", "stage_licenses.sh")
+    licenses_view = os.path.join(UI_IOS, "Recon", "Sources", "Screens",
+                                 "LicensesView.swift")
+
+    # ---- G22-a：生成物（project.yml）-------------------------------------
+    yml_code = None
+    if not os.path.isfile(container_yml):
+        rep.err(gate, f"缺少 {rel(container_yml)}")
+    else:
+        # 与 G15-a 同一处理：先剥整行注释再判 —— 注释里**刻意**解释这段 phase，
+        # 若连带注释判会误报（「判据范围要跟上代码位置」）。
+        raw_yml = read_text(container_yml)
+        yml_code = "\n".join(ln.split("#", 1)[0] for ln in raw_yml.splitlines())
+        if "Stage Third-Party Licenses" not in yml_code:
+            rep.err(gate,
+                    f"{rel(container_yml)} 里找不到名为 `Stage Third-Party "
+                    f"Licenses` 的 Build Phase —— 许可清单**从不进 App 包**，"
+                    f"U-13 许可页在真机上永远读到空（且编译期全绿）。"
+                    f"该 phase 必须由 `tools/gen_ios_project.py` 生成。")
+        else:
+            if "RECON_LICENSES_OUT_DIR" not in yml_code:
+                rep.err(gate,
+                        f"{rel(container_yml)} 的该 phase 里没有 "
+                        f"`RECON_LICENSES_OUT_DIR` 落位赋值 —— 产物不会进包。")
+            elif "${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}" \
+                    not in yml_code:
+                rep.err(gate,
+                        f"{rel(container_yml)} 的许可清单落位行未取 "
+                        f"`${{UNLOCALIZED_RESOURCES_FOLDER_PATH}}` —— iOS 是扁平 "
+                        f"bundle，非本地化资源必须在**包根**；写 `Contents/...` "
+                        f"之类会落到设备上不存在的层级（静默失效）。")
+            if "tools/stage_licenses.sh" not in yml_code:
+                rep.err(gate,
+                        f"{rel(container_yml)} 的该 phase 未调用 "
+                        f"`tools/stage_licenses.sh` —— 落位逻辑必须只有一处实现"
+                        f"（否则判据与产物成为两处事实来源，必然漂移）。")
+
+    # ---- G22-b：生成器（源头）---------------------------------------------
+    if not os.path.isfile(gen):
+        rep.err(gate, f"缺少 {rel(gen)}（生成物与源头的判据都要落）")
+    else:
+        gen_code = "\n".join(ln.split("#", 1)[0]
+                             for ln in read_text(gen).splitlines())
+        if "Stage Third-Party Licenses" not in gen_code:
+            rep.err(gate,
+                    f"{rel(gen)} 源头里没有 `Stage Third-Party Licenses` phase "
+                    f"—— 它是生成物的**源头**，只改生成物会被下一次重生成覆盖回"
+                    f"「无此 phase」。")
+        else:
+            if "RECON_LICENSES_OUT_DIR" not in gen_code \
+                    or "stage_licenses.sh" not in gen_code:
+                rep.err(gate,
+                        f"{rel(gen)} 里该 phase 缺少 `RECON_LICENSES_OUT_DIR` "
+                        f"落位或 `stage_licenses.sh` 调用（源头不完整）。")
+
+    # ---- G22-c：交叉对账（读取端必须指向包根）------------------------------
+    if not os.path.isfile(licenses_view):
+        rep.err(gate,
+                f"缺少 {rel(licenses_view)} —— G22-c 交叉对账的读取端不存在"
+                f"（判据没有目标对象）。")
+    else:
+        # 与 G15-a 同一处理：剥注释（文件头注释里**刻意**解释「不得带
+        # subdirectory」），但**必须保留字符串** —— 读取端的 `"THIRD_PARTY_
+        # LICENSES"`、`"txt"` 本就是字符串字面量，若用 strip_comments_and_strings
+        # 会把它一并剥掉，判据自身就失去目标对象（本关实测踩到过这个坑）。
+        view_code = strip_comments_keep_strings(read_text(licenses_view))
+        if "THIRD_PARTY_LICENSES" not in view_code:
+            rep.err(gate,
+                    f"{rel(licenses_view)} 里找不到 `THIRD_PARTY_LICENSES` —— "
+                    f"读取端与写入端的交叉对账已无目标对象（许可页被清空？）。")
+        # 交叉对账的核心：读取 `Bundle.main.url(...)` 时**不得**带 subdirectory
+        # （带 subdirectory 意味着指向包根下的某个子目录，与 Build Phase 把文件
+        #  放到包根的事实不符 → 读端与写端漂移）。
+        if re.search(r"url\s*\(\s*forResource\s*:[^)]*subdirectory\s*:", view_code):
+            rep.err(gate,
+                    f"{rel(licenses_view)} 读取许可清单时带了 `subdirectory:` —— "
+                    f"而生成物把清单放到**包根**（`${{UNLOCALIZED_RESOURCES_"
+                    f"FOLDER_PATH}}`）。读写两端指向不同目录层 → 真机上读不到"
+                    f"（静默失效）。应改用 `Bundle.main.url(forResource:"
+                    f"withExtension:)`（无 subdirectory）。")
+
+    # ---- G22-d：落位脚本必须存在且 fail-closed -----------------------------
+    if not os.path.isfile(stage_sh):
+        rep.err(gate,
+                f"缺少 {rel(stage_sh)} —— 许可清单落位的单一实现不存在，"
+                f"Build Phase 会在真机构建时 `bash: ... No such file`。")
+    else:
+        # 与 G22-a 同处理：剥注释再判 —— 脚本头注释里**刻意**解释了
+        # `RECON_REQUIRE_LICENSES` 与 `exit 1` 的用途，若连带注释判，删掉真正的
+        # 代码行也仍会「通过」（注释里还有那几个词）→ 假闸门。故先剥注释。
+        sh_code = strip_comments_keep_strings(read_text(stage_sh))
+        if "set -euo pipefail" not in sh_code:
+            rep.err(gate,
+                    f"{rel(stage_sh)} 缺少 `set -euo pipefail` —— 落位失败会被"
+                    f"静默吞掉（不静默降级是本项目铁律）。")
+        # fail-closed：判据锚在**契约的机械特征**上 —— `RECON_REQUIRE_LICENSES`
+        # 的默认值展开 `:-`（即 `REQUIRE="${RECON_REQUIRE_LICENSES:-0}"`）。
+        # ⚠️ 刻意**不**写成「文本里含 `RECON_REQUIRE_LICENSES`」：脚本末尾的
+        #    echo 文案里也含该名字（那是给人看的提示，不是契约），用它判会
+        #    让「删掉真正的赋值行」这个注入**照样通过** → 假闸门。
+        if not re.search(r"RECON_REQUIRE_LICENSES:-", sh_code) or \
+                not re.search(r"exit\s+1", sh_code):
+            rep.err(gate,
+                    f"{rel(stage_sh)} 不是 fail-closed —— 应把缺清单的硬失败路径"
+                    f"绑在 `RECON_REQUIRE_LICENSES` 契约上（如 "
+                    f"`REQUIRE=\"${{RECON_REQUIRE_LICENSES:-0}}\"` + `exit 1`），"
+                    f"否则缺清单时会产空文件冒充「依赖为零」。")
+
+    if not any(gate in e for e in rep.errors):
+        rep.note("许可清单嵌入包根：生成物 phase + 生成器源头 + 读取端交叉对账 + "
+                 "落位脚本 fail-closed 四处齐备，U-13 能在包根读到清单 ✓")
+
+
 def main() -> int:
     rep = Report()
     if not os.path.isdir(UI_IOS):
@@ -2729,6 +2984,7 @@ def main() -> int:
     gate_swift_access_level(rep)
     gate_depvar_exists(rep)
     gate_compiler_visible(rep)
+    gate_licenses_embed(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -2754,7 +3010,7 @@ def main() -> int:
           "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
           "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 / "
           "G19 Swift 访问级别自洽 / G20 构建部署守卫变量存在性 / "
-          "G21 Swift/Clang 编译可见缺陷 全部通过。")
+          "G21 Swift/Clang 编译可见缺陷 / G22 许可清单嵌入包根 全部通过。")
     return 0
 
 

@@ -304,7 +304,7 @@ public struct ReviewingView: View {
                 showCancelConfirm = true
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: ReconFont.headline.size))
+                    .font(ReconFont.fixedFont(ReconFont.headline))
             }
             .foregroundStyle(ReconColor.txtPrimary)
             .frame(width: ReconMetric.minTouchTarget, height: ReconMetric.minTouchTarget)
