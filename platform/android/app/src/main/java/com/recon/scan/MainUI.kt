@@ -348,8 +348,8 @@ internal class MainUI(
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
     fun updateCaptureHud(frames: Int, coverage: Float, buckets: BooleanArray? = null,
-                         objectBox: FloatArray? = null) {
-        if (fullscreen) captureHud.update(frames, coverage, buckets, objectBox)
+                         objectMask: BooleanArray? = null) {
+        if (fullscreen) captureHud.update(frames, coverage, buckets, objectMask)
     }
 
     fun render(v: ViewState) {
@@ -397,12 +397,15 @@ internal class MainUI(
             R.string.stage_scale, R.string.stage_export)
         stageList.removeAllViews()
         val activeIndex = (stage - 1).coerceIn(0, stages.size - 1)
-        // 总进度按比例分配到 11 段；当前段内用 (progress*11 - activeIndex) 细分
-        val global = (progress * stages.size).toFloat()
+        // 【修复】core 的 progress 口径不统一：阶段边界报全局进度(如 VIO=0.04)，
+        // 阶段内部报阶段内进度(0~1)。旧算法 (progress*11 - activeIndex) 对全局
+        // 0.04 算出负数→钳成 0，用户看到"位姿一直 0%"。改为**stage 主导**：
+        // 已完成的阶段满格，当前阶段显示"Ing/进行中"并给一个非零的基准进度，
+        // 避免任何阶段显示 0% 或倒退。
         for (i in stages.indices) {
             val frac = when {
                 i < activeIndex -> 1f
-                i == activeIndex -> (global - i).coerceIn(0f, 1f)
+                i == activeIndex -> 0.5f   // 进行中：明确非零，不谎报具体百分比
                 else -> 0f
             }
             val row = LinearLayout(context).apply {
@@ -426,7 +429,7 @@ internal class MainUI(
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             val pct = TextView(context).apply {
-                text = "${(frac * 100).toInt()}%"
+                text = if (i == activeIndex) "进行中" else "${(frac * 100).toInt()}%"
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
                 setTextColor(if (i == activeIndex) C.ACCENT else C.TEXT_MUTED)
                 layoutParams = LinearLayout.LayoutParams(dp(38), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -795,170 +798,111 @@ internal class MainUI(
      * 采集实时引导 HUD：取景四角框 + 环绕方向动画 + 实时帧数/覆盖度。
      * 参照专业扫描 App 的"屏幕实时指引"：用户一眼知道怎么移动、覆盖多少。
      */
+    /**
+     * 采集实时引导 HUD：物体前景轮廓绿边 + 涂层包裹 + 顶部提示 + 底部状态条。
+     * 没有绿球、没有方格——按 mask 沿真实物体轮廓描边，已覆盖区域逐格涂绿。
+     */
     private class CaptureHudView(context: Context, private val dp: (Int) -> Int) : View(context) {
         private var frames = 0
         private var coverage = 0f
         private var buckets: BooleanArray? = null
-        private var objectBox: FloatArray? = null   // [L,T,R,B] 归一化，贴合检测到的物体
+        private var objectMask: BooleanArray? = null
         private var tick = 0f
-        private val white = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dp(2).toFloat()
-            strokeCap = Paint.Cap.ROUND
-        }
-        private val green = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(0x3D, 0xD6, 0x84); style = Paint.Style.STROKE
-            strokeWidth = 2.5f * context.resources.displayMetrics.density
-            strokeCap = Paint.Cap.ROUND
-        }
-        private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(13).toFloat()
-            setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
-        }
-        private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(26).toFloat()
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
-        }
-        private val pill = android.graphics.drawable.GradientDrawable().apply {
-            setColor(Color.argb(0xB3, 0x11, 0x18, 0x27)); cornerRadius = dp(4).toFloat() }
 
-        fun update(f: Int, cov: Float, bs: BooleanArray?, obj: FloatArray?) {
-            frames = f; coverage = cov; buckets = bs; objectBox = obj; invalidate()
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(12).toFloat()
+            setShadowLayer(dp(3).toFloat(), 0f, 0f, Color.argb(0xAA, 0, 0, 0)) }
+
+        fun update(f: Int, cov: Float, bs: BooleanArray?, mask: BooleanArray?) {
+            frames = f; coverage = cov; buckets = bs; objectMask = mask; invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             tick += 1f
             val w = width.toFloat(); val h = height.toFloat()
+            val mask = objectMask
 
-            // 顶部提示胶囊（识别状态如实反映）
-            val detected = objectBox != null
-            val tip = if (detected) "已锁定物体 · 缓慢环绕一周" else "将物体置于画面中央以识别"
-            val tw = text.measureText(tip) + dp(32)
+            // 顶部提示胶囊
+            val tip = if (mask != null) "已识别物体 · 缓慢环绕包裹" else "将物体置于画面中央"
+            val tw = textPaint.measureText(tip) + dp(28)
             val left = (w - tw) / 2f
-            pill.setBounds(left.toInt(), dp(16), (left + tw).toInt(), (dp(16) + dp(36)).toInt())
-            pill.draw(canvas)
-            canvas.drawText(tip, w / 2f, (dp(16) + dp(24)).toFloat(), text)
+            canvas.drawRoundRect(left, dp(14).toFloat(), left + tw, dp(48).toFloat(),
+                dp(4).toFloat(), dp(4).toFloat(),
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(0xB3, 0x11, 0x18, 0x27) })
+            canvas.drawText(tip, w / 2f, dp(35).toFloat(), textPaint)
 
-            // ---- 物体绿边：检测到则贴合物体轮廓，未检测到画中心虚框 ----
-            val bx: Float; val by: Float; val boxW: Float; val boxH: Float
-            if (detected) {
-                val b = objectBox!!
-                bx = b[0] * w; by = b[1] * h
-                boxW = (b[2] - b[0]) * w; boxH = (b[3] - b[1]) * h
-                green.alpha = 255
+            if (mask != null) {
+                drawObjectCoating(canvas, mask, w.toInt(), h.toInt())
             } else {
-                boxW = w * 0.56f; boxH = h * 0.36f
-                bx = (w - boxW) / 2f; by = h * 0.24f
-                // 虚线效果：半透明
-                green.alpha = 110
+                // 未识别：中心画一个淡的取景提示框（虚线感，半透明）
+                val bw = w * 0.52f; val bh = h * 0.34f
+                val bx = (w - bw) / 2f; val by = h * 0.26f
+                val guide = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.argb(0x88, 0xFF, 0xFF, 0xFF)
+                    style = Paint.Style.STROKE; strokeWidth = 1.5f * context.resources.displayMetrics.density }
+                canvas.drawRect(bx, by, bx + bw, by + bh, guide)
             }
-            val seg = minOf(boxW, boxH) * 0.16f
-            canvas.drawLine(bx, by, bx + seg, by, green); canvas.drawLine(bx, by, bx, by + seg, green)
-            canvas.drawLine(bx + boxW, by, bx + boxW - seg, by, green); canvas.drawLine(bx + boxW, by, bx + boxW, by + seg, green)
-            canvas.drawLine(bx, by + boxH, bx + seg, by + boxH, green); canvas.drawLine(bx, by + boxH, bx, by + boxH - seg, green)
-            canvas.drawLine(bx + boxW, by + boxH, bx + boxW - seg, by + boxH, green); canvas.drawLine(bx + boxW, by + boxH, bx + boxW, by + boxH - seg, green)
-            if (detected) {
-                // 物体表面"绿色涂层"：在锁定框内画网格，随环绕覆盖逐个染绿。
-                // 视觉上就是给物体裹上一层逐渐铺满的绿衣（对标全景扫描 App）。
-                val gridCols = 6; val gridRows = 4
-                val cellW = boxW / gridCols; val cellH = boxH / gridRows
-                val nb = buckets
-                if (nb != null) for (row in 0 until gridRows) for (col in 0 until gridCols) {
-                    // 每个网格单元映射到一个方位桶；覆盖到的涂绿，未覆盖保持透明网格
-                    val bucket = ((col * nb.size / gridCols) + row) % nb.size
-                    val painted = nb.getOrNull(bucket) == true
-                    val cellPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        style = Paint.Style.FILL
-                        color = if (painted) Color.argb(0x42, 0x3D, 0xD6, 0x84)
-                                else Color.argb(0x14, 0xFF, 0xFF, 0xFF)
-                    }
-                    canvas.drawRect(bx + col * cellW + dp(2), by + row * cellH + dp(2),
-                        bx + (col+1) * cellW - dp(2), by + (row+1) * cellH - dp(2), cellPaint)
-                }
-                // 四角实心锚点：专业锁定反馈
-                val r = dp(3).toFloat()
-                val anchor = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0x3D,0xD6,0x84); style = Paint.Style.FILL }
-                canvas.drawCircle(bx, by, r, anchor); canvas.drawCircle(bx+boxW, by, r, anchor)
-                canvas.drawCircle(bx, by+boxH, r, anchor); canvas.drawCircle(bx+boxW, by+boxH, r, anchor)
-            }
-            green.alpha = 255
 
-            // ---- 环绕方向流动箭头（沿框顶从左到右）----
-            val phase = (tick % 120f) / 120f
-            val ax = bx + phase * boxW
-            val ay = by - dp(10)
-            canvas.drawLine(ax - dp(8), ay, ax, ay - dp(6), white)
-            canvas.drawLine(ax, ay - dp(6), ax + dp(8), ay, white)
-
-            // ---- 球包裹可视化（左下角：36 方位扇区逐个染绿）----
-            val sr = dp(46).toFloat()
-            val scx = dp(16) + sr
-            val scy = h - dp(30) - sr
-            drawCoverageSphere(canvas, scx, scy, sr, buckets, coverage)
-
-            // ---- 底部状态条：小而稳，不晃眼（旧版两个 26sp 大数字一直跳）----
-            val statLabel = "已采 $frames 帧  ·  覆盖 ${(coverage * 100).toInt()}%"
-            val statPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                textSize = dp(12).toFloat(); color = Color.WHITE
-                textAlign = Paint.Align.CENTER }
-            val sw = statPaint.measureText(statLabel) + dp(28)
-            val sLeft = (w - sw) / 2f
-            val sTop = h - dp(46)
-            canvas.drawRoundRect(sLeft, sTop, sLeft + sw, sTop + dp(30),
+            // 底部状态条：小而稳，不晃眼
+            val label = "已采 $frames 帧  ·  覆盖 ${(coverage * 100).toInt()}%"
+            val sp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = dp(12).toFloat(); color = Color.WHITE; textAlign = Paint.Align.CENTER }
+            val sw = sp.measureText(label) + dp(28)
+            val sl = (w - sw) / 2f; val st = h - dp(46)
+            canvas.drawRoundRect(sl, st, sl + sw, st + dp(30),
                 dp(4).toFloat(), dp(4).toFloat(),
                 Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(0x99, 0x11, 0x18, 0x27) })
-            canvas.drawText(statLabel, w / 2f, sTop + dp(20), statPaint)
+            canvas.drawText(label, w / 2f, st + dp(20), sp)
 
             postInvalidateDelayed(50)
         }
 
-        /** 把 36 方位桶画成绕球的经线扇区，覆盖的染绿 —— "球被慢慢包裹"。 */
-        private fun drawCoverageSphere(
-            canvas: Canvas, cx: Float, cy: Float, r: Float,
-            bs: BooleanArray?, cov: Float,
-        ) {
-            val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(0xCC, 0xFF, 0xFF, 0xFF); style = Paint.Style.STROKE
-                strokeWidth = 1.5f * context.resources.displayMetrics.density }
-            val filled = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                shader = android.graphics.LinearGradient(
-                    cx, cy - r, cx, cy + r,
-                    intArrayOf(Color.rgb(0x6E, 0xF0, 0xA8), Color.rgb(0x1F, 0xA8, 0x62)),
-                    null, android.graphics.Shader.TileMode.CLAMP)
-                style = Paint.Style.FILL }
-            val empty = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(0xCC, 0x11, 0x18, 0x27); style = Paint.Style.FILL }
-            // 球体底：深色半透明底盘（之前 20% 白在亮画面上完全看不见）
-            canvas.drawCircle(cx, cy, r + dp(4).toFloat(),
-                Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.argb(0x99, 0x00, 0x00, 0x00); style = Paint.Style.FILL })
-            canvas.drawCircle(cx, cy, r, empty)
-            // 36 个方位扇区：每个是一条竖直"瓜瓣"（椭圆弧），覆盖则绿
-            val n = 36
-            for (i in 0 until n) {
-                val covered = bs?.getOrNull(i) ?: false
-                val a0 = (i.toFloat() / n) * 360f
-                val a1 = ((i + 1).toFloat() / n) * 360f
-                val path = android.graphics.Path()
-                // 用球面经度投影：瓜瓣宽度随 cos(经度) 收窄，画到圆两侧
-                val mid = (a0 + a1) / 2f
-                val rad = Math.toRadians(mid.toDouble()).toFloat()
-                val x0 = cx + r * kotlin.math.sin(rad) * 0.85f
-                val x1 = cx + r * kotlin.math.sin(Math.toRadians(a1.toDouble()).toFloat()) * 0.85f
-                path.moveTo(cx, cy - r)
-                path.quadTo(x0, cy, x1, cy + r)
-                path.quadTo(cx, cy, cx, cy - r)
-                canvas.drawPath(path, if (covered) filled else empty)
+        /**
+         * 沿物体真实轮廓画绿边 + 涂层：对每个前景 cell，若四邻中有背景则它是边界
+         * → 画绿色描边；已覆盖方位对应的 cell 填充半透明绿（像涂层逐渐铺满）。
+         */
+        private fun drawObjectCoating(canvas: Canvas, mask: BooleanArray, w: Int, h: Int) {
+            val gw = 64; val gh = 64
+            val cw = w / gw.toFloat(); val ch = h / gh.toFloat()
+            val bs = buckets
+            val painted = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+            val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(0x3D, 0xD6, 0x84)
+                style = Paint.Style.STROKE; strokeWidth = 1.5f * context.resources.displayMetrics.density }
+            val pulse = 0.7f + 0.3f * kotlin.math.sin(tick * 0.05f).toFloat()
+
+            for (gy in 0 until gh) for (gx in 0 until gw) {
+                val idx = gy * gw + gx
+                if (!mask[idx]) continue
+                val x = gx * cw; val y = gy * ch
+                // 覆盖判定：该 cell 归到哪个方位桶（按 x 位置映射）
+                val bucket = if (bs != null && bs.isNotEmpty()) (gx * bs.size / gw) else -1
+                if (bucket >= 0 && bs!![bucket]) {
+                    // 已包裹：涂绿（随方位覆盖逐渐铺满）
+                    painted.color = Color.argb((0x55 * pulse).toInt().coerceIn(0, 255),
+                        0x3D, 0xD6, 0x84)
+                    canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
+                } else {
+                    // 未包裹：极淡绿底，标出物体范围
+                    painted.color = Color.argb(0x18, 0x3D, 0xD6, 0x84)
+                    canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
+                }
+                // 轮廓边：四邻有背景 → 画绿色边线（贴合物体真实形状）
+                val isEdge =
+                    (gx == 0 || !mask[idx - 1]) ||
+                    (gx == gw - 1 || !mask[idx + 1]) ||
+                    (gy == 0 || !mask[idx - gw]) ||
+                    (gy == gh - 1 || !mask[idx + gw])
+                if (isEdge) {
+                    edge.alpha = (255 * pulse).toInt().coerceIn(0, 255)
+                    canvas.drawLine(x, y, x + cw, y, edge)
+                    canvas.drawLine(x, y + ch, x + cw, y + ch, edge)
+                    canvas.drawLine(x, y, x, y + ch, edge)
+                    canvas.drawLine(x + cw, y, x + cw, y + ch, edge)
+                }
             }
-            // 球轮廓 + 赤道
-            canvas.drawCircle(cx, cy, r, outline)
-            canvas.drawOval(cx - r * 0.32f, cy - r, cx + r * 0.32f, cy + r, outline)
-            canvas.drawLine(cx - r, cy, cx + r, cy, outline)
-            // 高光：左上方小椭圆，增加玻璃/球体质感
-            canvas.drawOval(cx - r * 0.62f, cy - r * 0.72f, cx - r * 0.22f, cy - r * 0.34f,
-                Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.argb(0x4D, 0xFF, 0xFF, 0xFF); style = Paint.Style.FILL })
+            edge.alpha = 255
         }
     }
 

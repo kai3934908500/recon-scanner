@@ -59,7 +59,7 @@ class CaptureActivity : ComponentActivity() {
     private var coverageTracker: CoverageTracker? = null
     /** 物体显著性检测：驱动绿色物体边框贴合物体。 */
     private val objectDetector = ObjectDetector()
-    @Volatile private var detectedObjectBox: FloatArray? = null
+    @Volatile private var detectedObjectMask: BooleanArray? = null
     private var detectCounter = 0
 
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
@@ -351,12 +351,12 @@ class CaptureActivity : ComponentActivity() {
             coverageTracker?.markFrame()
             // 每 8 帧做一次轻量物体检测（48×48 下采样，<1ms，不阻塞采集）
             if (++detectCounter % 8 == 0) {
-                val box = objectDetector.detect(frame.bgra, frame.width, frame.height)
-                if (box != null) {
-                    detectedObjectBox = box
+                val result = objectDetector.detect(frame.bgra, frame.width, frame.height)
+                if (result.mask != null) {
+                    detectedObjectMask = result.mask
                     mainHandler.post { ui.updateCaptureHud(ingestedFrames,
                         coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates(), detectedObjectBox) }
+                        coverageTracker?.bucketStates(), detectedObjectMask) }
                 }
             }
         } else rejectedFrames++
@@ -488,8 +488,7 @@ class CaptureActivity : ComponentActivity() {
         nextFrameId = 1L
         arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
         coverageTracker?.reset()
-        objectDetector.reset()
-        detectedObjectBox = null
+        detectedObjectMask = null
         detectCounter = 0
         ui.clearStageDetail()
         shell.setResultSummary(getString(R.string.projects_empty_body))
@@ -534,7 +533,7 @@ class CaptureActivity : ComponentActivity() {
                     lastStats = s
                     // 采集全屏 HUD 实时反馈：帧数 + 方位覆盖
                     ui.updateCaptureHud(ingestedFrames, coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates(), detectedObjectBox)
+                        coverageTracker?.bucketStates(), detectedObjectMask)
                     renderNow()
                 }
                 delay(500)

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// ObjectDetector.kt — 物体显著性检测（纯本地，零依赖）
+// ObjectDetector.kt — 物体前景分割（纯本地，零依赖）
 //
-// 用途：采集取景时"识别到物体→给物体镶绿边"。对标专业扫描 App 的
-// 物体包围盒贴合：物体移动/缩放时绿边跟着动，而不是画死一个框。
+// 用途：识别画面中央的物体，输出前景 mask（低分辨率布尔网格）。
+// HUD 据此沿**真实轮廓**画绿边 + 像涂层一样逐格覆盖，而不是矩形框/方格。
 //
-// 算法（轻量，48×48 下采样，单帧 <1ms）：
-//   1. BGRA → 灰度下采样到 48×48
-//   2. 背景色取四角均值；画面中心区域找与背景色差异显著的前景像素
-//   3. 前景像素的包围盒 = 物体；EMA 平滑抑制抖动
-//   4. 前景太少（<2%）视为"没检测到"，保持上一框（不闪烁）
+// 算法（轻量，64×64 下采样，单帧 <1ms）：
+//   1. BGRA → 灰度下采样到 64×64
+//   2. 背景色取四角均值；与背景色差异显著的像素 = 前景
+//   3. 形态学：保留最大连通主体，去掉散点噪声
+//   4. 前景太少/太多如实判"未识别"，不硬凑
 //
 // 无 ML 模型、无网络——纯算术，符合纯本地铁律。
 package com.recon.scan
@@ -17,71 +17,94 @@ package com.recon.scan
 import kotlin.math.abs
 
 internal class ObjectDetector {
-    private val gw = 48
-    private val gh = 48
-    private val gray = FloatArray(gw * gh)
-    private var hasBox = false
-    private var box = floatArrayOf(0.25f, 0.25f, 0.75f, 0.75f) // L,T,R,B 归一化
+    val gridW = 64
+    val gridH = 64
+    private val gray = FloatArray(gridW * gridH)
+    private val mask = BooleanArray(gridW * gridH)
+    private val visited = BooleanArray(gridW * gridH)
 
-    /**
-     * @return 归一化包围盒 [left,top,right,bottom]；null 表示未检测到有效物体。
-     */
-    fun detect(bgra: ByteArray, w: Int, h: Int): FloatArray? {
-        if (w <= 0 || h <= 0 || bgra.size < w * h * 4) return null
-        // 1. 下采样灰度
-        for (gy in 0 until gh) {
-            val sy = gy * h / gh
-            val rowBase = sy * w
-            for (gx in 0 until gw) {
-                val sx = gx * w / gw
-                val i = (rowBase + sx) * 4
-                gray[gy * gw + gx] = bgra[i] * 0.11f + bgra[i + 1] * 0.59f + bgra[i + 2] * 0.30f
+    data class Result(val mask: BooleanArray?, val ratio: Float)
+
+    fun detect(bgra: ByteArray, w: Int, h: Int): Result {
+        if (w <= 0 || h <= 0 || bgra.size < w * h * 4) return Result(null, 0f)
+        for (gy in 0 until gridH) {
+            val sy = gy * h / gridH
+            for (gx in 0 until gridW) {
+                val sx = gx * w / gridW
+                val i = (sy * w + sx) * 4
+                gray[gy * gridW + gx] = bgra[i] * 0.11f + bgra[i + 1] * 0.59f + bgra[i + 2] * 0.30f
             }
         }
-        // 2. 背景色 = 四角 8×8 均值
         var bg = 0f; var cnt = 0
-        for (gy in 0 until 8) for (gx in 0 until 8) {
-            bg += gray[gy * gw + gx]; cnt++
-        }
-        for (gy in gh - 8 until gh) for (gx in gw - 8 until gw) {
-            bg += gray[gy * gw + gx]; cnt++
+        for (gy in 0 until 10) for (gx in 0 until 10) { bg += gray[gy * gridW + gx]; cnt++ }
+        for (gy in gridH - 10 until gridH) for (gx in gridW - 10 until gridW) {
+            bg += gray[gy * gridW + gx]; cnt++
         }
         bg /= cnt.coerceAtLeast(1)
-        // 3. 中心 76% 区域找显著前景
-        val x0 = (gw * 0.12f).toInt(); val x1 = (gw * 0.88f).toInt()
-        val y0 = (gh * 0.12f).toInt(); val y1 = (gh * 0.88f).toInt()
-        var minX = gw; var minY = gh; var maxX = 0; var maxY = 0; var found = 0
-        for (gy in y0 until y1) for (gx in x0 until x1) {
-            if (abs(gray[gy * gw + gx] - bg) > 18f) {
-                if (gx < minX) minX = gx
-                if (gx > maxX) maxX = gx
-                if (gy < minY) minY = gy
-                if (gy > maxY) maxY = gy
-                found++
+
+        val x0 = gridW / 8; val x1 = gridW * 7 / 8
+        val y0 = gridH / 8; val y1 = gridH * 7 / 8
+        var fg = 0
+        for (gy in 0 until gridH) for (gx in 0 until gridW) {
+            val inside = gx in x0 until x1 && gy in y0 until y1
+            val on = inside && abs(gray[gy * gridW + gx] - bg) > 16f
+            mask[gy * gridW + gx] = on
+            if (on) fg++
+        }
+        val ratio = fg.toFloat() / (gridW * gridH)
+        if (ratio < 0.02f || ratio > 0.80f) { mask.fill(false); return Result(null, ratio) }
+
+        java.util.Arrays.fill(visited, false)
+        var bestSeed = -1; var bestSize = 0
+        for (gy in 0 until gridH) for (gx in 0 until gridW) {
+            val idx = gy * gridW + gx
+            if (mask[idx] && !visited[idx]) {
+                val size = floodFill(gx, gy)
+                if (size > bestSize) { bestSize = size; bestSeed = idx }
             }
         }
-        val area = (x1 - x0) * (y1 - y0)
-        val ratio = found.toFloat() / area.coerceAtLeast(1)
-        // 如实判定：前景太少（无物体）或太多（杂乱背景误判）都不算"已锁定"。
-        // 不为了好看而乱报锁定。
-        if (ratio < 0.03f || ratio > 0.75f || maxX <= minX || maxY <= minY) {
-            hasBox = false
-            return null
-        }
-        // 4. 归一化 + 略微外扩 + EMA 平滑
-        val pad = 0.02f
-        val nl = (minX.toFloat() / gw - pad).coerceIn(0f, 1f)
-        val nt = (minY.toFloat() / gh - pad).coerceIn(0f, 1f)
-        val nr = (maxX.toFloat() / gw + pad).coerceIn(0f, 1f)
-        val nb = (maxY.toFloat() / gh + pad).coerceIn(0f, 1f)
-        val a = if (hasBox) 0.25f else 1f
-        box[0] += (nl - box[0]) * a
-        box[1] += (nt - box[1]) * a
-        box[2] += (nr - box[2]) * a
-        box[3] += (nb - box[3]) * a
-        hasBox = true
-        return box.copyOf()
+        if (bestSeed < 0 || bestSize < 12) { mask.fill(false); return Result(null, ratio) }
+
+        val keep = BooleanArray(mask.size)
+        java.util.Arrays.fill(visited, false)
+        floodMark(bestSeed % gridW, bestSeed / gridW, keep)
+        System.arraycopy(keep, 0, mask, 0, mask.size)
+        return Result(mask.copyOf(), bestSize.toFloat() / (gridW * gridH))
     }
 
-    fun reset() { hasBox = false }
+    private fun floodFill(sx: Int, sy: Int): Int {
+        val stack = ArrayDeque<Int>()
+        stack.add(sy * gridW + sx)
+        visited[sy * gridW + sx] = true
+        var n = 0
+        while (stack.isNotEmpty()) {
+            val idx = stack.removeLast()
+            n++
+            val x = idx % gridW; val y = idx / gridW
+            if (x > 0) visit(idx - 1, stack)
+            if (x < gridW - 1) visit(idx + 1, stack)
+            if (y > 0) visit(idx - gridW, stack)
+            if (y < gridH - 1) visit(idx + gridW, stack)
+        }
+        return n
+    }
+
+    private fun floodMark(sx: Int, sy: Int, out: BooleanArray) {
+        val stack = ArrayDeque<Int>()
+        stack.add(sy * gridW + sx)
+        visited[sy * gridW + sx] = true
+        while (stack.isNotEmpty()) {
+            val idx = stack.removeLast()
+            out[idx] = true
+            val x = idx % gridW; val y = idx / gridW
+            if (x > 0) visit(idx - 1, stack)
+            if (x < gridW - 1) visit(idx + 1, stack)
+            if (y > 0) visit(idx - gridW, stack)
+            if (y < gridH - 1) visit(idx + gridW, stack)
+        }
+    }
+
+    private fun visit(idx: Int, stack: ArrayDeque<Int>) {
+        if (mask[idx] && !visited[idx]) { visited[idx] = true; stack.add(idx) }
+    }
 }
