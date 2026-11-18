@@ -346,8 +346,8 @@ internal class MainUI(
     }
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
-    fun updateCaptureHud(frames: Int, coverage: Float) {
-        if (fullscreen) captureHud.update(frames, coverage)
+    fun updateCaptureHud(frames: Int, coverage: Float, buckets: BooleanArray? = null) {
+        if (fullscreen) captureHud.update(frames, coverage, buckets)
     }
 
     fun render(v: ViewState) {
@@ -743,9 +743,15 @@ internal class MainUI(
     private class CaptureHudView(context: Context, private val dp: (Int) -> Int) : View(context) {
         private var frames = 0
         private var coverage = 0f
+        private var buckets: BooleanArray? = null
         private var tick = 0f
-        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        private val white = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dp(2).toFloat()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val green = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(0x3D, 0xD6, 0x84); style = Paint.Style.STROKE
+            strokeWidth = 2.5f * context.resources.displayMetrics.density
             strokeCap = Paint.Cap.ROUND
         }
         private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -753,54 +759,108 @@ internal class MainUI(
             setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
         }
         private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(28).toFloat()
+            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(26).toFloat()
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
         }
         private val pill = android.graphics.drawable.GradientDrawable().apply {
             setColor(Color.argb(0xB3, 0x11, 0x18, 0x27)); cornerRadius = dp(999).toFloat() }
 
-        fun update(f: Int, cov: Float) { frames = f; coverage = cov; invalidate() }
+        fun update(f: Int, cov: Float, bs: BooleanArray?) {
+            frames = f; coverage = cov; buckets = bs; invalidate()
+        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             tick += 1f
             val w = width.toFloat(); val h = height.toFloat()
-            val topBarH = dp(56).toFloat()
 
             // 顶部提示胶囊
-            val tip = "缓慢环绕物体一周 · 覆盖所有角度"
+            val tip = "把物体放进绿框 · 缓慢环绕一周"
             val tw = text.measureText(tip) + dp(32)
             val left = (w - tw) / 2f
             pill.setBounds(left.toInt(), dp(16), (left + tw).toInt(), (dp(16) + dp(36)).toInt())
             pill.draw(canvas)
             canvas.drawText(tip, w / 2f, (dp(16) + dp(24)).toFloat(), text)
 
-            // 中央取景四角框（提示用户把物体放这里）
-            val boxW = w * 0.62f; val boxH = h * 0.42f
-            val bx = (w - boxW) / 2f; val by = h * 0.24f
-            val seg = boxW * 0.14f
-            canvas.drawLine(bx, by, bx + seg, by, line); canvas.drawLine(bx, by, bx, by + seg, line)
-            canvas.drawLine(bx + boxW, by, bx + boxW - seg, by, line); canvas.drawLine(bx + boxW, by, bx + boxW, by + seg, line)
-            canvas.drawLine(bx, by + boxH, bx + seg, by + boxH, line); canvas.drawLine(bx, by + boxH, bx, by + boxH - seg, line)
-            canvas.drawLine(bx + boxW, by + boxH, bx + boxW - seg, by + boxH, line); canvas.drawLine(bx + boxW, by + boxH, bx + boxW, by + boxH - seg, line)
+            // ---- 物体绿框（覆盖度越高越实、脉动越强）----
+            val boxW = w * 0.64f; val boxH = h * 0.40f
+            val bx = (w - boxW) / 2f; val by = h * 0.22f
+            val seg = boxW * 0.16f
+            val pulse = (0.75f + 0.25f * kotlin.math.sin(tick * 0.06f).toFloat())
+            val g = (0x84 * pulse).toInt().coerceIn(0, 255)
+            green.alpha = g
+            // 四角
+            canvas.drawLine(bx, by, bx + seg, by, green); canvas.drawLine(bx, by, bx, by + seg, green)
+            canvas.drawLine(bx + boxW, by, bx + boxW - seg, by, green); canvas.drawLine(bx + boxW, by, bx + boxW, by + seg, green)
+            canvas.drawLine(bx, by + boxH, bx + seg, by + boxH, green); canvas.drawLine(bx, by + boxH, bx, by + boxH - seg, green)
+            canvas.drawLine(bx + boxW, by + boxH, bx + boxW - seg, by + boxH, green); canvas.drawLine(bx + boxW, by + boxH, bx + boxW, by + boxH - seg, green)
+            // 框内中心准星
+            val cxp = w / 2f; val cyp = by + boxH / 2f
+            green.alpha = (120 * pulse).toInt().coerceIn(0, 255)
+            canvas.drawCircle(cxp, cyp, dp(10).toFloat(), green)
+            canvas.drawLine(cxp - dp(16), cyp, cxp - dp(4), cyp, green)
+            canvas.drawLine(cxp + dp(4), cyp, cxp + dp(16), cyp, green)
+            green.alpha = 255
 
-            // 环绕方向箭头（沿取景框顶部流动，直观提示"绕着走"）
+            // ---- 环绕方向流动箭头（沿框顶从左到右）----
             val phase = (tick % 120f) / 120f
             val ax = bx + phase * boxW
-            val ay = by - dp(10)
-            canvas.drawLine(ax - dp(8), ay, ax, ay - dp(6), line)
-            canvas.drawLine(ax, ay - dp(6), ax + dp(8), ay, line)
+            val ay = by - dp(12)
+            canvas.drawLine(ax - dp(9), ay, ax, ay - dp(7), white)
+            canvas.drawLine(ax, ay - dp(7), ax + dp(9), ay, white)
 
-            // 底部实时统计：帧数 + 覆盖度
-            val statY = h - dp(96)
-            canvas.drawText(frames.toString(), w * 0.32f, statY, big)
-            canvas.drawText("已采集帧", w * 0.32f, statY + dp(20), text)
-            val covPct = "${(coverage * 100).toInt()}%"
-            canvas.drawText(covPct, w * 0.68f, statY, big)
-            canvas.drawText("方位覆盖", w * 0.68f, statY + dp(20), text)
+            // ---- 球包裹可视化（左下角：36 方位扇区逐个染绿）----
+            val sr = dp(46).toFloat()
+            val scx = dp(16) + sr
+            val scy = h - dp(30) - sr
+            drawCoverageSphere(canvas, scx, scy, sr, buckets, coverage)
+
+            // ---- 右下角统计 ----
+            val statY = h - dp(70)
+            canvas.drawText(frames.toString(), w - dp(96), statY, big)
+            canvas.drawText("帧", w - dp(96), statY + dp(18), text)
+            canvas.drawText("${(coverage * 100).toInt()}%", w - dp(24), statY, big)
+            canvas.drawText("覆盖", w - dp(24), statY + dp(18), text)
 
             postInvalidateDelayed(50)
+        }
+
+        /** 把 36 方位桶画成绕球的经线扇区，覆盖的染绿 —— "球被慢慢包裹"。 */
+        private fun drawCoverageSphere(
+            canvas: Canvas, cx: Float, cy: Float, r: Float,
+            bs: BooleanArray?, cov: Float,
+        ) {
+            val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(0xCC, 0xFF, 0xFF, 0xFF); style = Paint.Style.STROKE
+                strokeWidth = 1.5f * context.resources.displayMetrics.density }
+            val filled = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(0x3D, 0xD6, 0x84); style = Paint.Style.FILL }
+            val empty = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(0x33, 0xFF, 0xFF, 0xFF); style = Paint.Style.FILL }
+            // 球体底
+            canvas.drawCircle(cx, cy, r, empty)
+            // 36 个方位扇区：每个是一条竖直"瓜瓣"（椭圆弧），覆盖则绿
+            val n = 36
+            for (i in 0 until n) {
+                val covered = bs?.getOrNull(i) ?: false
+                val a0 = (i.toFloat() / n) * 360f
+                val a1 = ((i + 1).toFloat() / n) * 360f
+                val path = android.graphics.Path()
+                // 用球面经度投影：瓜瓣宽度随 cos(经度) 收窄，画到圆两侧
+                val mid = (a0 + a1) / 2f
+                val rad = Math.toRadians(mid.toDouble()).toFloat()
+                val x0 = cx + r * kotlin.math.sin(rad) * 0.18f
+                val x1 = cx + r * kotlin.math.sin(Math.toRadians(a1.toDouble()).toFloat()) * 0.18f
+                path.moveTo(cx, cy - r)
+                path.quadTo(x0, cy, x1, cy + r)
+                path.quadTo(cx, cy, cx, cy - r)
+                canvas.drawPath(path, if (covered) filled else empty)
+            }
+            // 球轮廓 + 赤道
+            canvas.drawCircle(cx, cy, r, outline)
+            canvas.drawOval(cx - r * 0.32f, cy - r, cx + r * 0.32f, cy + r, outline)
+            canvas.drawLine(cx - r, cy, cx + r, cy, outline)
         }
     }
 

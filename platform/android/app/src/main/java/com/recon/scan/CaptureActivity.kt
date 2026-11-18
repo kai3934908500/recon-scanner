@@ -55,6 +55,8 @@ class CaptureActivity : ComponentActivity() {
     /** 相机只能在 Activity 处于前台时打开；真机实测后台 openCamera 会被系统拒绝。 */
     private var activityResumed = false
     private var pendingCameraStart = false
+    /** 陀螺仪方位覆盖追踪：驱动全景扫描式"球包裹"引导。 */
+    private lateinit var coverageTracker: CoverageTracker
 
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
@@ -335,7 +337,10 @@ class CaptureActivity : ComponentActivity() {
             null, null, frame.timestampNs,
             null, 0,
             0.0, 0.0)
-        if (status == ReconStatus.OK) ingestedFrames++ else rejectedFrames++
+        if (status == ReconStatus.OK) {
+            ingestedFrames++
+            coverageTracker.markFrame()
+        } else rejectedFrames++
     }
 
     private fun startCapture() {
@@ -352,6 +357,7 @@ class CaptureActivity : ComponentActivity() {
                 return@launch
             }
             startStatsPolling()
+            coverageTracker.start()
             ensureCamera()
             camera?.setIngest(true)
             renderNow()
@@ -432,6 +438,7 @@ class CaptureActivity : ComponentActivity() {
         lastProgressFraction = -1f
         nextFrameId = 1L
         arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
+        coverageTracker.reset()
         ui.clearStageDetail()
         shell.setResultSummary(getString(R.string.projects_empty_body))
         shell.setPreviewMesh(null, null)
@@ -474,7 +481,8 @@ class CaptureActivity : ComponentActivity() {
                 if (s != null) {
                     lastStats = s
                     // 采集全屏 HUD 实时反馈：帧数 + 方位覆盖
-                    ui.updateCaptureHud(s.framesCaptured.toInt(), s.azimuthCoverage.toFloat())
+                    ui.updateCaptureHud(ingestedFrames, coverageTracker.coverage(),
+                        coverageTracker.bucketStates())
                     renderNow()
                 }
                 delay(500)
@@ -483,6 +491,7 @@ class CaptureActivity : ComponentActivity() {
     }
 
     private fun stopStatsPolling() {
+        coverageTracker.stop()
         statsJob?.cancel()
         statsJob = null
     }
@@ -665,6 +674,7 @@ class CaptureActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        coverageTracker.stop()
         stopStatsPolling()
         reconJob?.cancel()
         releaseCamera()
