@@ -808,11 +808,11 @@ recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
   // 【关键修复】SfM 输入抽稀：RunIncrementalSfm 是 O(n²) 图像匹配，
   // 600 帧会让真机卡死在"位姿估计"且进度 0%（用户实测）。SfM 建位姿只需
   // 足够的视角覆盖，均匀抽稀到上限不损失几何精度（COLMAP 同样对视频抽帧）。
-  // 抽稀后仍用全部帧做后续的 MVS 稠密融合，精度不受影响。
-  // 低端机实测：80 视图的增量注册 rebuild_index() 是 O(轮×track×特征)，
-  // 在手机上要几分钟 → 用户看到"进行中"长期不动。24 个均匀视角对环绕扫描
-  // 建位姿足够（MVS 仍用全部帧，最终几何精度不受影响）。
-  constexpr size_t kSfmMaxViews = 24;
+  // 【重建质量关键】抽稀上限直接决定 MVS 输入：keyframe_indices_ 来自
+  // SfM 注册视图，StageMvs 只处理这些帧。旧值 24 让稠密融合只有十几帧，
+  // 是"重建质量差"的根因。修正为 48：配合已修的 rebuild_index uv-hash
+  // （O(1)）与初始对上限 16，48 视图不再像旧版 80 那样卡死，MVS 输入翻倍。
+  constexpr size_t kSfmMaxViews = 48;
   if (usable.size() > kSfmMaxViews) {
     const size_t total = usable.size();
     std::vector<int> sampled;
