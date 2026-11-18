@@ -79,4 +79,14 @@
     <string name="ui_export_note">导出路径</string>
     <string name="ui_progress_label">进度</string>
     <string name="ui_abi_mismatch">ABI 版本不匹配</string>
+
+    <!-- 企业级界面：步骤流程 -->
+    <string name="ui_step_prepare">设备准备</string>
+    <string name="ui_step_capture">环绕采集</string>
+    <string name="ui_step_reconstruct">三维重建</string>
+    <string name="ui_step_result">成果导出</string>
+    <string name="ui_badge_local">ON-DEVICE</string>
+    <string name="ui_badge_version">v1.0</string>
+    <string name="ui_section_overview">采集概览</string>
+    <string name="ui_next_hint">下一步</string>
 </resources>

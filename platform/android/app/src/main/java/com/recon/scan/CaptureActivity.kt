@@ -219,10 +219,15 @@ class CaptureActivity : ComponentActivity() {
     private fun onReviewing() {
         stopStatsPolling()
         camera?.setIngest(false)  // 保留预览，用户可选 CONTINUE 继续扫描
-        // 采集统计作为自检依据的如实呈现；具体判据由 native 侧后续版本接入。
-        lastStats = if (captureContext != 0L) NativeBridge.getScanStats(captureContext)
-                        ?.let { ScanStats.fromArray(it) } else null
-        renderNow()
+        // native 读取必须离开主线程（否则可能 ANR）；结果回到主线程再渲染。
+        lifecycleScope.launch {
+            val s = withContext(Dispatchers.IO) {
+                if (captureContext != 0L) NativeBridge.getScanStats(captureContext)
+                    ?.let { ScanStats.fromArray(it) } else null
+            }
+            lastStats = s
+            renderNow()
+        }
     }
 
     /** 重建在 Activity 内闭环：完成/失败显式回推状态机（修 Processing 死态）。 */
@@ -235,6 +240,7 @@ class CaptureActivity : ComponentActivity() {
                     object : NativeBridge.ProgressCallback {
                         override fun onProgress(stage: Int, progress: Double, message: String) {
                             mainHandler.post {
+                                lastProgressFraction = progress.coerceIn(0.0, 1.0).toFloat()
                                 lastProgress = "阶段 $stage · ${(progress * 100).toInt()}% · $message"
                                 renderNow()
                             }
@@ -309,6 +315,7 @@ class CaptureActivity : ComponentActivity() {
     private var lastStats: ScanStats? = null
     private var lastMesh: MeshInfo? = null
     private var lastProgress: String = ""
+    private var lastProgressFraction: Float = -1f
     private var lastExportNote: String = ""
 
     private fun renderNow() {
@@ -346,10 +353,37 @@ class CaptureActivity : ComponentActivity() {
             else -> emptySet()
         }
 
+        val current = CaptureEventBridge.currentState()
+        // 四段式流程：0 设备准备 / 1 环绕采集 / 2 三维重建 / 3 成果导出
+        val step = when (current) {
+            CaptureEventBridge.STATE_IDLE,
+            CaptureEventBridge.STATE_CAPABILITY_PROBE,
+            CaptureEventBridge.STATE_REQUESTING_PERMISSION,
+            CaptureEventBridge.STATE_PREVIEWING -> 0
+            CaptureEventBridge.STATE_CAPTURING,
+            CaptureEventBridge.STATE_REVIEWING -> 1
+            CaptureEventBridge.STATE_PROCESSING -> 2
+            CaptureEventBridge.STATE_COMPLETED,
+            CaptureEventBridge.STATE_FAILED,
+            CaptureEventBridge.STATE_CANCELLED -> 3
+            else -> 0
+        }
+        val tone = when (current) {
+            CaptureEventBridge.STATE_PROCESSING -> 1
+            CaptureEventBridge.STATE_COMPLETED -> 2
+            CaptureEventBridge.STATE_FAILED -> 3
+            else -> 0
+        }
+        val progressFraction =
+            if (current == CaptureEventBridge.STATE_PROCESSING) lastProgressFraction else -1f
+
         ui.render(MainUI.ViewState(
             stateLabel = state,
             hint = hint,
             progress = lastProgress,
+            progressFraction = progressFraction,
+            step = step,
+            stateTone = tone,
             diag = buildString {
                 append(getString(R.string.ui_diag_label)).append("：")
                     .append(arrivedFrames).append(" / ")
