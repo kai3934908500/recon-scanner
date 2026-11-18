@@ -40,6 +40,13 @@ librecon_platform_android.so 在 armeabi-v7a 下被抬到了 0x4000（16 KB）�
 
   注入 4（反空）：把检查 3 整段删掉 → 断言脚本报「未找到检查 3」。
 
+  注入 5（apk .so 未压缩判据 —— 误报型假闸门，CI #12 首次执行暴露）：
+    原内联写法用 `unzip -lv | awk '$3 == "Stored"'`，而 Method 列是**第 2 列**
+    → 计数恒 0 → **恒判「被压缩」**（真实 APK 里 15 个 .so 全是 Stored）。
+    该判定已抽成 `tools/apk_so_compression.py`（读 `zipfile.compress_type`，
+    不解析文本输出）。本注入把「未压缩判定」改成恒真/恒假，断言新判据的
+    `--self-test` 会拒收 —— 证明该自检不是摆设。
+
 ⚠️ 注入把**合成 ELF** 当作判据的目标对象（`--build-dir` 指向临时树），
    因此本脚本**不需要 Android SDK / NDK / 真实构建**，任何机器可跑。
    合成 ELF 的 p_align 写成真实缺陷的形态（32 位自建 = 0x4000）。
@@ -62,6 +69,7 @@ DEFAULT_ROOT = os.path.dirname(HERE)  # ⚠️ 不依赖 cwd（ctest 的 cwd 是
 
 CHECK16 = os.path.join("tools", "check_16kb.sh")
 ANDROID_CONTRACT = os.path.join("tools", "check_android_contract.py")
+APK_SO_COMPRESSION = os.path.join("tools", "apk_so_compression.py")
 ROOT_CMAKE = "CMakeLists.txt"
 
 GATE_TAG = "G-AND-8"
@@ -140,6 +148,14 @@ def run_android_contract(root: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def run_apk_self_test(root: str) -> tuple[int, str]:
+    """跑 `apk_so_compression.py --self-test`（合成 APK 双态自检）。"""
+    proc = subprocess.run(
+        [sys.executable, os.path.join(root, APK_SO_COMPRESSION), "--self-test"],
+        capture_output=True, text=True, cwd=root)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 def slurp(p: str) -> str:
     with open(p, encoding="utf-8") as fh:
         return fh.read()
@@ -207,6 +223,39 @@ CMAKE_CASES: list[tuple[str, str, str, str, str, str]] = [
         "  if(_recon_abi IN_LIST RECON_16KB_ABIS)",
         "  if(TRUE)",
         GATE_TAG,
+    ),
+]
+
+# APK 内 `.so` 未压缩判据的自检（CI #12 暴露的**误报型假闸门**）。
+# 语义与上面几组**不同**：这里注入的是**判据本体**（apk_so_compression.py），
+# 而「拒收」的动作由它的 `--self-test` 承担 —— 故断言是：
+#   **注入后自检必须失败**（rc≠0 且输出含 `FAIL`）。
+# 这正面证明该自检**不是摆设**：判据一坏，自检当场抓住。
+#
+# (用例名, 说明, 原串, 替换串, 期望「出现」的子串)
+APK_CASES: list[tuple[str, str, str, str, str]] = [
+    (
+        "AA-5-apk-so-classifier-neutered",
+        "把「是否未压缩」的判定改成**恒真**（= CI #12 那版错列位 awk 的"
+        "本质：无论实际如何都判不出「被压缩」）→ 自检必须失败",
+        "    if compress_type == zipfile.ZIP_STORED:\n"
+        "        return True, KIND_STORED\n"
+        "    if compress_type == zipfile.ZIP_DEFLATED:\n"
+        "        return False, KIND_DEFLATED\n"
+        "    return False, f\"{KIND_OTHER}({compress_type})\"",
+        "    return True, KIND_STORED",
+        "FAIL",
+    ),
+    (
+        "AA-6-apk-so-antiempty-removed",
+        "删掉**反空约束**（无 .so 条目时不再报错）→ 自检必须失败"
+        "（证明反空约束是判据的必要组成，不是可选装饰）",
+        "    if not entries:\n"
+        "        return False, [f\"{apk_path}: 未找到任何 .so 条目 —— 判据的目标对象缺失，\"\n"
+        "                       f\"不得静默通过（abiFilters / jniLibs 配置被改动？）\"]",
+        "    if not entries:\n"
+        "        return True, []",
+        "FAIL",
     ),
 ]
 
@@ -297,6 +346,61 @@ def main() -> int:
                     print("      " + "\n      ".join(out3.strip().splitlines()[-6:]))
             finally:
                 restore(path, src)
+
+        # ---- 基线：apk_so_compression.py 的自检必须先通过 ---------------
+        # 若自检本身就不通过，后面的注入断言无意义（无法区分「注入生效」与
+        # 「判据本来就坏」）。
+        if not os.path.isfile(os.path.join(root, APK_SO_COMPRESSION)):
+            print(f"[negative] 未找到判据本体：{os.path.join(root, APK_SO_COMPRESSION)}")
+            fail = 1
+        else:
+            rca, outa = run_apk_self_test(root)
+            if rca != 0:
+                print("[negative] 基线：apk_so_compression.py --self-test **未通过**"
+                      " —— 判据本身有问题，注入测试无意义：")
+                print(outa[-1500:])
+                fail = 1
+            else:
+                print("[negative] 基线：apk 内 .so 未压缩自检通过（6/6）✓")
+
+            # ---- 注入 5..6：APK .so 未压缩判据 ---------------------------------
+            # 语义：注入**判据本体**，断言它的 `--self-test` **失败**（rc≠0）。
+            # = 判据一坏，自检当场抓住 ⇒ 自检不是摆设。
+            backups_a: list[tuple[str, str]] = []
+            try:
+                for name, desc, old, new, expect in APK_CASES:
+                    path = os.path.join(root, APK_SO_COMPRESSION)
+                    src = slurp(path)
+                    backups_a.append((path, src))
+                    if src.count(old) < 1:
+                        print(f"  ✗ {name} —— 注入锚点未命中（{APK_SO_COMPRESSION}），"
+                              f"说明**注入本身已失效**（不是判据失效）")
+                        fail = 1
+                        continue
+                    restore(path, src.replace(old, new, 1))
+
+                    rcb, outb = run_apk_self_test(root)
+                    hit_b = expect in outb
+                    ok = (rcb != 0) and hit_b
+                    mark = "✓" if ok else "✗"
+                    print(f"  {mark} {name} —— "
+                          f"{'自检失败（注入后判据被抓住）' if ok else '自检仍通过（注入无效？）'}"
+                          f"(rc={rcb})  [{desc}]")
+                    if not ok:
+                        fail = 1
+                        print("      " + "\n      ".join(outb.strip().splitlines()[-6:]))
+                    restore(path, backups_a.pop()[1])
+            finally:
+                while backups_a:
+                    path, content = backups_a.pop()
+                    restore(path, content)
+
+            # 还原后自检必须重新通过
+            rcc, outc = run_apk_self_test(root)
+            if rcc != 0:
+                print("[negative] 还原后 apk 自检失败 —— 注入脚本污染了工作区：")
+                print(outc[-1200:])
+                fail = 1
 
         # ---- 还原后基线 ------------------------------------------------
         rc4, out4 = run_check16(root, build_dir)

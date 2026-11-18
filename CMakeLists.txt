@@ -892,9 +892,18 @@ if(RECON_BUILD_TESTS AND RECON_PLATFORM_DESKTOP)
   # （违反 docs/12 §3.2）而闸门毫无反应。
   # 本测试用**合成 ELF** 作判据的目标对象，故不需要 Android SDK / NDK，
   # 任何机器可跑；它同时覆盖 CMake 根因侧的静态判据 G-AND-8。
+  # 2026-11-18 扩展：并入 CI #12 暴露的**误报型假闸门**（APK 内 .so 未压缩
+  # 判据写错 `unzip -lv` 列位 → 恒判「被压缩」）。该判据已抽成
+  # `tools/apk_so_compression.py`（读 zipfile.compress_type，不解析文本输出），
+  # 注入项 AA-5/AA-6 断言其 `--self-test` 会在判据被改坏时失败。
   add_test(NAME abi_align_negative
     COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/verify_abi_align_negative.py"
             --root "${RECON_REPO_ROOT}")
+
+  # APK 内 .so 未压缩判据的**合成 APK 双态自检**（不需要 Android SDK / 真实 APK）。
+  add_test(NAME apk_so_compression
+    COMMAND ${Python3_EXECUTABLE} "${RECON_REPO_ROOT}/tools/apk_so_compression.py"
+            --self-test)
 endif()
 endif()
 

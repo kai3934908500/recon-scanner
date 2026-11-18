@@ -29,15 +29,26 @@
 #      （见检查 3b）比依赖中间目录更稳，且判据落在**交付物**而非中间产物上。
 #
 # ---------------------------------------------------------------------------
-# 三条检查（判据全部落在**产物**上，不落脚本自述）
+# 四条检查（判据全部落在**产物**上，不落脚本自述）
 # ---------------------------------------------------------------------------
+#  检查 0  ELF 对齐解析器自检（先证明**判据本身**不是恒真的）
 #  检查 1  ELF LOAD 段 p_align ≥ 0x4000（仅 64 位 ABI：arm64-v8a / x86_64）
 #          实现收敛到 tools/elf_load_align.py（**单一实现 + 内置自检**，
 #          避免在 shell 里用 `readelf | awk` —— 那种写法在 readelf 缺失或
 #          输出格式变化时会匹配 0 行、循环不执行、于是**假绿**）。
+#  检查 3  armeabi-v7a 必须**保持 4 KB**：正向断言 `--max-align 0x1000`
+#          （**不靠**"另一个判据失败"反推，那是零检测力的假闸门 ——
+#           见 docs/14 缺口 AY），且**只判本案自建**（白名单前缀
+#           `librecon_`），第三方预编译库只留档不判。
 #  检查 2  APK 内 .so 的 zip 对齐：`zipalign -c -P 16 -v 4 <apk>`
-#  检查 3  armeabi-v7a 必须**保持 4 KB**（不适用 16 KB；留档其实际值，
-#          并断言它没有被"意外"改成 16 KB —— 32 位 ELF 页大小由设备决定）
+#          + `.so` 条目必须**未压缩**（ZIP_STORED）：实现收敛到
+#            tools/apk_so_compression.py（**单一实现 + 内置自检** ——
+#            原内联 `unzip -lv | awk` 写错列位，是**误报型假闸门**，
+#            CI #12 首次执行时暴露）。
+#
+# ⚠️ 本脚本内**不再重复实现**任何判定逻辑：ELF 对齐 → elf_load_align.py，
+#    APK 内 .so 压缩 → apk_so_compression.py，两者都带 `--self-test`。
+#    在 shell 里重写一遍是"同一逻辑写两遍"，且 shell 解析文本极易失锚。
 #
 # ---------------------------------------------------------------------------
 # 反静默降级（零容忍）
@@ -264,16 +275,21 @@ else
       # useLegacyPackaging false 是"未压缩"的必要条件，若它被改回 true，
       # 上面 zipalign 可能仍然通过（对齐的是 zip 局部头），但实际装到
       # Android 15+ 设备上仍会因 .so 被压缩而失败 —— 故单独断言。
-      if command -v unzip >/dev/null 2>&1; then
-        n_uncompressed_so="$(unzip -lv "${apk}" 2>/dev/null \
-          | awk '$NF ~ /\.so$/ && $3 == "Stored" {print $NF}' | wc -l | tr -d ' ')"
-        n_so="$(unzip -l "${apk}" 2>/dev/null | awk '$NF ~ /\.so$/ {print $NF}' \
-          | wc -l | tr -d ' ')"
-        note "$(basename "${apk}"): .so 条目 ${n_so} 个，其中 Stored(未压缩) ${n_uncompressed_so} 个"
-        if [ "${n_so}" -gt 0 ] && [ "${n_uncompressed_so}" -ne "${n_so}" ]; then
-          bad "$(basename "${apk}")：存在**被压缩**的 .so —— useLegacyPackaging"$'\n'"  疑似被改回 true（docs/12 §3.4.1 / 16 KB 合规必要条件）"
-        fi
-      fi
+      #
+      # ⚠️ 本条曾是一处**误报型假闸门（假红）**，CI #12 首次执行时暴露：
+      #   原写法 `awk '$NF ~ /\.so$/ && $3 == "Stored"'` —— `unzip -lv` 的
+      #   「Method」列是**第 2 列**（$2），$3 是 Size 列 → 恒不匹配 →
+      #   Stored 计数**恒为 0** → **恒判「被压缩」**，而真实 APK 里 15 个
+      #   .so **全部**是 Stored（本机用 CI #12 的真实 APK 实测：
+      #   `$3` 命中 0、`$2` 命中 15）。之所以此前没暴露，是因为 CI #11 在
+      #   更靠前的检查 1 就失败，这条断言**从未被执行到**。
+      #   修法：**不再解析 unzip 的文本输出**（列位随版本可能变，硬编码列位
+      #   是脆的），改用 `tools/apk_so_compression.py` —— 它用 Python
+      #   `zipfile` 直接读每个条目的 `compress_type`（结构性事实），
+      #   并自带 `--self-test`（6 项，含单个/全部/无/非 zip/混装五个反例）。
+      #   （单一实现：判定逻辑只此一份，不在 shell 里再写一遍。）
+      "${PY}" "${SCRIPT_DIR}/apk_so_compression.py" "${apk}" || \
+        bad "$(basename "${apk}")：.so 未压缩判据未通过（见上方 ::error:: 行）"
     done
   fi
 fi

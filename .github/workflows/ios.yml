@@ -90,6 +90,7 @@ on:
       - "tools/build_vulkan_shaders.sh"
       - "tools/stage_ios_ipa.py"
       - "tools/ci_run_gates.sh"
+      - "tools/apk_so_compression.py"
       - ".github/workflows/ios.yml"
   # ⚠️ pull_request 的白名单必须与 push **逐条一致**（含 tools/*.py 那一串）。
   #   先前它只有 8 条，缺了 gen_ios_project.py / verify_*_negative.py /
@@ -120,6 +121,7 @@ on:
       - "tools/build_vulkan_shaders.sh"
       - "tools/stage_ios_ipa.py"
       - "tools/ci_run_gates.sh"
+      - "tools/apk_so_compression.py"
       - ".github/workflows/ios.yml"
   workflow_dispatch:
     inputs:

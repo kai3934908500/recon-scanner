@@ -349,6 +349,16 @@ fi
 if wants elf; then
   step "ELF PT_LOAD 对齐解析器自检（合成 ELF + 反空约束）" \
     "${PY}" tools/elf_load_align.py --self-test
+
+  # --- APK 内 .so 未压缩判据的自检（16 KB 门禁的另一半）---------------------
+  # 为什么在这一组：`check_16kb.sh` 的检查 2 除 `zipalign -P 16` 外，还断言
+  # 「APK 内 .so 条目未压缩（ZIP_STORED）」—— 它是 `useLegacyPackaging false`
+  # 的必要条件。原实现内联在 shell 里用 `unzip -lv | awk '$3 == "Stored"'`，
+  # 而 Method 列是**第 2 列** → 计数恒 0 → **恒判「被压缩」**（**误报型假闸门**，
+  # CI #12 首次执行时暴露；真实 APK 里 15 个 .so 全是 Stored）。
+  # 现抽成独立判据（读 zipfile.compress_type，不解析文本输出）+ 合成 APK 自检。
+  step "APK 内 .so 未压缩判据自检（合成 APK 双态）" \
+    "${PY}" tools/apk_so_compression.py --self-test
 fi
 
 # --- 「按 ABI 分别判页对齐」判据的负向注入 --------------------------------
