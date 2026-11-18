@@ -1,5 +1,82 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!--
+  res/values/strings.xml — 界面文案。
+
+  契约：docs/09_UI规格.md §4.1（采集状态机）、§4.2（各态界面）。
+  Android 侧 UI 由程序化视图承载（无 layout XML），故所有可见文案集中在此，
+  便于与 iOS 的 L10n 键对照；两者语义一致（同一规格）。
+-->
 <resources>
-    <string name="app_name">recon</string>
+    <string name="app_name">recon · 本地三维扫描</string>
+
+    <!-- 应用标题 / 状态 -->
+    <string name="ui_title">recon</string>
+    <string name="ui_subtitle">纯本地 · 三维扫描建模</string>
+    <string name="ui_state_label">状态</string>
+
+    <!-- 状态机各态（对应 CaptureStateName） -->
+    <string name="state_idle">空闲</string>
+    <string name="state_capability_probe">正在探测设备能力</string>
+    <string name="state_requesting_permission">正在申请权限</string>
+    <string name="state_previewing">预览中 · 请对准物体</string>
+    <string name="state_capturing">采集中 · 请环绕物体</string>
+    <string name="state_reviewing">自检中</string>
+    <string name="state_processing">重建中 · 请稍候</string>
+    <string name="state_completed">重建完成</string>
+    <string name="state_failed">失败</string>
+    <string name="state_cancelled">已取消</string>
+    <string name="state_unknown">未知状态</string>
+
+    <!-- 能力信息 -->
+    <string name="ui_section_capability">设备能力</string>
+    <string name="ui_cap_branch">管线分支</string>
+    <string name="ui_cap_depth">深度等级</string>
+    <string name="ui_cap_camera">相机</string>
+    <string name="ui_cap_imu">惯性传感器</string>
+    <string name="ui_cap_memory">可用内存</string>
+    <string name="ui_cap_resolution">最大分辨率</string>
+    <string name="ui_cap_unknown">探测中…</string>
+    <string name="ui_cap_yes">支持</string>
+    <string name="ui_cap_no">不支持</string>
+    <string name="ui_branch_rgbd">RGBD</string>
+    <string name="ui_branch_mono">单目</string>
+
+    <!-- 采集统计 -->
+    <string name="ui_section_stats">采集统计</string>
+    <string name="ui_stat_frames">已采集帧</string>
+    <string name="ui_stat_accepted">有效帧</string>
+    <string name="ui_stat_keyframes">关键帧</string>
+    <string name="ui_stat_imu">IMU 采样</string>
+    <string name="ui_stat_coverage">覆盖方位</string>
+
+    <!-- 重建结果 -->
+    <string name="ui_section_result">重建结果</string>
+    <string name="ui_result_vertices">顶点数</string>
+    <string name="ui_result_triangles">三角面数</string>
+    <string name="ui_result_nonmanifold">非流形边</string>
+    <string name="ui_result_scale">尺度因子</string>
+
+    <!-- 按钮 -->
+    <string name="ui_btn_start">开始采集</string>
+    <string name="ui_btn_finish">结束采集</string>
+    <string name="ui_btn_reconstruct">确认重建</string>
+    <string name="ui_btn_continue">继续采集</string>
+    <string name="ui_btn_export_glb">导出 GLB</string>
+    <string name="ui_btn_export_stl">导出 STL</string>
+    <string name="ui_btn_recapture">重新采集</string>
+    <string name="ui_btn_retry">重试</string>
+    <string name="ui_btn_home">返回首页</string>
+
+    <!-- 诊断 / 提示 -->
+    <string name="ui_hint_preview">将物体置于画面中央，然后点击「开始采集」</string>
+    <string name="ui_hint_capturing">缓慢环绕物体一周，确保各方位都被采到</string>
+    <string name="ui_hint_reviewing">自检中 · 请确认采集充分后重建</string>
+    <string name="ui_hint_processing">正在运行多阶段重建，可能需要数分钟</string>
+    <string name="ui_hint_completed">模型已生成，可导出 GLB 或 STL</string>
+    <string name="ui_hint_failed">操作失败，请查看日志或重试</string>
+    <string name="ui_diag_label">诊断 · 相机回调 / 已采 / 被拒</string>
+    <string name="ui_export_note">导出路径</string>
+    <string name="ui_progress_label">进度</string>
+    <string name="ui_abi_mismatch">ABI 版本不匹配</string>
 </resources>
