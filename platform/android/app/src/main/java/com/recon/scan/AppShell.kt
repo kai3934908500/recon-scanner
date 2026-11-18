@@ -47,6 +47,8 @@ internal class AppShell(
     private val onReplayGuide: () -> Unit,
     private val onDevMode: (Boolean) -> Unit,
     private val onGuideDone: () -> Unit,
+    private val onResetSettings: () -> Unit,
+    private val onQualityTier: (Int) -> Unit,
     private val guideSummary: String = "",
 ) {
     private object C {
@@ -367,7 +369,7 @@ internal class AppShell(
         return row
     }
 
-    private val paramDefaults = mutableMapOf(
+    private val defaultParamValues = mutableMapOf(
         "sfm_feature_count" to 3000.0,
         "sfm_min_track_length" to 3.0,
         "vio_feature_count" to 300.0,
@@ -377,6 +379,7 @@ internal class AppShell(
         "cap_exposure_time_us" to 10000.0,
         "cap_iso" to 100.0,
     )
+    private val paramDefaults = defaultParamValues.toMutableMap()
     private val paramSteps = mutableMapOf(
         "sfm_feature_count" to 500.0,
         "sfm_min_track_length" to 1.0,
@@ -486,6 +489,54 @@ internal class AppShell(
 
         // 采集质量：全部是 params.h 里的真实 key，改值直接 setParam 进内核
         page.addView(sectionLabel(R.string.settings_section_quality))
+        // 采集画质档位（取景始终最高，此项只影响送内核帧）
+        val tierCard = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(C.SURFACE, C.BORDER)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, dp(8))
+            }
+        }
+        tierCard.addView(TextView(context).apply {
+            text = context.getString(R.string.settings_quality_tier)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+            setTextColor(C.SECOND)
+        })
+        val tierRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(8), 0, 0)
+            }
+        }
+        val tierLabels = listOf(R.string.settings_tier_smooth,
+            R.string.settings_tier_balanced, R.string.settings_tier_quality)
+        var currentTier = 1
+        tierLabels.forEachIndexed { idx, label ->
+            val b = makeSecondaryButton(label).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(dp(2), 0, dp(2), 0)
+                }
+                setButtonActive(this, idx == currentTier)
+                setOnClickListener {
+                    currentTier = idx
+                    tierLabels.forEachIndexed { i, _ -> setButtonActive(tierRow.getChildAt(i) as? Button, i == idx) }
+                    onQualityTier(idx)
+                }
+            }
+            tierRow.addView(b)
+        }
+        tierCard.addView(tierRow)
+        val tierHint = TextView(context).apply {
+            text = context.getString(R.string.settings_tier_hint)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
+            setTextColor(C.MUTED)
+            setPadding(0, dp(8), 0, 0)
+        }
+        tierCard.addView(tierHint)
+        page.addView(tierCard)
         val qualityCard = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(C.SURFACE, C.BORDER)
@@ -545,6 +596,38 @@ internal class AppShell(
         page.addView(devToggle)
         page.addView(TextView(context).apply {
             text = context.getString(R.string.settings_dev_hint)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
+            setTextColor(C.MUTED); setPadding(0, dp(4), 0, 0)
+        })
+
+        // 一键还原：所有参数/预设/对焦恢复出厂默认
+        page.addView(sectionLabel(R.string.settings_section_reset))
+        val resetBtn = makeSecondaryButton(R.string.settings_reset).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, dp(4))
+            }
+            setTextColor(Color.rgb(0xDC, 0x26, 0x26))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.WHITE)
+                setStroke(1, Color.rgb(0xDC, 0x26, 0x26)); cornerRadius = dp(8).toFloat() }
+            setOnClickListener {
+                // 复位本 UI 的所有控件状态
+                paramDefaults.putAll(defaultParamValues)
+                paramDefaults.keys.forEach { k -> paramValueTexts[k]?.text = paramDefaults[k]?.toInt()?.toString() ?: "—" }
+                setFocusUi(auto = true)
+                focusSeek?.progress = 0
+                devModeOn = false
+                setButtonActive(devToggle, false)
+                presetButtons.forEach { (k, v) ->
+                    setButtonActive(v, k == 1)   // 默认均衡档
+                }
+                onResetSettings()
+            }
+        }
+        page.addView(resetBtn)
+        page.addView(TextView(context).apply {
+            text = context.getString(R.string.settings_reset_hint)
             setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
             setTextColor(C.MUTED); setPadding(0, dp(4), 0, 0)
         })
@@ -656,9 +739,14 @@ internal class AppShell(
         private val pages = listOf(
             R.string.guide_1_title to R.string.guide_1_body,
             R.string.guide_2_title to R.string.guide_2_body,
+            R.string.guide_tips_title to R.string.guide_tips_body,
             R.string.guide_3_title to R.string.guide_3_body,
             R.string.guide_4_title to R.string.guide_4_body,
         )
+        private val tips = listOf(
+            R.string.guide_tip_1, R.string.guide_tip_2,
+            R.string.guide_tip_3, R.string.guide_tip_4)
+        private val tipsBox: LinearLayout
         private val summaryCard: TextView
         private var index = 0
         private val title: TextView
@@ -699,6 +787,36 @@ internal class AppShell(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(18) }
             }
+            tipsBox = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                visibility = View.GONE
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(16) }
+            }
+            tips.forEachIndexed { i, res ->
+                tipsBox.addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    addView(TextView(context).apply {
+                        text = "${i + 1}"
+                        setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                        setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                        gravity = Gravity.CENTER
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            setColor(Color.rgb(0x25, 0x63, 0xEB)); cornerRadius = dp(999).toFloat() }
+                        layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
+                    })
+                    addView(TextView(context).apply {
+                        text = context.getString(res)
+                        setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                        setTextColor(Color.rgb(0x6B, 0x72, 0x80))
+                        setPadding(dp(10), 0, 0, 0)
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    })
+                })
+            }
             nextBtn = Button(context).apply {
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(15).toFloat())
@@ -726,6 +844,7 @@ internal class AppShell(
             })
             box.addView(title)
             box.addView(body)
+            box.addView(tipsBox)
             box.addView(summaryCard)
             box.addView(nextBtn)
             box.addView(skipBtn)
@@ -736,6 +855,7 @@ internal class AppShell(
         private fun render() {
             title.text = context.getString(pages[index].first)
             body.text = context.getString(pages[index].second)
+            tipsBox.visibility = if (pages[index].first == R.string.guide_tips_title) View.VISIBLE else View.GONE
             val showSummary = index == pages.size - 1 && summary.isNotEmpty()
             summaryCard.visibility = if (showSummary) View.VISIBLE else View.GONE
             if (showSummary) summaryCard.text = summary

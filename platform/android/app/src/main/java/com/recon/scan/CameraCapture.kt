@@ -85,6 +85,8 @@ internal class CameraCapture(
 
     private var width = 0
     private var height = 0
+    private var previewW = 0
+    private var previewH = 0
     private var started = false
 
     /** 相机传感器安装角；用于把横向预览旋转到竖屏并居中裁剪（修"图像压扁"）。 */
@@ -149,19 +151,19 @@ internal class CameraCapture(
      */
     private fun configureTransform(viewW: Int, viewH: Int) {
         val tv = textureView ?: return
-        if (viewW <= 0 || viewH <= 0 || width <= 0 || height <= 0) return
+        if (viewW <= 0 || viewH <= 0 || previewW <= 0 || previewH <= 0) return
         val rotation = (context as? android.app.Activity)?.windowManager?.defaultDisplay?.rotation
             ?: Surface.ROTATION_0
         val matrix = Matrix()
         val viewRect = android.graphics.RectF(0f, 0f, viewW.toFloat(), viewH.toFloat())
         // buffer 用「高×宽」——这是 AOSP 原文的口径（预览尺寸存的是横屏 w×h）
-        val bufferRect = android.graphics.RectF(0f, 0f, height.toFloat(), width.toFloat())
+        val bufferRect = android.graphics.RectF(0f, 0f, previewH.toFloat(), previewW.toFloat())
         val cx = viewRect.centerX()
         val cy = viewRect.centerY()
         if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
             bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY())
             matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = max(viewH.toFloat() / height.toFloat(), viewW.toFloat() / width.toFloat())
+            val scale = max(viewH.toFloat() / previewH.toFloat(), viewW.toFloat() / previewW.toFloat())
             matrix.postScale(scale, scale, cx, cy)
             matrix.postRotate((90 * (rotation - 2)).toFloat(), cx, cy)
         } else if (rotation == Surface.ROTATION_180) {
@@ -221,6 +223,7 @@ internal class CameraCapture(
             characteristics = chars
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
+            // 采集尺寸（送内核重建）——按画质档位，避免 4K 每帧 48MB 拖垮内存。
             val size = pickSize(chars)
             width = size.width
             height = size.height
@@ -229,7 +232,12 @@ internal class CameraCapture(
             cx = width / 2.0
             cy = height / 2.0
 
-            surfaceTexture.setDefaultBufferSize(width, height)
+            // 预览尺寸（只显示、不存）——取相机最大 YUV 尺寸，最高画质取景。
+            // Camera2 允许一个 session 内 preview / ImageReader 两个不同尺寸的 surface。
+            val previewSize = maxPreviewSize(chars)
+            previewW = previewSize.width
+            previewH = previewSize.height
+            surfaceTexture.setDefaultBufferSize(previewW, previewH)
             val tv = textureView
             if (tv != null) configureTransform(tv.width, tv.height)
             val preview = Surface(surfaceTexture)
@@ -375,13 +383,27 @@ internal class CameraCapture(
         intrinsicsReady = true
     }
 
+    /** 取景预览固定用相机最大 YUV 尺寸（最高画质，只显示不存）。 */
+    private fun maxPreviewSize(chars: CameraCharacteristics): Size {
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+        return sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(1920, 1080)
+    }
+
+    /** 采集画质档：0 流畅(720p) / 1 均衡(1080p) / 2 高画质(最大)。 */
+    @Volatile private var qualityTier = 1
+
+    fun setQualityTier(tier: Int) { qualityTier = tier.coerceIn(0, 2) }
+
     private fun pickSize(chars: CameraCharacteristics): Size {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
         if (sizes.isEmpty()) return Size(1280, 720)
-        // 1280×720：足够几何精度，同时避免 4K 每帧 KB 级拷贝拖垮采集。
-        val target = 1280 * 720
-        return sizes.minByOrNull { abs(it.width * it.height - target) } ?: sizes[0]
+        return when (qualityTier) {
+            0 -> { val t = 1280 * 720; sizes.minByOrNull { abs(it.width * it.height - t) } ?: sizes[0] }
+            1 -> { val t = 1920 * 1080; sizes.minByOrNull { abs(it.width * it.height - t) } ?: sizes[0] }
+            else -> sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: sizes[0]
+        }
     }
 
     private fun drain(r: ImageReader) {

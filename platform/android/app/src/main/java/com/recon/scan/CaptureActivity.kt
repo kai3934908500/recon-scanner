@@ -89,6 +89,8 @@ class CaptureActivity : ComponentActivity() {
             onReplayGuide = { replayGuide() },
             onDevMode = { on -> toggleDevMode(on) },
             onGuideDone = { restartCameraIfNeeded() },
+            onResetSettings = { resetAllSettings() },
+            onQualityTier = { tier -> setQualityTier(tier) },
             guideSummary = guideSummary,
         )
         setContentView(shell.root)
@@ -135,6 +137,37 @@ class CaptureActivity : ComponentActivity() {
         getSharedPreferences("recon_prefs", MODE_PRIVATE).edit()
             .putBoolean("guide_seen", false).apply()
         shell.showGuide()
+    }
+
+    private fun setQualityTier(tier: Int) {
+        // 画质档改变需重开相机（采集 ImageReader 尺寸在 openCamera 时定）
+        lifecycleScope.launch {
+            val wasCapturing = CaptureEventBridge.currentState() ==
+                CaptureEventBridge.STATE_CAPTURING
+            withContext(Dispatchers.Main.immediate) {
+                releaseCamera()
+                camera = CameraCapture(
+                    context = this@CaptureActivity,
+                    onPreviewView = { view -> ui.attachPreview(view) },
+                    onFrame = { frame -> ingest(frame) },
+                    onDiagnostic = { msg -> mainHandler.post { cameraNote = msg; renderNow() } },
+                )
+                camera?.setQualityTier(tier)
+                camera?.setIngest(wasCapturing)
+                camera?.start()
+            }
+        }
+    }
+
+    private fun resetAllSettings() {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                if (captureContext != 0L) NativeBridge.applyPreset(captureContext, 1)
+            }
+            focusMode = 0
+            lastFocusDistance = 0f
+            toast(getString(R.string.settings_reset_done))
+        }
     }
 
     private var devMode = false
@@ -246,6 +279,9 @@ class CaptureActivity : ComponentActivity() {
     }
 
     /** 相机线程：YUV→BGRA 已完成，这里只做内核投递与诊断计数。 */
+    /** 单会话最多送内核的帧数：SfM 是 O(n²)，240 帧足够且避免真机卡死。 */
+    private val maxFramesToCore = 240
+
     private fun ingest(frame: CapturedFrame) {
         arrivedFrames++
         val ctx = captureContext
@@ -253,6 +289,10 @@ class CaptureActivity : ComponentActivity() {
             CaptureEventBridge.currentState() != CaptureEventBridge.STATE_CAPTURING) {
             rejectedFrames++
             return
+        }
+        if (ingestedFrames >= maxFramesToCore) {
+            rejectedFrames++
+            return   // 帧上限：预览继续，但不再送内核（避免 SfM O(n²) 卡死）
         }
         val status = NativeBridge.pushFrame(
             ctx, nextFrameId++, frame.timestampNs,

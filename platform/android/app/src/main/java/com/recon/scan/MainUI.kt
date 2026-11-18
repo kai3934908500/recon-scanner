@@ -685,6 +685,7 @@ internal class MainUI(
             orientation = VERTICAL
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(8).toFloat() }
+            if (android.os.Build.VERSION.SDK_INT >= 21) elevation = dp(1).toFloat()
             setPadding(dp(14), dp(12), dp(14), dp(13))
             addView(TextView(context).apply {
                 text = title

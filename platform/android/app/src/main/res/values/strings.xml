@@ -160,6 +160,23 @@
     <string name="settings_on">开</string>
     <string name="settings_off">关</string>
     <string name="settings_applied">已应用</string>
+    <string name="settings_section_reset">恢复默认</string>
+    <string name="settings_reset">一键还原默认设置</string>
+    <string name="settings_reset_hint">所有参数、预设与对焦恢复出厂值</string>
+    <string name="settings_reset_done">已恢复默认设置</string>
+    <string name="settings_quality_tier">采集画质（送内核）</string>
+    <string name="settings_tier_smooth">流畅</string>
+    <string name="settings_tier_balanced">均衡</string>
+    <string name="settings_tier_quality">高画质</string>
+    <string name="settings_tier_hint">取景始终用最高画质；此项只影响送内核重建的帧</string>
+
+    <!-- 引导：扫描技巧 -->
+    <string name="guide_tips_title">拍出好模型的技巧</string>
+    <string name="guide_tips_body">专业扫描都遵循这四点，跟着做成功率最高。</string>
+    <string name="guide_tip_1">光线均匀明亮，避免强光直射与阴影</string>
+    <string name="guide_tip_2">缓慢环绕物体一周，各角度都要覆盖</string>
+    <string name="guide_tip_3">避免反光、透明或纯黑无纹理的物体</string>
+    <string name="guide_tip_4">距离保持 0.5–1 米，手机移动要平稳</string>
 
     <!-- 多阶段重建 -->
     <string name="stage_preprocess">帧预处理</string>
