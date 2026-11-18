@@ -42,12 +42,15 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.graphics.Matrix
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.widget.FrameLayout
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.max
 
 /** 交给 Activity 推给内核的一帧（已转 BGRA8，含该机实测内参）。 */
 internal data class CapturedFrame(
@@ -74,12 +77,18 @@ internal class CameraCapture(
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var previewSurface: Surface? = null
+    private var frameSurfaceRef: Surface? = null
+    private var focusMode = 0       // 0 自动 / 1 手动
+    private var focusDistance = 0f  // 屈光度
     private var cameraId: String? = null
     private var characteristics: CameraCharacteristics? = null
 
     private var width = 0
     private var height = 0
     private var started = false
+
+    /** 相机传感器安装角；用于把横向预览旋转到竖屏并居中裁剪（修"图像压扁"）。 */
+    private var sensorOrientation = 90
 
     /** 内核内参（从 CaptureResult/Characteristics 实测，不写死假值）。 */
     @Volatile private var fx = 0.0
@@ -90,6 +99,11 @@ internal class CameraCapture(
 
     /** 只有 Capturing 态才为 true；预览态仍持续 acquire/close 以免缓冲耗尽。 */
     @Volatile private var ingestEnabled = false
+
+    /** 相机打开失败标志：Activity 在前台恢复时据此自动重试（后台打开相机会被系统拒绝）。 */
+    @Volatile private var openFailed = false
+
+    fun hasError(): Boolean = openFailed
 
     fun setIngest(enabled: Boolean) {
         ingestEnabled = enabled && started
@@ -109,15 +123,52 @@ internal class CameraCapture(
                 FrameLayout.LayoutParams.MATCH_PARENT)
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) {
+                    configureTransform(w, h)
                     openCamera(s)
                 }
-                override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) = Unit
+                override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {
+                    configureTransform(w, h)
+                }
                 override fun onSurfaceTextureDestroyed(s: SurfaceTexture): Boolean = true
                 override fun onSurfaceTextureUpdated(s: SurfaceTexture) = Unit
             }
         }
         textureView = view
         onPreviewView(view)
+    }
+
+    /**
+     * 按相机预览宽高比 + 传感器安装角，对 TextureView 做旋转 + 居中裁剪。
+     * 这是修"图像被压扁"的关键：默认 TextureView 把 1280×720 横屏 buffer 直接
+     * 拉伸到竖屏 View，必然变形。center-crop 保证等比填充、不拉伸。
+     */
+    /**
+     * AOSP Camera2Basic 官方算法（逐字口径）：横屏设备才旋转；竖屏保持单位阵。
+     * 上一版错误地把 sensorOrientation 当旋转依据，在竖屏强行旋转 + 二次缩放，
+     * 导致画面被拉成条纹 —— 这是参赛真机实测暴露的缺陷，此处按官方修正。
+     */
+    private fun configureTransform(viewW: Int, viewH: Int) {
+        val tv = textureView ?: return
+        if (viewW <= 0 || viewH <= 0 || width <= 0 || height <= 0) return
+        val rotation = (context as? android.app.Activity)?.windowManager?.defaultDisplay?.rotation
+            ?: Surface.ROTATION_0
+        val matrix = Matrix()
+        val viewRect = android.graphics.RectF(0f, 0f, viewW.toFloat(), viewH.toFloat())
+        // buffer 用「高×宽」——这是 AOSP 原文的口径（预览尺寸存的是横屏 w×h）
+        val bufferRect = android.graphics.RectF(0f, 0f, height.toFloat(), width.toFloat())
+        val cx = viewRect.centerX()
+        val cy = viewRect.centerY()
+        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
+            bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(viewH.toFloat() / height.toFloat(), viewW.toFloat() / width.toFloat())
+            matrix.postScale(scale, scale, cx, cy)
+            matrix.postRotate((90 * (rotation - 2)).toFloat(), cx, cy)
+        } else if (rotation == Surface.ROTATION_180) {
+            matrix.postRotate(180f, cx, cy)
+        }
+        // 竖屏 ROTATION_0：保持单位阵，让 TextureView 按 buffer 自然铺满（系统已旋转对齐）
+        tv.setTransform(matrix)
     }
 
     /** 停止推帧并释放相机资源；可再次 start()。 */
@@ -168,6 +219,7 @@ internal class CameraCapture(
             cameraId = id
             val chars = manager.getCameraCharacteristics(id)
             characteristics = chars
+            sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
             val size = pickSize(chars)
             width = size.width
@@ -178,6 +230,8 @@ internal class CameraCapture(
             cy = height / 2.0
 
             surfaceTexture.setDefaultBufferSize(width, height)
+            val tv = textureView
+            if (tv != null) configureTransform(tv.width, tv.height)
             val preview = Surface(surfaceTexture)
             previewSurface = preview
 
@@ -192,21 +246,26 @@ internal class CameraCapture(
                 }
                 override fun onDisconnected(device: CameraDevice) {
                     onDiagnostic("相机断开连接")
+                    openFailed = true
                     device.close()
                     camera = null
                 }
                 override fun onError(device: CameraDevice, error: Int) {
                     onDiagnostic("相机打开失败 error=$error")
+                    openFailed = true
                     device.close()
                     camera = null
                 }
             }, h)
         } catch (e: CameraAccessException) {
             onDiagnostic("相机访问失败：${e.message}")
+            openFailed = true
         } catch (e: SecurityException) {
             onDiagnostic("相机权限被拒：${e.message}")
+            openFailed = true
         } catch (t: Throwable) {
             onDiagnostic("相机初始化异常：${t.message}")
+            openFailed = true
         }
     }
 
@@ -217,6 +276,7 @@ internal class CameraCapture(
         chars: CameraCharacteristics,
     ) {
         val h = handler ?: return
+        frameSurfaceRef = frameSurface
         try {
             device.createCaptureSession(
                 listOf(preview, frameSurface),
@@ -230,6 +290,7 @@ internal class CameraCapture(
                                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                                 set(CaptureRequest.NOISE_REDUCTION_MODE,
                                     CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+                                applyFocus(this)
                             }.build()
                         try {
                             s.setRepeatingRequest(request, object : CameraCaptureSession.CaptureCallback() {
@@ -250,15 +311,59 @@ internal class CameraCapture(
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
                         onDiagnostic("相机会话配置失败")
+                        openFailed = true
                     }
                 },
                 h)
         } catch (e: CameraAccessException) {
             onDiagnostic("相机会话创建失败：${e.message}")
+            openFailed = true
         }
     }
 
     /** fx/fy 用实测焦距与传感器物理尺寸算，绝不写死"看起来差不多"的假内参。 */
+    /** 对当前正在运行的预览请求应用对焦设置（设置页实时生效）。 */
+    fun setFocus(mode: Int, distanceDiopters: Float) {
+        focusMode = mode
+        focusDistance = distanceDiopters
+        val h = handler ?: return
+        h.post {
+            val dev = camera ?: return@post
+            val s = session ?: return@post
+            val frameSf = frameSurfaceRef ?: return@post
+            val previewSf = previewSurface ?: return@post
+            try {
+                val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                    addTarget(previewSf)
+                    addTarget(frameSf)
+                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                    set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+                    applyFocus(this)
+                }.build()
+                s.setRepeatingRequest(req, null, h)
+            } catch (e: CameraAccessException) {
+                onDiagnostic("对焦设置失败：${e.message}")
+            }
+        }
+    }
+
+    /** 把 focusMode/focusDistance 写进请求。手动模式需先确认硬件支持，不支持则如实留自动。 */
+    private fun applyFocus(builder: CaptureRequest.Builder) {
+        if (focusMode == 1) {
+            val chars = characteristics
+            val supported = chars?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+            val manual = CaptureRequest.CONTROL_AF_MODE_OFF
+            if (supported == null || supported.contains(manual)) {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, manual)
+                // 屈光度 → 焦距（米）= 1/D，D=0 表示无穷远
+                val focal = if (focusDistance <= 0f) Float.POSITIVE_INFINITY else 1f / focusDistance
+                builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focal)
+                return
+            }
+        }
+        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    }
+
     private fun readIntrinsics(result: TotalCaptureResult, chars: CameraCharacteristics) {
         val focal = result.get(CaptureResult.LENS_FOCAL_LENGTH) ?: return
         val sensor = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return

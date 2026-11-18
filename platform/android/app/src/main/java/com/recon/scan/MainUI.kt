@@ -70,6 +70,7 @@ internal class MainUI(
     private val progressWrap: LinearLayout
     private val progressBar: ProgressBarView
     private val progressText: TextView
+    private val stageList: LinearLayout
     private val statCard: Card
     private val statGrid: LinearLayout
     private val capCard: Card
@@ -77,6 +78,10 @@ internal class MainUI(
     private val resultCard: Card
     private val resultBody: LinearLayout
     private val diagText: TextView
+    private lateinit var headerBar: LinearLayout
+    private lateinit var infoScroll: ScrollView
+    private lateinit var bottomBar: LinearLayout
+    private var fullscreen = false
     private val buttonBar: LinearLayout
     private val buttons: Map<Action, Button>
 
@@ -145,6 +150,7 @@ internal class MainUI(
         }
         statusPill.addView(statusText)
         header.addView(statusPill)
+        headerBar = header
         column.addView(header)
         column.addView(View(context).apply {
             setBackgroundColor(C.BORDER)
@@ -216,6 +222,14 @@ internal class MainUI(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(6)).apply { setMargins(0, dp(10), 0, 0) }
         }
         progressWrap.addView(progressBar)
+        stageList = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(14), 0, 0)
+            }
+        }
+        progressWrap.addView(stageList)
         content.addView(progressWrap)
 
         statCard = Card(context, dp, context.getString(R.string.ui_section_overview))
@@ -245,6 +259,7 @@ internal class MainUI(
         content.addView(diagText)
 
         scroll.addView(content)
+        infoScroll = scroll
         column.addView(scroll)
 
         // ---- 底部主操作栏 ----
@@ -280,6 +295,7 @@ internal class MainUI(
             buttonBar.addView(btn)
         }
         bottom.addView(buttonBar)
+        bottomBar = bottom
         column.addView(bottom)
     }
 
@@ -291,6 +307,27 @@ internal class MainUI(
     fun attachPreview(view: View) {
         previewHost.removeAllViews()
         previewHost.addView(view)
+    }
+
+    /**
+     * 采集态切换为**全屏竖屏取景**：真正的大厂扫描体验。
+     * 全屏时隐藏品牌栏/信息流/流程条，取景器铺满整屏，只留顶部极简状态条与底部操作栏。
+     */
+    fun setCaptureFullscreen(on: Boolean) {
+        if (fullscreen == on) return
+        fullscreen = on
+        headerBar.visibility = if (on) View.GONE else View.VISIBLE
+        infoScroll.visibility = if (on) View.GONE else View.VISIBLE
+        stepper.visibility = if (on) View.GONE else View.VISIBLE
+        bottomBar.setPadding(0, dp(12), 0, if (on) dp(30) else dp(14))
+        previewHost.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            if (on) 0 else dp(196)).apply {
+            weight = if (on) 1f else 0f
+            setMargins(if (on) 0 else dp(16), if (on) 0 else dp(12),
+                       if (on) 0 else dp(16), 0)
+        }
+        previewHost.invalidate()
     }
 
     fun render(v: ViewState) {
@@ -314,6 +351,71 @@ internal class MainUI(
             btn.visibility = if (action in v.visibleActions) View.VISIBLE else View.GONE
         }
     }
+
+    /**
+     * 渲染多阶段重建明细。stage 是 recon_stage 枚举值，progress 是**总进度** [0,1]。
+     * 用总进度推算各阶段：stage 之前的算完成、当前阶段按 stage 内插值、之后等待。
+     * 让用户在长耗时重建时能看到"走到哪一步、每步完成度"，而不是干等一个百分比。
+     */
+    fun renderStageDetail(stage: Int, progress: Double, message: String) {
+        val stages = intArrayOf(
+            R.string.stage_preprocess, R.string.stage_vio, R.string.stage_sfm,
+            R.string.stage_bundle, R.string.stage_mvs, R.string.stage_fusion,
+            R.string.stage_mesh, R.string.stage_postproc, R.string.stage_texture,
+            R.string.stage_scale, R.string.stage_export)
+        stageList.removeAllViews()
+        val activeIndex = (stage - 1).coerceIn(0, stages.size - 1)
+        // 总进度按比例分配到 11 段；当前段内用 (progress*11 - activeIndex) 细分
+        val global = (progress * stages.size).toFloat()
+        for (i in stages.indices) {
+            val frac = when {
+                i < activeIndex -> 1f
+                i == activeIndex -> (global - i).coerceIn(0f, 1f)
+                else -> 0f
+            }
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    setMargins(0, 0, 0, dp(7))
+                }
+            }
+            val mark = TextView(context).apply {
+                text = if (frac >= 1f) "✓" else if (i == activeIndex) "●" else "○"
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
+                setTextColor(if (frac >= 1f) C.OK else if (i == activeIndex) C.ACCENT else C.TEXT_MUTED)
+                layoutParams = LinearLayout.LayoutParams(dp(18), ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+            val name = TextView(context).apply {
+                text = context.getString(stages[i])
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
+                setTextColor(if (i <= activeIndex) C.TEXT_PRIMARY else C.TEXT_MUTED)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val pct = TextView(context).apply {
+                text = "${(frac * 100).toInt()}%"
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
+                setTextColor(if (i == activeIndex) C.ACCENT else C.TEXT_MUTED)
+                layoutParams = LinearLayout.LayoutParams(dp(38), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.END
+                }
+            }
+            row.addView(mark); row.addView(name); row.addView(pct)
+            stageList.addView(row)
+        }
+        if (message.isNotEmpty()) {
+            stageList.addView(TextView(context).apply {
+                text = message
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
+                setTextColor(C.TEXT_MUTED)
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+    }
+
+    /** 重建结束后清空阶段明细。 */
+    fun clearStageDetail() { stageList.removeAllViews() }
 
     private fun renderPairs(host: LinearLayout, contentText: String) {
         host.removeAllViews()

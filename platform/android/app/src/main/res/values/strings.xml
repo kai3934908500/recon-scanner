@@ -89,4 +89,89 @@
     <string name="ui_badge_version">v1.0</string>
     <string name="ui_section_overview">采集概览</string>
     <string name="ui_next_hint">下一步</string>
+
+    <!-- 底部导航 -->
+    <string name="tab_scan">扫描</string>
+    <string name="tab_projects">项目</string>
+    <string name="tab_params">参数</string>
+    <string name="tab_settings">设置</string>
+
+    <!-- 引导页 -->
+    <string name="guide_1_title">欢迎使用 recon</string>
+    <string name="guide_1_body">纯本地三维扫描建模。所有图像与模型只留在你的设备上，不上传、不联网。</string>
+    <string name="guide_2_title">环绕采集</string>
+    <string name="guide_2_body">把物体置于画面中央，点击「开始采集」后缓慢环绕一周，让各个方位都被采到。</string>
+    <string name="guide_3_title">重建与导出</string>
+    <string name="guide_3_body">采集结束后确认重建，等待多阶段处理完成，即可导出 GLB / STL 模型。</string>
+    <string name="guide_4_title">为你的设备优化</string>
+    <string name="guide_4_body">我们已检测本机能力并推荐了合适的采集档位。你可以在「参数」页随时调整。</string>
+    <string name="guide_next">下一步</string>
+    <string name="guide_start">开始使用</string>
+    <string name="guide_skip">跳过</string>
+
+    <!-- 项目页 -->
+    <string name="projects_title">我的项目</string>
+    <string name="projects_empty">还没有项目</string>
+    <string name="projects_empty_body">完成一次扫描后，模型会出现在这里</string>
+    <string name="projects_current">当前会话模型</string>
+    <string name="projects_go_scan">去扫描</string>
+
+    <!-- 参数页 -->
+    <string name="params_title">采集与重建参数</string>
+    <string name="params_preset">精度预设</string>
+    <string name="params_preset_balanced">均衡</string>
+    <string name="params_preset_quality">高精度</string>
+    <string name="params_preset_fast">快速</string>
+    <string name="params_section_sfm">稀疏重建</string>
+    <string name="params_sfm_features">SfM 特征点数</string>
+    <string name="params_sfm_track">最小轨迹长度</string>
+    <string name="params_section_vio">视觉惯性</string>
+    <string name="params_vio_features">VIO 特征点数</string>
+    <string name="params_section_mesh">网格化</string>
+    <string name="params_mesh_poisson">泊松深度</string>
+    <string name="params_hint">参数在下次重建时生效；精度越高耗时越长。</string>
+    <string name="params_applied">参数已应用</string>
+
+    <!-- 设置页 -->
+    <string name="settings_title">设置</string>
+    <string name="settings_section_capture">采集</string>
+    <string name="settings_focus_mode">对焦模式</string>
+    <string name="settings_focus_auto">自动对焦</string>
+    <string name="settings_focus_manual">手动对焦</string>
+    <string name="settings_focus_distance">对焦距离</string>
+    <string name="settings_focus_near">近</string>
+    <string name="settings_focus_far">远</string>
+    <string name="settings_section_guide">引导</string>
+    <string name="settings_replay_guide">重新观看引导</string>
+    <string name="settings_section_advanced">高级</string>
+    <string name="settings_dev_mode">开发者模式</string>
+    <string name="settings_dev_hint">显示帧计数、内参与诊断信息</string>
+    <string name="settings_section_about">关于</string>
+    <string name="settings_about_body">recon · 纯本地三维扫描建模\n版本 1.0 · 所有处理均在设备端完成</string>
+
+    <!-- 设置页：真实采集参数（连 C ABI setParam） -->
+    <string name="settings_section_quality">采集质量</string>
+    <string name="settings_resolution">预览分辨率宽度</string>
+    <string name="settings_framerate">目标帧率</string>
+    <string name="settings_exposure">曝光时间 (µs)</string>
+    <string name="settings_iso">感光度 ISO</string>
+    <string name="settings_imu_enabled">启用惯性传感器</string>
+    <string name="settings_imu_hint">关闭后走纯视觉位姿；有 IMU 时建议开启</string>
+    <string name="settings_on">开</string>
+    <string name="settings_off">关</string>
+    <string name="settings_applied">已应用</string>
+
+    <!-- 多阶段重建 -->
+    <string name="stage_preprocess">帧预处理</string>
+    <string name="stage_vio">视觉惯性位姿</string>
+    <string name="stage_sfm">稀疏点云重建</string>
+    <string name="stage_bundle">全局光束平差</string>
+    <string name="stage_mvs">稠密深度估计</string>
+    <string name="stage_fusion">深度融合</string>
+    <string name="stage_mesh">网格化</string>
+    <string name="stage_postproc">后处理</string>
+    <string name="stage_texture">纹理烘焙</string>
+    <string name="stage_scale">尺度标定</string>
+    <string name="stage_export">导出</string>
+    <string name="stage_done">完成</string>
 </resources>

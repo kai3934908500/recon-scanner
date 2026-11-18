@@ -40,6 +40,7 @@ class CaptureActivity : ComponentActivity() {
 
     private var captureContext: Long = 0L
     private lateinit var ui: MainUI
+    private lateinit var shell: AppShell
 
     /** 相机链路诊断计数：回调到达 / 成功投递内核 / 被拒（缺口 AV 同口径）。 */
     @Volatile private var arrivedFrames = 0
@@ -50,6 +51,10 @@ class CaptureActivity : ComponentActivity() {
     private var camera: CameraCapture? = null
     private var cameraNote: String = ""
     private var nextFrameId: Long = 1L
+
+    /** 相机只能在 Activity 处于前台时打开；真机实测后台 openCamera 会被系统拒绝。 */
+    private var activityResumed = false
+    private var pendingCameraStart = false
 
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
@@ -68,10 +73,74 @@ class CaptureActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ui = MainUI(this) { action -> onAction(action) }
-        setContentView(ui.root)
+        val probe = DeviceProbe.probe(this)
+        val branch = if (probe.hasTof) "支持硬件深度" else "单目视觉"
+        val imu = if (probe.hasImu) "惯性传感器可用" else "无惯性传感器"
+        val guideSummary = "设备检测：$branch · $imu\n" +
+            "最大分辨率 ${probe.maxImageWidth}×${probe.maxImageHeight}\n" +
+            "推荐档位：均衡（可在参数页调整）"
+        shell = AppShell(
+            context = this,
+            scanUI = ui,
+            onPreset = { id -> applyPreset(id) },
+            onParam = { key, intVal, doubleVal -> setParam(key, intVal, doubleVal) },
+            onFocusMode = { mode -> setFocusMode(mode) },
+            onFocusDistance = { d -> setFocusDistance(d) },
+            onReplayGuide = { replayGuide() },
+            onDevMode = { on -> toggleDevMode(on) },
+            onGuideDone = { restartCameraIfNeeded() },
+            guideSummary = guideSummary,
+        )
+        setContentView(shell.root)
 
         // T-01：Idle → CapabilityProbe（经状态机），随后探测 → T-02 申请权限。
         onEvent(CaptureEventBridge.START_SCAN)
+    }
+
+    // ---- AppShell 回调：全部连真实功能，不做假按钮 ------------------------
+    private fun applyPreset(id: Int) {
+        lifecycleScope.launch {
+            val status = withContext(Dispatchers.IO) {
+                if (captureContext == 0L) ReconStatus.ERR_INVALID_ARGUMENT
+                else NativeBridge.applyPreset(captureContext, id)
+            }
+            toast(getString(if (status == ReconStatus.OK)
+                R.string.params_applied else R.string.ui_hint_failed))
+        }
+    }
+
+    private fun setParam(key: String, intVal: Int, doubleVal: Double) {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                if (captureContext != 0L) NativeBridge.setParam(captureContext, key, intVal, doubleVal)
+            }
+        }
+    }
+
+    private var focusMode = 0
+    private fun setFocusMode(mode: Int) {
+        focusMode = mode
+        // 把当前模式重新应用到正在运行的预览请求
+        camera?.setFocus(mode, lastFocusDistance)
+    }
+
+    private var lastFocusDistance = 0f
+    private fun setFocusDistance(d: Float) {
+        lastFocusDistance = d
+        if (focusMode == 1) camera?.setFocus(focusMode, d)
+    }
+
+    private fun replayGuide() {
+        // 清掉"已看过"标记并重建 AppShell 的引导层显示
+        getSharedPreferences("recon_prefs", MODE_PRIVATE).edit()
+            .putBoolean("guide_seen", false).apply()
+        shell.showGuide()
+    }
+
+    private var devMode = false
+    private fun toggleDevMode(on: Boolean) {
+        devMode = on
+        renderNow()
     }
 
     // ------------------------------------------------------------------- //
@@ -160,7 +229,9 @@ class CaptureActivity : ComponentActivity() {
         stopStatsPolling()
         ensureCamera()
         camera?.setIngest(false)
-        camera?.start()
+        // ⚠️ 切前台后再开相机：onCreate 阶段进程可能仍是后台态，
+        // 此刻 openCamera 会被 Android 以 CAMERA_DISABLED(1) 拒绝（真机实测）。
+        if (activityResumed) camera?.start() else pendingCameraStart = true
         renderNow()
     }
 
@@ -242,6 +313,7 @@ class CaptureActivity : ComponentActivity() {
                             mainHandler.post {
                                 lastProgressFraction = progress.coerceIn(0.0, 1.0).toFloat()
                                 lastProgress = "阶段 $stage · ${(progress * 100).toInt()}% · $message"
+                                ui.renderStageDetail(stage, progress, message)
                                 renderNow()
                             }
                         }
@@ -251,9 +323,14 @@ class CaptureActivity : ComponentActivity() {
                 lastMesh = withContext(Dispatchers.IO) {
                     NativeBridge.getMeshInfo(captureContext)?.let { MeshInfo.fromArray(it) }
                 }
+                shell.setResultSummary(lastMesh?.let {
+                    "${it.vertexCount} 顶点 · ${it.triangleCount} 三角面 · 非流形边 ${it.nonManifoldEdges}"
+                } ?: getString(R.string.projects_empty_body))
+                ui.clearStageDetail()
                 onEvent(CaptureEventBridge.RECONSTRUCTION_SUCCEEDED)
             } else {
                 Log.e(TAG, "重建失败 status=$status")
+                ui.clearStageDetail()
                 CaptureEventBridge.setFailureStage(CaptureEventBridge.FAILURE_RECONSTRUCTION)
                 onEvent(CaptureEventBridge.RECONSTRUCTION_FAILED)
             }
@@ -354,6 +431,10 @@ class CaptureActivity : ComponentActivity() {
         }
 
         val current = CaptureEventBridge.currentState()
+        // 采集态进入全屏竖屏取景（大厂扫描体验）；其余态回到信息面板。
+        val isCapturing = current == CaptureEventBridge.STATE_CAPTURING
+        ui.setCaptureFullscreen(isCapturing)
+        if (::shell.isInitialized) shell.setCaptureFullscreen(isCapturing)
         // 四段式流程：0 设备准备 / 1 环绕采集 / 2 三维重建 / 3 成果导出
         val step = when (current) {
             CaptureEventBridge.STATE_IDLE,
@@ -444,12 +525,40 @@ class CaptureActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        activityResumed = false
         onEvent(CaptureEventBridge.APP_BACKGROUNDED)
     }
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         CaptureEventBridge.clearPaused()
+        restartCameraIfNeeded()
+    }
+
+    /**
+     * 前台后确保相机可用：待启动标志消费，或对曾打开失败的相机完整重建。
+     * 引导层遮挡期间的相机启动会被系统判后台而拒绝，引导结束后必须重试。
+     */
+    private fun restartCameraIfNeeded() {
+        if (!activityResumed) return
+        if (pendingCameraStart) {
+            pendingCameraStart = false
+            camera?.start()
+        } else if (camera?.hasError() == true || camera == null) {
+            val st = CaptureEventBridge.currentState()
+            if (st == CaptureEventBridge.STATE_PREVIEWING ||
+                st == CaptureEventBridge.STATE_CAPTURING) {
+                val ingesting = st == CaptureEventBridge.STATE_CAPTURING
+                cameraNote = ""
+                releaseCamera()
+                ensureCamera()
+                camera?.setIngest(ingesting)
+                camera?.start()
+                arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
+                renderNow()
+            }
+        }
     }
 
     override fun onDestroy() {
