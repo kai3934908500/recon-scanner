@@ -50,6 +50,11 @@ struct SfmConfig {
   int max_num_neighbors = 80;           // 匹配图最大候选邻居数（MM-2）
   double spatial_neighbor_angle_deg = 45.0;  // 空间近邻的方位差上限（MM-2）
   int neighbor_sequence_span = 3;       // 序列邻接跨距（MM-1，i 与 i+1..i+span）
+  // MM-3：视觉近邻回环（ORB-SLAM3 词袋思想的轻量实现，无位姿时启用）。
+  // 用描述子互匹配比例衡量帧相似度，让环绕回环处（序列远但视角近）的帧建边。
+  bool visual_loop_enabled = true;
+  int visual_loop_max_neighbors = 6;    // 每帧最多加几条视觉回环边（防边爆炸）
+  double visual_loop_min_similarity = 0.06;  // 帧相似度下限（互匹配内点比例）
 
   // 几何验证 RANSAC（§4.3.3）
   double f_threshold_px = 1.5;      // F 矩阵 Sampson 阈值（像素）

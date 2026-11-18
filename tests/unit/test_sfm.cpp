@@ -577,6 +577,50 @@ void TestMatchingRotationInvariant() {
 // ---------------------------------------------------------------------------
 // 9. 匹配图结构：MM-1 序列邻接 + 上限（MM-4）
 // ---------------------------------------------------------------------------
+// MM-3 视觉回环（ORB-SLAM3 词袋思想轻量实现）测试。
+// 负向注入：关闭 visual_loop 后回环边必须消失 —— 证明判据确实在检验 MM-3。
+void TestVisualLoopClosure() {
+  std::printf("[TEST] 视觉回环边（MM-3）\n");
+  const int n = 6;
+  std::vector<recon::SfmFeatureSet> sets(static_cast<size_t>(n));
+
+  // 可解析回环：帧 0 与帧 5 有完全相同的 20 个描述子（模拟环绕一圈
+  // 回到起点看到同一物体）；其余帧描述子不同（视角不同）。
+  auto make_feats = [](uint8_t seed, bool loop) {
+    recon::SfmFeatureSet fs;
+    for (int k = 0; k < 20; ++k) {
+      recon::SfmFeature f;
+      f.uv = Vec2d(static_cast<double>(k * 17), static_cast<double>(k * 11));
+      f.descriptor.assign(128, loop ? static_cast<uint8_t>(seed + k)
+                                    : static_cast<uint8_t>((seed * 7 + k * 13) % 256));
+      fs.features.push_back(f);
+    }
+    return fs;
+  };
+  sets[0] = make_feats(3, true);
+  sets[5] = make_feats(3, true);
+  for (int i = 1; i < 5; ++i)
+    sets[static_cast<size_t>(i)] = make_feats(static_cast<uint8_t>(40 + i * 23), false);
+
+  auto has_edge = [](const std::vector<recon::SfmCandidatePair>& pairs, int i, int j) {
+    for (const auto& p : pairs) if (p.index0 == i && p.index1 == j) return true;
+    return false;
+  };
+
+  recon::SfmConfig cfg;
+  cfg.neighbor_sequence_span = 1;  // 序列只连相邻，(0,5) 只能靠 MM-3
+  cfg.visual_loop_enabled = true;
+  cfg.visual_loop_max_neighbors = 3;
+  cfg.visual_loop_min_similarity = 0.3;
+  const auto with_loop = recon::BuildMatchGraph(sets, nullptr, cfg);
+  Check(has_edge(with_loop, 0, 5), "开启视觉回环时 (0,5) 回环边应存在");
+
+  // 负向注入：关闭 MM-3，(0,5) 必须消失
+  cfg.visual_loop_enabled = false;
+  const auto without_loop = recon::BuildMatchGraph(sets, nullptr, cfg);
+  Check(!has_edge(without_loop, 0, 5), "关闭视觉回环时 (0,5) 边必须消失（负向注入）");
+}
+
 void TestMatchGraphStructure() {
   std::printf("[TEST] 匹配图结构\n");
   const int n = 6;
@@ -1139,6 +1183,7 @@ int main() {
   TestMatchingIdentity();
   TestMatchingRotationInvariant();
   TestMatchGraphStructure();
+  TestVisualLoopClosure();
   TestVerifyPairGeometry();
   TestAbsolutePoseExact();
   TestBundleAdjustConverges();

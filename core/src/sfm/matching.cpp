@@ -288,6 +288,55 @@ std::vector<SfmMatch> MatchFeatureSets(const SfmFeatureSet& a,
 // 匹配图
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// 轻量帧相似度（ORB-SLAM3 词袋回环思想的零依赖实现）。
+// 不做 139MB 词袋聚类，直接从两帧各采样有限个描述子，统计互为最近邻
+// 且距离小于阈值的比例。环绕回环处（序列远、视角近）相似度高，
+// 从而能被 BuildMatchGraph 加为候选边，解决 MONO 无位姿时只有序列邻接、
+// 第 1 帧与最后一帧（同一角度）永远匹配不上的问题。
+double ComputeFrameSimilarity(const SfmFeatureSet& a, const SfmFeatureSet& b,
+                              int sample_limit) {
+  const size_t na = a.features.size();
+  const size_t nb = b.features.size();
+  if (na == 0 || nb == 0) return 0.0;
+  const int sa = static_cast<int>(std::min(na, static_cast<size_t>(sample_limit)));
+  const int sb = static_cast<int>(std::min(nb, static_cast<size_t>(sample_limit)));
+  if (sa == 0 || sb == 0) return 0.0;
+
+  // 对 a 的采样描述子，在 b 的全部描述子里找最近距离，统计小于阈值的比例。
+  // 阈值用描述子维度相关的经验值：128 维 uint8 欧氏，好的匹配通常 < 60。
+  const double kGoodDist = 60.0;
+  int good = 0;
+  const double step_a = static_cast<double>(na) / sa;
+  for (int i = 0; i < sa; ++i) {
+    const auto& fa = a.features[static_cast<size_t>(i * step_a)];
+    double best = 1e30;
+    for (size_t j = 0; j < nb; ++j) {
+      const double d = DescriptorDistance(fa.descriptor, b.features[j].descriptor);
+      if (d < best) best = d;
+    }
+    if (best < kGoodDist) ++good;
+  }
+  // 双向一致性：反过来再查一次，取两者较小值（互为最近邻更可靠）。
+  int good_b = 0;
+  const double step_b = static_cast<double>(nb) / sb;
+  for (int j = 0; j < sb; ++j) {
+    const auto& fb = b.features[static_cast<size_t>(j * step_b)];
+    double best = 1e30;
+    for (size_t i = 0; i < na; ++i) {
+      const double d = DescriptorDistance(fb.descriptor, a.features[i].descriptor);
+      if (d < best) best = d;
+    }
+    if (best < kGoodDist) ++good_b;
+  }
+  const double ra = static_cast<double>(good) / sa;
+  const double rb = static_cast<double>(good_b) / sb;
+  return std::min(ra, rb);
+}
+
+}  // namespace
+
 std::vector<SfmCandidatePair> BuildMatchGraph(
     const std::vector<SfmFeatureSet>& sets, const std::vector<CameraPose>* poses,
     const SfmConfig& config) {
@@ -335,6 +384,29 @@ std::vector<SfmCandidatePair> BuildMatchGraph(
       const int lim = std::min<int>(config.max_num_neighbors,
                                     static_cast<int>(scored.size()));
       for (int k = 0; k < lim; ++k) add_edge(i, scored[static_cast<size_t>(k)].second);
+    }
+  }
+
+  // MM-3：视觉近邻回环（ORB-SLAM3 词袋思想，零依赖轻量实现）。
+  // 无位姿（MONO 无 IMU）时 MM-2 不启用，只有序列邻接 → 环绕一圈后
+  // 第 1 帧与最后一帧（同一角度）没有边、回环匹配不上。这里按帧相似度
+  // 给每帧补最多 visual_loop_max_neighbors 条视觉边，专挑序列距离远但
+  // 画面相似的帧（序列距离 < span 的已有边，跳过）。
+  if (config.visual_loop_enabled && poses == nullptr) {
+    const int sample_limit = 48;  // 每帧采样描述子数（限制 O(n²) 代价）
+    for (int i = 0; i < n; ++i) {
+      std::vector<std::pair<double, int>> sim;
+      for (int j = 0; j < n; ++j) {
+        if (i == j) continue;
+        if (std::abs(i - j) <= config.neighbor_sequence_span) continue;  // 已有序列边
+        const double s = ComputeFrameSimilarity(
+            sets[static_cast<size_t>(i)], sets[static_cast<size_t>(j)], sample_limit);
+        if (s >= config.visual_loop_min_similarity) sim.push_back({s, j});
+      }
+      std::sort(sim.rbegin(), sim.rend());  // 相似度降序
+      const int lim = std::min(config.visual_loop_max_neighbors,
+                               static_cast<int>(sim.size()));
+      for (int k = 0; k < lim; ++k) add_edge(i, sim[static_cast<size_t>(k)].second);
     }
   }
 
