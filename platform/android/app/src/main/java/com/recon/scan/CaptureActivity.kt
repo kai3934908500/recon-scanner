@@ -46,6 +46,11 @@ class CaptureActivity : ComponentActivity() {
     @Volatile private var ingestedFrames = 0
     @Volatile private var rejectedFrames = 0
 
+    /** Camera2 采集链：权限通过后创建，离开扫描链路后释放。 */
+    private var camera: CameraCapture? = null
+    private var cameraNote: String = ""
+    private var nextFrameId: Long = 1L
+
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
     private var reconJob: Job? = null
@@ -151,8 +156,44 @@ class CaptureActivity : ComponentActivity() {
         // 进入预览即重置 IMU 环形缓冲（规则本体在 platform/common）。
         ImuRingBuffer.reset()
         arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
+        cameraNote = ""
         stopStatsPolling()
+        ensureCamera()
+        camera?.setIngest(false)
+        camera?.start()
         renderNow()
+    }
+
+    private fun ensureCamera() {
+        if (camera != null) return
+        camera = CameraCapture(
+            context = this,
+            onPreviewView = { view -> ui.attachPreview(view) },
+            onFrame = { frame -> ingest(frame) },
+            onDiagnostic = { msg -> mainHandler.post { cameraNote = msg; renderNow() } },
+        )
+    }
+
+    /** 相机线程：YUV→BGRA 已完成，这里只做内核投递与诊断计数。 */
+    private fun ingest(frame: CapturedFrame) {
+        arrivedFrames++
+        val ctx = captureContext
+        if (ctx == 0L ||
+            CaptureEventBridge.currentState() != CaptureEventBridge.STATE_CAPTURING) {
+            rejectedFrames++
+            return
+        }
+        val status = NativeBridge.pushFrame(
+            ctx, nextFrameId++, frame.timestampNs,
+            frame.bgra, frame.width, frame.height, frame.width * 4,
+            null, 0, 0, null,
+            0,  // RECON_DEPTH_SRC_NONE（本机型 MONO 分支）
+            frame.fx, frame.fy, frame.cx, frame.cy,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            null, null, frame.timestampNs,
+            null, 0,
+            0.0, 0.0)
+        if (status == ReconStatus.OK) ingestedFrames++ else rejectedFrames++
     }
 
     private fun startCapture() {
@@ -169,12 +210,15 @@ class CaptureActivity : ComponentActivity() {
                 return@launch
             }
             startStatsPolling()
+            ensureCamera()
+            camera?.setIngest(true)
             renderNow()
         }
     }
 
     private fun onReviewing() {
         stopStatsPolling()
+        camera?.setIngest(false)  // 保留预览，用户可选 CONTINUE 继续扫描
         // 采集统计作为自检依据的如实呈现；具体判据由 native 侧后续版本接入。
         lastStats = if (captureContext != 0L) NativeBridge.getScanStats(captureContext)
                         ?.let { ScanStats.fromArray(it) } else null
@@ -212,17 +256,25 @@ class CaptureActivity : ComponentActivity() {
 
     private fun onCompleted() {
         stopStatsPolling()
+        releaseCamera()
         renderNow()
     }
 
     private fun onFailed() {
         stopStatsPolling()
+        releaseCamera()
         renderNow()
     }
 
     private fun onCancelled() {
         stopStatsPolling()
+        releaseCamera()
         renderNow()
+    }
+
+    private fun releaseCamera() {
+        camera?.shutdown()
+        camera = null
     }
 
     // ------------------------------------------------------------------- //
@@ -298,8 +350,14 @@ class CaptureActivity : ComponentActivity() {
             stateLabel = state,
             hint = hint,
             progress = lastProgress,
-            diag = "${getString(R.string.ui_diag_label)}：$arrivedFrames / $ingestedFrames / $rejectedFrames" +
-                   if (lastExportNote.isNotEmpty()) "\n$lastExportNote" else "",
+            diag = buildString {
+                append(getString(R.string.ui_diag_label)).append("：")
+                    .append(arrivedFrames).append(" / ")
+                    .append(ingestedFrames).append(" / ")
+                    .append(rejectedFrames)
+                if (cameraNote.isNotEmpty()) append("\n").append(cameraNote)
+                if (lastExportNote.isNotEmpty()) append("\n").append(lastExportNote)
+            },
             capability = formatCapability(),
             stats = formatStats(),
             result = formatResult(),
@@ -363,6 +421,7 @@ class CaptureActivity : ComponentActivity() {
     override fun onDestroy() {
         stopStatsPolling()
         reconJob?.cancel()
+        releaseCamera()
         if (captureContext != 0L) {
             NativeBridge.destroy(captureContext)
             captureContext = 0L

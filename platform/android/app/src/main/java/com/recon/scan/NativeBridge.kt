@@ -109,6 +109,32 @@ object NativeBridge {
     /** 对应 recon_start_session()。 */
     external fun startSession(context: Long, sessionId: String): Int
 
+    // --------------------------------------------------------------------- //
+    // 采集帧转换（平台层工具，不是 core C ABI）
+    // --------------------------------------------------------------------- //
+
+    /**
+     * 把 Android `ImageReader` 的 YUV_420_888 三平面转成**紧密 BGRA8**。
+     *
+     * ⚠️ 这不是 core C ABI 函数，而是平台↔native 的搬运入口：
+     * Kotlin 侧只做**内存布局紧凑化**（去 rowStride / 解交错），色彩数学在
+     * `platform/common/src/yuv_convert.cpp`（跨平台唯一实现）。禁止在本侧写
+     * 任何 BT.601/709 系数 —— `check_platform_parity.py` 闸门 8 会拒收。
+     *
+     * 本采集器统一输出 I420（真平面）：Cb/Cr 各自紧凑，
+     * `cbStride == crStride == width/2`；semiPlanar=false。
+     *
+     * @return 长度 `width*height*4` 的 BGRA8；布局非法或分配失败返回 null。
+     */
+    external fun yuvToBgra(
+        yPlane: ByteArray, yStride: Int,
+        cbPlane: ByteArray, cbStride: Int,
+        crPlane: ByteArray, crStride: Int,
+        width: Int, height: Int,
+        semiPlanar: Boolean, cbFirst: Boolean,
+        bt709: Boolean, fullRange: Boolean
+    ): ByteArray?
+
     /**
      * 对应 recon_push_frame()。
      *

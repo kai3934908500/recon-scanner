@@ -18,6 +18,9 @@
 #include <vector>
 
 #include "recon/recon_c_api.h"
+// YUV→BGRA 色彩数学在 platform/common（跨平台唯一实现），本层只做 JNI 类型搬运。
+// 不得在本文件内联任何矩阵系数（check_platform_parity.py 闸门 8 会拒收）。
+#include "recon_platform/yuv_convert.h"
 
 namespace {
 
@@ -629,6 +632,76 @@ JNIEXPORT jint JNICALL
 Java_com_recon_scan_NativeBridge_isCancelled(JNIEnv*, jobject, jlong context) {
   if (context == 0) return 0;
   return static_cast<jint>(recon_is_cancelled(reinterpret_cast<void*>(context)));
+}
+
+// ---------------------------------------------------------------------------
+// YUV_420 → BGRA8（采集链）
+// ---------------------------------------------------------------------------
+// 采集帧来自 ImageReader 的 `YUV_420_888`：Y 全分辨率平面 + Cb/Cr 两个半分辨率
+// 平面。Android 机型的底层布局分两类：
+//   · **半平面**（NV12/NV21）：Cb、Cr 交错在同一块缓冲（pixelStride=2）；
+//   · **真平面**（I420）：Cb、Cr 各自独立（pixelStride=1）。
+// Kotlin 侧负责把三平面拷成紧凑字节数组并告知布局，本函数只调 platform/common
+// 的数学本体（唯一实现），**不含任何色彩系数**（闸门 8）。
+//
+// 返回紧密 BGRA8 数组（长度 = width*height*4）；失败返回 nullptr（调用方
+// 必须按 null 处理，不拿半幅图像顶替）。
+JNIEXPORT jbyteArray JNICALL
+Java_com_recon_scan_NativeBridge_yuvToBgra(
+    JNIEnv* env, jobject,
+    jbyteArray y_plane, jint y_stride,
+    jbyteArray cb_plane, jint cb_stride,
+    jbyteArray cr_plane, jint cr_stride,
+    jint width, jint height,
+    jboolean semi_planar, jboolean cb_first,
+    jboolean bt709, jboolean full_range) {
+  // 半平面布局下 Cb/Cr 共用一块交错缓冲，cr_stride 由 cb_stride 表述；
+  // 真平面布局下两者共享同一色度 stride。故本参数仅用于 JNI 位置对齐。
+  (void)cr_stride;
+  if (width <= 0 || height <= 0 || y_plane == nullptr) return nullptr;
+
+  std::vector<uint8_t> y_buf, cb_buf, cr_buf;
+  if (!CopyByteArray(env, y_plane, &y_buf)) return nullptr;
+  if (!CopyByteArray(env, cb_plane, &cb_buf)) return nullptr;
+  if (!CopyByteArray(env, cr_plane, &cr_buf)) return nullptr;
+
+  recon::platform::YuvToBgraParams params = recon::platform::MakeYuvToBgraParams(
+      bt709 ? recon::platform::ColorMatrix::kBt709
+            : recon::platform::ColorMatrix::kBt601,
+      full_range ? recon::platform::QuantRange::kFull
+                 : recon::platform::QuantRange::kLimited);
+  if (!params.valid) return nullptr;
+
+  recon::platform::YuvConvertResult result;
+  if (semi_planar) {
+    // 半平面：Cb/Cr 交错在 cb_buf 中，pixelStride=2；cr_buf 通常与 cb_buf 同源
+    // （Kotlin 侧把同一块二手拷进来），cr_stride 未用。
+    result = recon::platform::ConvertYuv420BiPlanarToBgra8(
+        y_buf.data(), static_cast<size_t>(y_stride),
+        cb_buf.data(), static_cast<size_t>(cb_stride),
+        static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+        cb_first == JNI_TRUE, params);
+  } else {
+    result = recon::platform::ConvertYuv420PlanarToBgra8(
+        y_buf.data(), static_cast<size_t>(y_stride),
+        cb_buf.data(), cr_buf.data(),
+        static_cast<size_t>(cb_stride),
+        static_cast<uint32_t>(width), static_cast<uint32_t>(height), params);
+  }
+  if (!result.ok) return nullptr;
+
+  const size_t n = result.frame.data.size();
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(n));
+  if (out == nullptr) return nullptr;
+  if (n > 0) {
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(n),
+                            reinterpret_cast<const jbyte*>(result.frame.data.data()));
+    if (env->ExceptionCheck()) {
+      env->DeleteLocalRef(out);
+      return nullptr;
+    }
+  }
+  return out;
 }
 
 }  // extern "C"

@@ -110,6 +110,7 @@ struct JNIEnv {
     // 数组（读取）
     jsize GetArrayLength(jarray);
     void  GetByteArrayRegion(jbyteArray, jsize, jsize, jbyte*);
+    void  SetByteArrayRegion(jbyteArray, jsize, jsize, const jbyte*);
     void  GetShortArrayRegion(jshortArray, jsize, jsize, jshort*);
     void  GetDoubleArrayRegion(jdoubleArray, jsize, jsize, jdouble*);
 
@@ -119,6 +120,7 @@ struct JNIEnv {
     void SetDoubleArrayRegion(jdoubleArray, jsize, jsize, const jdouble*);
 
     // 数组（创建）
+    jbyteArray   NewByteArray(jsize);
     jintArray    NewIntArray(jsize);
     jfloatArray  NewFloatArray(jsize);
     jdoubleArray NewDoubleArray(jsize);
