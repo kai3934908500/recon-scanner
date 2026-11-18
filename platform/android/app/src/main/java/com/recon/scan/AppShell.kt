@@ -692,7 +692,7 @@ internal class AppShell(
             setTextColor(Color.rgb(0xDC, 0x26, 0x26))
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(Color.WHITE)
-                setStroke(1, Color.rgb(0xDC, 0x26, 0x26)); cornerRadius = dp(8).toFloat() }
+                setStroke(1, Color.rgb(0xDC, 0x26, 0x26)); cornerRadius = dp(4).toFloat() }
             setOnClickListener {
                 // 复位本 UI 的所有控件状态
                 paramDefaults.putAll(defaultParamValues)
@@ -883,7 +883,7 @@ internal class AppShell(
                 setPadding(dp(14), dp(12), dp(14), dp(12))
                 background = android.graphics.drawable.GradientDrawable().apply {
                     setColor(Color.rgb(0xEF, 0xF6, 0xFF))
-                    setStroke(1, Color.rgb(0xDB, 0xEA, 0xFE)); cornerRadius = dp(8).toFloat() }
+                    setStroke(1, Color.rgb(0xDB, 0xEA, 0xFE)); cornerRadius = dp(4).toFloat() }
                 visibility = View.GONE
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -907,7 +907,7 @@ internal class AppShell(
                         setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
                         gravity = Gravity.CENTER
                         background = android.graphics.drawable.GradientDrawable().apply {
-                            setColor(Color.rgb(0x25, 0x63, 0xEB)); cornerRadius = dp(999).toFloat() }
+                            setColor(Color.rgb(0x25, 0x63, 0xEB)); cornerRadius = dp(4).toFloat() }
                         layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
                     })
                     addView(TextView(context).apply {
@@ -948,7 +948,7 @@ internal class AppShell(
                     stateListAnimator = null
                     background = android.graphics.drawable.GradientDrawable().apply {
                         setColor(if (idx == cfgPreset) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
-                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(8).toFloat() }
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(4).toFloat() }
                     setTextColor(if (idx == cfgPreset) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
                     setOnClickListener {
                         cfgPreset = idx
@@ -956,7 +956,7 @@ internal class AppShell(
                             val cb = presetRow.getChildAt(i) as Button
                             cb.setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
                                 setColor(if (i == cfgPreset) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
-                                setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(8).toFloat() })
+                                setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(4).toFloat() })
                             cb.setTextColor(if (i == cfgPreset) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
                         }
                     }
@@ -972,7 +972,7 @@ internal class AppShell(
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
                     background = android.graphics.drawable.GradientDrawable().apply {
-                        setColor(Color.rgb(0xF2,0xF5,0xF9)); cornerRadius = dp(8).toFloat() }
+                        setColor(Color.rgb(0xF2,0xF5,0xF9)); cornerRadius = dp(4).toFloat() }
                 }
                 val labels = LinearLayout(context).apply {
                     orientation = LinearLayout.VERTICAL
@@ -991,7 +991,7 @@ internal class AppShell(
                     minWidth = dp(56); stateListAnimator = null
                     background = android.graphics.drawable.GradientDrawable().apply {
                         setColor(if (initial) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
-                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(999).toFloat() }
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(4).toFloat() }
                     setTextColor(if (initial) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
                 }
                 var on = initial
@@ -1000,7 +1000,7 @@ internal class AppShell(
                     sw.text = context.getString(if (on) R.string.settings_on else R.string.settings_off)
                     sw.setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
                         setColor(if (on) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
-                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(999).toFloat() })
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(4).toFloat() })
                     sw.setTextColor(if (on) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
                     onToggle(on)
                 }
@@ -1014,7 +1014,7 @@ internal class AppShell(
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(15).toFloat())
                 setTextColor(Color.WHITE)
                 background = android.graphics.drawable.GradientDrawable().apply {
-                    setColor(Color.rgb(0x25, 0x63, 0xEB)); cornerRadius = dp(8).toFloat() }
+                    setColor(Color.rgb(0x25, 0x63, 0xEB)); cornerRadius = dp(4).toFloat() }
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply { topMargin = dp(40) }
                 setOnClickListener {

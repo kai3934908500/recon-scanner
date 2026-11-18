@@ -57,6 +57,10 @@ class CaptureActivity : ComponentActivity() {
     private var pendingCameraStart = false
     /** 陀螺仪方位覆盖追踪：驱动全景扫描式"球包裹"引导。 */
     private var coverageTracker: CoverageTracker? = null
+    /** 物体显著性检测：驱动绿色物体边框贴合物体。 */
+    private val objectDetector = ObjectDetector()
+    @Volatile private var detectedObjectBox: FloatArray? = null
+    private var detectCounter = 0
 
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
@@ -313,8 +317,12 @@ class CaptureActivity : ComponentActivity() {
     }
 
     /** 相机线程：YUV→BGRA 已完成，这里只做内核投递与诊断计数。 */
-    /** 单会话最多送内核的帧数：SfM 是 O(n²)，240 帧足够且避免真机卡死。 */
-    private val maxFramesToCore = 240
+    /**
+     * 单会话最多送内核的帧数。SfM 是 O(n²)，但 240 帧会明显牺牲环绕采集精度。
+     * 提到 600：core 侧预览/重建还有抽稀保护，600 帧在真机是可控的；
+     * 超出部分如实计入 rejectedFrames 并在诊断里可见，不静默丢弃。
+     */
+    private val maxFramesToCore = 600
 
     private fun ingest(frame: CapturedFrame) {
         arrivedFrames++
@@ -341,6 +349,16 @@ class CaptureActivity : ComponentActivity() {
         if (status == ReconStatus.OK) {
             ingestedFrames++
             coverageTracker?.markFrame()
+            // 每 8 帧做一次轻量物体检测（48×48 下采样，<1ms，不阻塞采集）
+            if (++detectCounter % 8 == 0) {
+                val box = objectDetector.detect(frame.bgra, frame.width, frame.height)
+                if (box != null) {
+                    detectedObjectBox = box
+                    mainHandler.post { ui.updateCaptureHud(ingestedFrames,
+                        coverageTracker?.coverage() ?: 0f,
+                        coverageTracker?.bucketStates(), detectedObjectBox) }
+                }
+            }
         } else rejectedFrames++
     }
 
@@ -368,6 +386,18 @@ class CaptureActivity : ComponentActivity() {
     private fun onReviewing() {
         stopStatsPolling()
         camera?.setIngest(false)  // 保留预览，用户可选 CONTINUE 继续扫描
+        // 采集封口：通知内核结束本次采集（关 session_active + 状态迁到 Reviewing）。
+        // 帧一直在 core 的 frames_ 里，此调用不搬数据，但缺了会留下 session_active=true
+        // 的生命周期不一致（重建期继续 push 会被拒）。失败如实记录，不静默。
+        lifecycleScope.launch {
+            val st = withContext(Dispatchers.IO) {
+                if (captureContext != 0L) NativeBridge.finishCapture(captureContext)
+                else ReconStatus.ERR_INVALID_ARGUMENT
+            }
+            if (st != ReconStatus.OK) {
+                Log.w(TAG, "finishCapture 返回非 OK status=$st（可能已封口，幂等）")
+            }
+        }
         // native 读取必须离开主线程（否则可能 ANR）；结果回到主线程再渲染。
         lifecycleScope.launch {
             val s = withContext(Dispatchers.IO) {
@@ -440,6 +470,9 @@ class CaptureActivity : ComponentActivity() {
         nextFrameId = 1L
         arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
         coverageTracker?.reset()
+        objectDetector.reset()
+        detectedObjectBox = null
+        detectCounter = 0
         ui.clearStageDetail()
         shell.setResultSummary(getString(R.string.projects_empty_body))
         shell.setPreviewMesh(null, null)
@@ -483,7 +516,7 @@ class CaptureActivity : ComponentActivity() {
                     lastStats = s
                     // 采集全屏 HUD 实时反馈：帧数 + 方位覆盖
                     ui.updateCaptureHud(ingestedFrames, coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates())
+                        coverageTracker?.bucketStates(), detectedObjectBox)
                     renderNow()
                 }
                 delay(500)

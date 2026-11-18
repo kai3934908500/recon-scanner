@@ -831,7 +831,9 @@ recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
     v.stride = f.gray_stride;
     v.intrinsics = f.intrinsics;
     views.push_back(v);
-    EmitProgress(RECON_STAGE_VIO,
+    // 修复：这里做的是 SfM（稀疏建图），阶段号必须是 RECON_STAGE_SFM(3)，
+    // 不是 VIO(2)。旧值让 UI 在"位姿估计"行显示"SfM 稀疏建图"文字，进度错乱。
+    EmitProgress(RECON_STAGE_SFM,
                  static_cast<double>(k + 1) / static_cast<double>(usable.size()),
                  "SfM 稀疏建图");
   }
@@ -1662,6 +1664,10 @@ recon_status Orchestrator::runReconstruction(const ReconOptions& options,
   };
 
   bool skip = (resume_stage_ > RECON_STAGE_IDLE);
+  // 修复：累积各阶段的降级事实，最终如实写入 mesh_info_.degraded。
+  // 旧代码在 StageScale 里写死为 0，导致 MVS 关闭/无纹理/UV 失败等降级
+  // 对 UI 完全不可见 —— 这是"重建乱报成功"的技术根因。
+  bool any_degraded = false;
   for (const StageEntry& e : kStages) {
     if (skip) {
       if (e.stage <= resume_stage_) continue;
@@ -1681,6 +1687,7 @@ recon_status Orchestrator::runReconstruction(const ReconOptions& options,
     rec.stage = e.stage;
     rec.ok = (st == RECON_OK);
     rec.degraded = res.degraded;
+    if (res.degraded) any_degraded = true;
     rec.millis = res.millis;
     rec.message = res.message;
     {
@@ -1712,6 +1719,8 @@ recon_status Orchestrator::runReconstruction(const ReconOptions& options,
   }
 
   // 完成后把网格信息写回 context（recon_get_mesh_info 的数据源）。
+  // 用阶段累积的真实降级标志覆盖 StageScale 里的占位值 0。
+  mesh_info_.degraded = any_degraded ? 1u : 0u;
   ctx_->mesh_info() = mesh_info_;
 
   SetState(OrchestratorState::kCompleted);
