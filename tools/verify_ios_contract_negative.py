@@ -38,6 +38,13 @@
       · 把 MTKView 正确的 depthStencilPixelFormat 改回不存在的 depthPixelFormat
         → 闸门须报「不存在」（**复现 CI #24 的真实失败**；同时覆盖
         `platform/ios/**/*.swift` 这一此前不在视野内的目录）
+  G21 Swift/Clang 编译可见缺陷（CI #33 首次真编译暴露）
+      · 把 `#pragma once` 加回 bridging header
+        → 闸门须报「#pragma once」（**复现 CI #33 的真实失败之一**）
+      · 把两参数 onChange 改回单参数 `{ t in`
+        → 闸门须报「单参数」（**复现 CI #33 的真实失败之二**）
+      · **反向**：把合法的两参数写法换个形参名 → 断言闸门**不报错**
+        （防判据自身假红 —— G21 第一版实测踩到过）
 
 ⚠️ 本脚本会**临时修改** `platform/ios/Recon/ReconCore.swift`、
    `platform/ios/Recon/WireframeRenderer.swift`、
@@ -114,6 +121,12 @@ WIREFRAME_RENDERER = os.path.join(ROOT, "platform", "ios", "Recon",
 # G20 的目标对象：根 CMakeLists.txt 的 iOS 部署守卫（此前引用了一个从未定义的
 # 变量 IOS_DEPLOYMENT_TARGET，使整条守卫恒假 —— 2026-11-02 发现并修正）。
 ROOT_CMAKELISTS = os.path.join(ROOT, "CMakeLists.txt")
+# G21 的目标对象：bridging header（`#pragma once` 的真实发生地）与两处
+# `onChange` 调用点（单参数 `perform:` 形式的真实发生地）。
+CALIBRATION_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens",
+                                "CalibrationView.swift")
+REBUILD_VIEW = os.path.join(ROOT, "ui", "ios", "Recon", "Sources", "Screens",
+                            "RebuildView.swift")
 
 
 def slurp(path: str) -> str:
@@ -540,13 +553,54 @@ INJECTIONS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
           "  if(IOS_DEPLOYMENT_TARGET AND\n"
           "     IOS_DEPLOYMENT_TARGET VERSION_LESS 17.0)")],
     ),
+    # --- G21：Swift/Clang 编译可见缺陷（CI #33 首次真编译暴露的两类）---------
+    #   ① 复现 CI #33 的原始错误之一：把 `#pragma once` 加回 bridging header
+    #      （真编译报 `error: #pragma once in main file`）。
+    (
+        "G21-a-pragma-once-in-bridging-header",
+        "把 `#pragma once` 加回 bridging header（复现 CI #33 的真实错误）",
+        "#pragma once",
+        [(BRIDGING_HEADER,
+          "#include \"recon/recon_c_api.h\"\n",
+          "#pragma once\n\n#include \"recon/recon_c_api.h\"\n")],
+    ),
+    #   ② 复现 CI #33 的原始错误之二：把两参数 onChange 改回单参数
+    #      （真编译报 `'onChange(of:perform:)' was deprecated in iOS 17.0`，
+    #        零警告标准 → 升为 `error:`）。
+    (
+        "G21-b-single-param-onchange",
+        "把两参数 onChange 改回单参数 `{ t in`（复现 CI #33 的真实错误）",
+        "单参数",
+        [(CALIBRATION_VIEW,
+          "            .onChange(of: referenceType) { _, t in\n",
+          "            .onChange(of: referenceType) { t in\n")],
+    ),
+    #   ③ **判据自身的假红防线**（本闸门第一版实测踩到）：若 `.onChange(of:)`
+    #      的实参表达式里含逗号（如 `controller.progress?.uiSegment` 那种跨行
+    #      写法外，还有多实参写法），用「懒惰匹配 `)` 再匹配 `{`」的正则会
+    #      **回溯**到文档后面某个 `) { d in` → 对**已修好的两参数写法**误报。
+    #      本注入把正确写法**再行数加长**（闭包形参换名 + 引入第二处），断言
+    #      基线仍 PASS —— 即「合法写法不得被误判」。
+    (
+        "G21-c-legal-two-param-must-pass",
+        "把合法两参数写法换个形参名（`{ _, seg in` → `{ _, newSeg in`）—— "
+        "断言闸门**不报错**（防判据自身假红）",
+        "__NO_ERROR__",
+        [(REBUILD_VIEW,
+          "        .onChange(of: controller.progress?.uiSegment) { _, seg in\n"
+          "            if let seg { lastStageIndex = seg }\n",
+          "        .onChange(of: controller.progress?.uiSegment)"
+          " { _, newSeg in\n"
+          "            if let newSeg { lastStageIndex = newSeg }\n")],
+    ),
 ]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="check_ios_contract.py 的负向注入自检"
-                    "（G6 / G7 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17）")
+                    "（G6 / G7 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / "
+                    "G17 / G18 / G19 / G20 / G21）")
     ap.add_argument("--keep-going", action="store_true",
                     help="全部跑完再汇总（默认也是全跑，此项保留语义）")
     args = ap.parse_args()
@@ -556,7 +610,7 @@ def main() -> int:
               LOCALIZATION, ZH_JSON, EN_JSON, CAPABILITY_VIEW,
               FRAME_PIPELINE, FRAME_CONVERTER, BRIDGING_HEADER, METAL_BACKEND,
               CONTAINER_YML, GEN_IOS_PROJECT, LICENSES_CMAKE, IOS_WORKFLOW,
-              ROOT_CMAKELISTS):
+              ROOT_CMAKELISTS, CALIBRATION_VIEW, REBUILD_VIEW):
         if not os.path.isfile(p):
             print(f"[negative] 环境错误：找不到 {p}", file=sys.stderr)
             return 1
@@ -596,7 +650,18 @@ def main() -> int:
                 continue      # 已记失败
 
             rc, out = run_gate()
-            if rc == 0:
+            # `__NO_ERROR__` = 断言「**合法写法不得被误判**」的**反向**注入：
+            # 用来证明判据自己不会假红（本闸门 G21 第一版实测踩到过 —— 见
+            # INJECTIONS 里 G21-c 的说明）。
+            if expect == "__NO_ERROR__":
+                if rc == 0:
+                    print(f"  [{idx:02d}] ✓ {code}  —— 合法写法未被误判（rc=0）")
+                else:
+                    failures.append(
+                        f"{code}: **合法写法被误判为违规**（rc={rc}）→ 判据"
+                        f"自身有假红，必须修正判据。 意图：{desc}\n{out}")
+                    print(f"  [{idx:02d}] ✗ {code}  —— 合法写法被误判（判据假红）")
+            elif rc == 0:
                 failures.append(f"{code}: **闸门未拒收**（退出码 0）→ 该判据是假闸门。"
                                 f" 意图：{desc}")
                 print(f"  [{idx:02d}] ✗ {code}  —— 未被拒收！（假闸门）")
@@ -628,7 +693,7 @@ def main() -> int:
 
     print(f"[negative] PASS：{len(INJECTIONS)} 项注入全部被正确拒收"
           f"（闸门 G6 / G8 / G9 / G11 / G12 / G13 / G14 / G15 / G16 / G17 / "
-          f"G18 / G19 / G20 均有效）")
+          f"G18 / G19 / G20 / G21 均有效）")
     return 0
 
 

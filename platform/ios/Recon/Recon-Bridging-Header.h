@@ -34,8 +34,20 @@
 // （G7-b 只校验 `#include` 指向的 C 头是否存在）**查不出**这类漏网 ——
 // 该漏网已由 G7-e（本 header 必须 import 所有被 Swift 用到的桥头）补齐，见
 // tools/check_ios_contract.py。
-
-#pragma once
+//
+// ── ⚠️ 本文件**不得**写 `#pragma once`（Xcode 26 真编译实证，CI #33）────────
+// 曾有一行 `#pragma once`（从初始提交就有，但**从未被真编译过** —— 见下）。
+// Swift 编译器处理 bridging header 时是把它当作**翻译单元的主文件**编译
+// （日志：`SwiftGeneratePch ... Compiling bridging header`，等价 `-x objective-c-header`），
+// 此时 Clang 报 **`error: #pragma once in main file`** → 整个 App 构建失败。
+//
+// 为什么此前没暴露：iOS CI 的 `build-app` job 依赖 `build-xcframework`，
+// 而 macos-26 遭遇平台容量故障（CI #29..#32 的 `build-xcframework` 四次 cancelled）
+// → `build-app` 一直处于 **`skipped`**，**从未真编译过 App**。CI #33 首次跑起来
+// 即报了这条。⇒ 同缺口 AM/AX：**「从未执行过」的代码，其错误只能等首次真跑**。
+//
+// 修法 = **删除**该行：bridging header 只经由 `SWIFT_OBJC_BRIDGING_HEADER`
+// 被编译器作主文件处理，**不会**被别的文件 `#include`，故 include guard 本就无意义。
 
 #include "recon/recon_c_api.h"
 

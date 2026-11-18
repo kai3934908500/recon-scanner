@@ -257,7 +257,8 @@ private struct WireframePreview: View {
             MetalViewRepresentable(holder: holder)
         }
         .onAppear { holder.load(mesh: mesh) }
-        .onChange(of: mesh.loadID) { _ in holder.load(mesh: mesh) }
+        // iOS 17 两参数形式（单参数 `perform:` 已弃用 + 零警告标准 = 编译错误）。
+        .onChange(of: mesh.loadID) { _, _ in holder.load(mesh: mesh) }
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in

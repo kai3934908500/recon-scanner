@@ -2551,6 +2551,157 @@ def gate_depvar_exists(rep: Report) -> None:
                  f"文件、{hits} 条守卫，引用的变量均真实存在 ✓")
 
 
+# ---------------------------------------------------------------------------
+# G21 Swift/Clang 编译可见缺陷（CI #33 首次真编译暴露的两类）
+# ---------------------------------------------------------------------------
+#
+# ── 为什么需要这条（2026-11-02 CI #33 的真实事故）────────────────────────
+#
+# iOS CI 的 `build-app` job 依赖 `build-xcframework`。macos-26 runner 遭遇平台
+# 容量故障（CI #29..#32 的 `build-xcframework` 四次 cancelled）→ `build-app`
+# 一直 `skipped`，**App 从未被真编译过**。回退 `macos-15` 后 CI #33 首次跑起来，
+# 当场报出两类错误：
+#
+#   (1) platform/ios/Recon/Recon-Bridging-Header.h:38:9:
+#         error: #pragma once in main file
+#       —— Swift 编译器把 bridging header 当**翻译单元主文件**编译
+#          （`-x objective-c-header`），此时 Clang 禁止 `#pragma once`。
+#
+#   (2) ui/ios/Recon/Sources/**/*.swift（4 文件 5 处）:
+#         error: 'onChange(of:perform:)' was deprecated in iOS 17.0
+#       —— 单参数 `perform:` 形式自 iOS 17 弃用，而本 target 开着
+#          `SWIFT_TREAT_WARNINGS_AS_ERRORS: YES`（项目「零警告标准」）
+#          → 弃用警告**升为编译错误**。
+#
+# 同轮 G1..G20 **全绿** —— 因为一条是 Clang 的 TU 规则，一条是
+# Swift 的标准库里「已弃用」标注，两条都不在任何静态判据的视野内。
+# 与 CI #20 / #24 同族：**只有编译器能发现**。
+#
+# ── 定位与边界（如实说明）────────────────────────────────────────────
+#   本闸门是**回归防线**：只拦上面两类**已实证**的缺陷形态，不是编译器，
+#   更不是「能编过」的证明。它把一部分这类错误提前到 ubuntu 静态 job，
+#   让失败更快、更好归因；**不替代** macOS CI 上的 xcodebuild 真编译。
+#
+# ── 判据（窄而准）───────────────────────────────────────────────────
+#   检查 1（bridging header ↔ `#pragma once`）：
+#     目标对象 = 全部 `*Bridging-Header.h`（不写死文件名，避免漏网）。
+#     该文件只经 `SWIFT_OBJC_BRIDGING_HEADER` 被作主文件处理，**永不**被
+#     `#include` → include guard 本就无意义 → 出现即报错。
+#   ⚠️ 反空约束：一个 bridging header 都扫不到时报错（判据没有目标对象）。
+#
+#   检查 2（Swift 单参数 `onChange(of:perform:)`）：
+#     目标对象 = 全部 iOS Swift 源（`ui/ios` + `platform/ios`，同 G18 范围）。
+#     只查**单参数闭包**写法 `{ x in`（或 `{ _ in`）—— 两参数 `{ a, b in` /
+#     零参数 `{ ` 都是 iOS 17 的合法形式，不得误报。
+#   ⚠️ 判据不能只看「onChange 后面有 `{`」：必须看闭包**形参个数**，
+#      否则会把已修好的两参数写法一并误判（假红）。
+#   ⚠️ **不得**用「`.onChange(of: ...)` 后面懒惰匹配 `)` 再匹配 `{`」的写法：
+#      `.onChange(of: controller.progress?.uiSegment) { _, seg in` 里 `_,` 使
+#      「单形参 + in」匹配失败 → 正则**回溯**到文档后面某个 `) { d in` 才成功
+#      → 报出**假红**（本闸门第一版实测踩到，见下方 `_onchange_bad_closures`）。
+#      正确做法：**括号配平**求出实参表结束位置，再解析紧随的闭包形参表。
+
+def _onchange_bad_closures(code: str) -> list[int]:
+    """返回 `code` 中所有「单形参 `onChange` 闭包」的左花括号偏移。
+
+    形参个数由**配平后的**闭包形参表判定，不做跨行懒惰匹配（见上方 ⚠️）。
+    """
+    out: list[int] = []
+    head = re.compile(r"\.onChange\s*\(")
+    sig_re = re.compile(
+        r"\s*((?:[A-Za-z_]\w*|_)(?:\s*,\s*(?:[A-Za-z_]\w*|_))*)\s+in\b")
+    n = len(code)
+    for m in head.finditer(code):
+        # 从实参表的 `(` 起配平，定位其 `)`
+        depth = 0
+        j = m.end() - 1
+        while j < n:
+            ch = code[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= n:
+            continue                      # 未闭合，跳过（文件本身不合法）
+        k = j + 1
+        while k < n and code[k] in " \t":
+            k += 1
+        if k >= n or code[k] != "{":
+            continue                      # 非尾随闭包形式，不管
+        mm = sig_re.match(code, k + 1)
+        if not mm:
+            continue
+        params = [p.strip() for p in mm.group(1).split(",") if p.strip()]
+        if len(params) == 1:              # 单形参 = iOS 17 已弃用的用法
+            out.append(k)
+    return out
+
+
+def gate_compiler_visible(rep: Report) -> None:
+    gate = "G21/compiler-visible"
+
+    # ---- 检查 1：bridging header 不得含 `#pragma once` ----
+    bridge_headers: list[str] = []
+    for base in (IOS_PLATFORM, UI_IOS):
+        for dirpath, _dn, fns in os.walk(base):
+            for fn in fns:
+                if fn.endswith("Bridging-Header.h"):
+                    bridge_headers.append(os.path.join(dirpath, fn))
+    bridge_headers = sorted(set(bridge_headers))
+    if not bridge_headers:
+        rep.err(gate, "未扫到任何 `*Bridging-Header.h` —— 判据没有目标对象"
+                      "（docs/12 §4.2 要求存在该混编入口）")
+    for path in bridge_headers:
+        raw = read_text(path)
+        # 与 G18 一致：注释里会**刻意**提到这行（说明「此处不得写」），不算违规。
+        code = strip_comments_and_strings(raw)
+        if "#pragma once" not in code:
+            continue
+        lineno = next((i for i, ln in enumerate(raw.splitlines(), 1)
+                       if "#pragma once" in ln
+                       and not ln.lstrip().startswith("//")), 0)
+        rep.err(gate,
+                f"{rel(path)}:{lineno} 含有 `#pragma once`。bridging header 由 "
+                f"Swift 编译器作**翻译单元主文件**编译（`-x objective-c-header`，"
+                f"日志 `SwiftGeneratePch ... Compiling bridging header`），此时 "
+                f"Clang 报 `error: #pragma once in main file` → App 构建失败"
+                f"（CI #33 实证）。该文件只经 `SWIFT_OBJC_BRIDGING_HEADER` 作主"
+                f"文件处理、**永不**被 `#include`，include guard 本就无意义 → "
+                f"直接删除该行。")
+
+    # ---- 检查 2：Swift 不得用单参数 `onChange(of:perform:)` ----
+    swift_files = (iter_swift_files() + iter_ios_platform_swift_files())
+    oc_hits = 0
+    total_onchange = 0
+    for path in swift_files:
+        raw = read_text(path)
+        code = strip_comments_and_strings(raw)
+        total_onchange += len(re.findall(r"\.onChange\s*\(", code))
+        for off in _onchange_bad_closures(code):
+            # 行号：按**剥注释后的文本**计（注释已删，行号可能偏移，仅供定位）
+            lineno = code.count("\n", 0, off) + 1
+            oc_hits += 1
+            rep.err(gate,
+                    f"{rel(path)}（剥注释后第 {lineno} 行）用了**单参数** "
+                    f"`.onChange` 闭包。`onChange(of:perform:)` 自 iOS 17 弃用，"
+                    f"而本 target 开着 `SWIFT_TREAT_WARNINGS_AS_ERRORS: YES`"
+                    f"（零警告标准）→ 弃用警告**升为编译错误**（CI #33 实证）。"
+                    f"改成两参数形式 `{{ _, newValue in ... }}`（或零参数 "
+                    f"`{{ ... }}`）。")
+
+    if total_onchange == 0:
+        rep.err(gate, "未扫到任何 `.onChange(` 调用 —— 要么判据失效，要么视图层"
+                      "被清空（两者都要查；本判据的检查 2 已无目标对象）")
+    elif oc_hits == 0:
+        rep.note(f"Swift/Clang 编译可见缺陷：{len(bridge_headers)} 个 bridging "
+                 f"header 无 `#pragma once` ✓、{total_onchange} 处 `.onChange` "
+                 f"全部为 iOS 17 合法形式（两参数/零参数）✓"
+                 f"（回归防线 —— 只覆盖两类已实证形态，不替代 macOS CI 真编译）")
+
+
 def main() -> int:
     rep = Report()
     if not os.path.isdir(UI_IOS):
@@ -2577,6 +2728,7 @@ def main() -> int:
     gate_system_api_denylist(rep)
     gate_swift_access_level(rep)
     gate_depvar_exists(rep)
+    gate_compiler_visible(rep)
 
     print("=" * 68)
     print("iOS 契约闸门（tools/check_ios_contract.py）")
@@ -2601,7 +2753,8 @@ def main() -> int:
           "G13 错误码映射穷举 / G14 平台平面缓冲纪律 / "
           "G15 iOS bundle 落位纪律 / G16 未签名 IPA 链纪律 / "
           "G17 locale 资源落位纪律 / G18 系统 API 幻觉清单 / "
-          "G19 Swift 访问级别自洽 / G20 构建部署守卫变量存在性 全部通过。")
+          "G19 Swift 访问级别自洽 / G20 构建部署守卫变量存在性 / "
+          "G21 Swift/Clang 编译可见缺陷 全部通过。")
     return 0
 
 

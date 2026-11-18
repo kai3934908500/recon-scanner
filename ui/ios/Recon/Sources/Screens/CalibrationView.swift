@@ -104,7 +104,8 @@ public struct CalibrationView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .onChange(of: referenceType) { t in
+            // iOS 17 两参数形式（单参数 `perform:` 已弃用 + 零警告标准 = 编译错误）。
+            .onChange(of: referenceType) { _, t in
                 if let dims = t.defaultDimensions {
                     widthMM = dims.width
                     heightMM = dims.height

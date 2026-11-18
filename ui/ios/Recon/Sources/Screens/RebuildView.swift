@@ -99,10 +99,11 @@ public struct RebuildView: View {
             Text(L10n.t(.confirmCancelRebuildMsg))
         }
         // 段号保持：内核给出可映射段时记录，供「无段」的中间帧沿用。
-        .onChange(of: controller.progress?.uiSegment) { seg in
+        // iOS 17 两参数形式（单参数 `perform:` 已弃用 + 零警告标准 = 编译错误）。
+        .onChange(of: controller.progress?.uiSegment) { _, seg in
             if let seg { lastStageIndex = seg }
         }
-        .onChange(of: controller.outcome) { _ in
+        .onChange(of: controller.outcome) { _, _ in
             // 终局后不再显示「正在取消」。
             if case .running = controller.outcome {} else { cancelling = false }
         }

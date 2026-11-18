@@ -46,7 +46,11 @@ public struct ReconApp: App {
                 // **内部的那一份**实例（同一对象，不是副本）。
                 .environmentObject(controller.session)
                 // 竖屏锁定由 Info.plist 声明（platform/ios/Recon/Info.plist）。
-                .onChange(of: scenePhase) { phase in
+                // ⚠️ 必须用 iOS 17 的**两参数**闭包形式：单参数 `perform:` 形式
+                //   自 iOS 17 起被弃用，而本 target 开着
+                //   `SWIFT_TREAT_WARNINGS_AS_ERRORS: YES`（零警告标准）→
+                //   弃用警告升为**编译错误**（CI #33 首次真编译暴露）。
+                .onChange(of: scenePhase) { _, phase in
                     handleScenePhase(phase)
                 }
         }
