@@ -57,11 +57,11 @@ internal class U2NetDetector(context: Context) {
     val available: Boolean get() = session != null && !closed
 
     /**
-     * 检测结果：64×64 前景 mask + 前景占比。
-     * @param bgra BGRA8 像素（相机帧）
-     * @return mask 为 null 表示未识别到显著物体。
+     * 检测结果：128×128 软前景概率图（保留 U-Net 平滑边缘）+ 前景占比。
+     * 软值 [0,1]，渲染时用它画羽化边缘和平滑轮廓，替代旧的 64×64 布尔格子。
+     * @return softMask 为 null 表示未识别到显著物体。
      */
-    data class Result(val mask: BooleanArray?, val ratio: Float)
+    data class Result(val softMask: FloatArray?, val ratio: Float)
 
     private var loggedOnce = false
     fun detect(bgra: ByteArray, w: Int, h: Int): Result {
@@ -102,20 +102,28 @@ internal class U2NetDetector(context: Context) {
             }
             if (!loggedOnce) { Log.i("U2NetDetector", "推理OK size=${d0.size} outputType=${raw?.javaClass?.name}"); loggedOnce = true }
 
-            // 3. 320×320 显著性 → 64×64 前景 mask（阈值 0.5）
-            val mask = BooleanArray(64 * 64)
+            // 3. 320×320 软显著性 → 128×128 软概率图（2×2 均值下采样，保留平滑边缘）。
+            // U²-Net 的 d0 输出本就是软值，做羽化边缘/平滑轮廓的关键数据，
+            // 绝不能再粗暴阈值化成布尔格子（那是"绿格粗糙"的根因）。
+            val small = 128
+            val soft = FloatArray(small * small)
             var fg = 0
-            for (gy in 0 until 64) for (gx in 0 until 64) {
-                // 下采样：取 320 图中对应块中心
-                val sx = (gx * SIZE / 64) + (SIZE / 128)
-                val sy = (gy * SIZE / 64) + (SIZE / 128)
-                val v = d0[sy * SIZE + sx]
-                if (v >= 0.5f) { mask[gy * 64 + gx] = true; fg++ }
+            for (gy in 0 until small) for (gx in 0 until small) {
+                val sx0 = gx * SIZE / small; val sy0 = gy * SIZE / small
+                // 2×2 区域均值（SIZE/small = 320/128 = 2.5，取相邻 2 像素）
+                var acc = 0f; var cnt = 0
+                for (dy in 0..1) for (dx in 0..1) {
+                    val x = (sx0 + dx).coerceAtMost(SIZE - 1)
+                    val y = (sy0 + dy).coerceAtMost(SIZE - 1)
+                    acc += d0[y * SIZE + x]; cnt++
+                }
+                val v = acc / cnt.coerceAtLeast(1)
+                soft[gy * small + gx] = v
+                if (v >= 0.5f) fg++
             }
-            val ratio = fg.toFloat() / (64 * 64)
-            // 前景太少（无物体）或太多（贴脸/纯色误判）→ 如实未识别
+            val ratio = fg.toFloat() / (small * small)
             if (ratio < 0.02f || ratio > 0.90f) return Result(null, ratio)
-            return Result(mask, ratio)
+            return Result(soft, ratio)
         } catch (e: Exception) {
             return Result(null, 0f)
         }

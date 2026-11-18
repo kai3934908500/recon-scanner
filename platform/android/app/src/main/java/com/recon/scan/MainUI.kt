@@ -389,7 +389,7 @@ internal class MainUI(
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
     fun updateCaptureHud(frames: Int, coverage: Float, buckets: BooleanArray? = null,
-                         objectMask: BooleanArray? = null, speed: Double = 0.0) {
+                         objectMask: FloatArray? = null, speed: Double = 0.0) {
         if (fullscreen) captureHud.update(frames, coverage, buckets, objectMask, speed)
     }
 
@@ -863,15 +863,19 @@ internal class MainUI(
         private var frames = 0
         private var coverage = 0f
         private var buckets: BooleanArray? = null
-        private var objectMask: BooleanArray? = null
+        private var objectMask: FloatArray? = null
         private var speed = 0.0
+        // 离屏涂层 bitmap（128×128 软 mask 渲染，避免每帧几千个 drawRect）
+        private val coatingBitmap = android.graphics.Bitmap.createBitmap(128, 128, android.graphics.Bitmap.Config.ARGB_8888)
+        private val coatingCanvas = android.graphics.Canvas(coatingBitmap)
+        private val coatingPixels = IntArray(128 * 128)
         private var tick = 0f
 
         private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(12).toFloat()
             setShadowLayer(dp(3).toFloat(), 0f, 0f, Color.argb(0xAA, 0, 0, 0)) }
 
-        fun update(f: Int, cov: Float, bs: BooleanArray?, mask: BooleanArray?, sp: Double) {
+        fun update(f: Int, cov: Float, bs: BooleanArray?, mask: FloatArray?, sp: Double) {
             frames = f; coverage = cov; buckets = bs; objectMask = mask; speed = sp; invalidate()
         }
 
@@ -925,42 +929,50 @@ internal class MainUI(
          * 沿物体真实轮廓画绿边 + 涂层：对每个前景 cell，若四邻中有背景则它是边界
          * → 画绿色描边；已覆盖方位对应的 cell 填充半透明绿（像涂层逐渐铺满）。
          */
-        private fun drawObjectCoating(canvas: Canvas, mask: BooleanArray, w: Int, h: Int) {
-            val gw = 64; val gh = 64
-            val cw = w / gw.toFloat(); val ch = h / gh.toFloat()
-            val painted = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-            val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(0x3D, 0xD6, 0x84)
-                style = Paint.Style.STROKE; strokeWidth = 1.5f * context.resources.displayMetrics.density }
-            val pulse = 0.7f + 0.3f * kotlin.math.sin(tick * 0.05f).toFloat()
+        /**
+         * 平滑涂层渲染：用 U²-Net 的软概率图生成羽化边缘的绿色罩层，
+         * 再沿阈值边界画平滑闭合轮廓。替代旧的 64×64 硬格子 + 逐格 drawRect
+         * （那是"绿格粗糙/外形丑/刷新慢"的根因）。
+         */
+        private fun drawObjectCoating(canvas: Canvas, soft: FloatArray, w: Int, h: Int) {
+            val n = 128
+            if (soft.size < n * n) return
+            val pulse = 0.75f + 0.25f * kotlin.math.sin(tick * 0.05f).toFloat()
 
-            for (gy in 0 until gh) for (gx in 0 until gw) {
-                val idx = gy * gw + gx
-                if (!mask[idx]) continue
-                val x = gx * cw; val y = gy * ch
-                // 覆盖判定：该 cell 归到哪个方位桶（按 x 位置映射）
-                // 统一半透明绿罩：只表示"这里识别到了物体"，不谎报包裹进度。
-                // 旧的按方位桶涂满会随乱晃到100%，与是否真扫到物体无关，是误导。
-                painted.color = Color.argb((0x30 * pulse).toInt().coerceIn(0, 255),
-                    0x3D, 0xD6, 0x84)
-                canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
-                // 轮廓边：四邻有背景 → 画绿色边线（贴合物体真实形状）
-                val isEdge =
-                    (gx == 0 || !mask[idx - 1]) ||
-                    (gx == gw - 1 || !mask[idx + 1]) ||
-                    (gy == 0 || !mask[idx - gw]) ||
-                    (gy == gh - 1 || !mask[idx + gw])
-                if (isEdge) {
-                    edge.alpha = (255 * pulse).toInt().coerceIn(0, 255)
-                    canvas.drawLine(x, y, x + cw, y, edge)
-                    canvas.drawLine(x, y + ch, x + cw, y + ch, edge)
-                    canvas.drawLine(x, y, x, y + ch, edge)
-                    canvas.drawLine(x + cw, y, x + cw, y + ch, edge)
-                }
+            // 1. 软 mask → 羽化绿罩 bitmap：alpha 直接用概率值，边缘天然平滑。
+            //    加一个 gamma 让弱响应更淡、主体更实，视觉上贴合物体轮廓。
+            for (i in 0 until n * n) {
+                val v = soft[i].coerceIn(0f, 1f)
+                val a = (java.lang.Math.pow(v.toDouble(), 1.5) * 0x72 * pulse).toInt().coerceIn(0, 255)
+                coatingPixels[i] = (a shl 24) or 0x3DD684  // ARGB 绿罩
             }
-            edge.alpha = 255
+            coatingBitmap.setPixels(coatingPixels, 0, n, 0, 0, n, n)
+            // 拉伸到整个取景区：软 mask 与画面同构（U-Net 输入是全帧缩放），
+            // 一次 drawBitmap 画完，几千个 drawRect 没了 → 刷新快、边缘平滑。
+            val dst = android.graphics.RectF(0f, 0f, w.toFloat(), h.toFloat())
+            canvas.drawBitmap(coatingBitmap, null, dst,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { alpha = 255 })
 
-            // 环绕方向箭头：在物体上方画一段流动弧线 + 箭头，提示"绕着走"
+            // 2. 平滑轮廓：对软图做 0.5 阈值，找边界点画成小圆点串，
+            //    圆点叠加在羽化罩层边缘上，比硬格子边平滑得多。
+            val threshold = 0.5f
+            val on = { x: Int, y: Int ->
+                x in 0 until n && y in 0 until n && soft[y * n + x] >= threshold }
+
+            // 轮廓用断续小段 + 圆点组合，避免连成穿越物体的乱线：
+            // 逐段画短线而非一条闭合 path（边界点是扫描序，连线会乱跳）。
+            val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb((0xE0 * pulse).toInt().coerceIn(0, 255), 0x3D, 0xD6, 0x84)
+                style = Paint.Style.FILL }
+            val r = dp(2).toFloat()
+            for (gy in 1 until n - 1 step 2) for (gx in 1 until n - 1 step 2) {
+                val e = on(gx, gy) &&
+                    (!on(gx - 1, gy) || !on(gx + 1, gy) ||
+                     !on(gx, gy - 1) || !on(gx, gy + 1))
+                if (e) canvas.drawCircle((gx.toFloat() / n) * w, (gy.toFloat() / n) * h, r, edgePaint)
+            }
+
+            // 3. 环绕方向箭头
             val arrowY = h * 0.12f
             val cx = w / 2f
             val flow = (tick % 100f) / 100f

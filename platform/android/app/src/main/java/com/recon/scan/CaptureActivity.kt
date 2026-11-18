@@ -59,7 +59,7 @@ class CaptureActivity : ComponentActivity() {
     private var coverageTracker: CoverageTracker? = null
     /** U²-Netp 显著性物体分割：真正识别扫描目标（端侧 ONNX 推理）。 */
     private var u2netDetector: U2NetDetector? = null
-    @Volatile private var detectedObjectMask: BooleanArray? = null
+    @Volatile private var detectedObjectMask: FloatArray? = null
     @Volatile private var detecting = false
     private var lastDetectMs = 0L
 
@@ -361,23 +361,25 @@ class CaptureActivity : ComponentActivity() {
         if (status == ReconStatus.OK) {
             ingestedFrames++
             coverageTracker?.markFrame()
-            // U²-Netp 目标识别：节流 250ms，IO 线程推理，不阻塞采集。
-            // 模型不可用时保持旧 mask（不伪造识别结果）。
+            // U²-Netp 目标识别：节流 150ms，单线程池推理，不阻塞采集。
+            // 关键：识别结果（含"未识别"）立即刷新 UI —— 旧版只在成功时刷新，
+            // 导致物体移出画面后绿边卡住不消失 = 刷新慢的直接原因。
             val now = System.currentTimeMillis()
-            if (!detecting && now - lastDetectMs >= 250) {
+            if (!detecting && now - lastDetectMs >= 150) {
                 lastDetectMs = now
                 detecting = true
+                // 拷贝当前帧：detector 在后台线程跑，frame.bgra 会被复用
+                val frameCopy = frame.bgra.copyOf()
+                val fw = frame.width; val fh = frame.height
                 lifecycleScope.launch(Dispatchers.IO) {
-                    val det = u2netDetector?.detect(frame.bgra, frame.width, frame.height)
+                    val det = u2netDetector?.detect(frameCopy, fw, fh)
                     detecting = false
-                    if (det?.mask != null) {
-                        detectedObjectMask = det.mask
-                        mainHandler.post {
-                            ui.updateCaptureHud(ingestedFrames,
-                                coverageTracker?.coverage() ?: 0f,
-                                coverageTracker?.bucketStates(), detectedObjectMask,
-                                coverageTracker?.speed() ?: 0.0)
-                        }
+                    detectedObjectMask = det?.softMask   // null=未识别，UI 应清除绿边
+                    mainHandler.post {
+                        ui.updateCaptureHud(ingestedFrames,
+                            coverageTracker?.coverage() ?: 0f,
+                            coverageTracker?.bucketStates(), detectedObjectMask,
+                            coverageTracker?.speed() ?: 0.0)
                     }
                 }
             }
