@@ -62,7 +62,7 @@ internal class MainUI(
     }
 
     val root: FrameLayout
-    private val previewHost: FrameLayout
+    private val previewHost: AspectFrame
     private val statusDot: DotView
     private val statusText: TextView
     private val stepper: StepperView
@@ -82,6 +82,7 @@ internal class MainUI(
     private lateinit var infoScroll: ScrollView
     private lateinit var bottomBar: LinearLayout
     private var fullscreen = false
+    private lateinit var captureHud: CaptureHudView
     private val buttonBar: LinearLayout
     private val buttons: Map<Action, Button>
 
@@ -121,7 +122,7 @@ internal class MainUI(
         }
         titleCol.addView(TextView(context).apply {
             text = "recon"
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(19).toFloat())
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(22).toFloat())
             setTextColor(C.TEXT_PRIMARY)
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         })
@@ -166,20 +167,28 @@ internal class MainUI(
         column.addView(stepper)
 
         // ---- 相机取景器（白底页里的独立取景区）----
-        previewHost = FrameLayout(context).apply {
+        previewHost = AspectFrame(context, dp).apply {
             setBackgroundColor(C.PREVIEW_BG)
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(196)).apply {
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(dp(16), dp(12), dp(16), dp(4))
             }
             clipToOutline = true
             outlineProvider = object : android.view.ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: android.graphics.Outline) {
-                    outline.setRoundRect(0, 0, view.width, view.height, dp(10).toFloat())
+                    outline.setRoundRect(0, 0, view.width, view.height, dp(14).toFloat())
                 }
             }
         }
         column.addView(previewHost)
+
+        // 采集实时引导 HUD（全屏态叠加在取景器上）
+        captureHud = CaptureHudView(context, dp).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            visibility = View.GONE
+        }
+        root.addView(captureHud)
 
         // ---- 可滚动信息区 ----
         val scroll = ScrollView(context).apply {
@@ -192,7 +201,7 @@ internal class MainUI(
         val content = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
 
         hintText = TextView(context).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(13).toFloat())
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(14).toFloat())
             setTextColor(C.TEXT_PRIMARY)
             background = hintBackground()
             setPadding(dp(14), dp(12), dp(14), dp(12))
@@ -320,14 +329,21 @@ internal class MainUI(
         infoScroll.visibility = if (on) View.GONE else View.VISIBLE
         stepper.visibility = if (on) View.GONE else View.VISIBLE
         bottomBar.setPadding(0, dp(12), 0, if (on) dp(30) else dp(14))
+        previewHost.fullscreen = on
         previewHost.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            if (on) 0 else dp(196)).apply {
+            if (on) 0 else ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             weight = if (on) 1f else 0f
             setMargins(if (on) 0 else dp(16), if (on) 0 else dp(12),
                        if (on) 0 else dp(16), 0)
         }
         previewHost.invalidate()
+        captureHud.visibility = if (on) View.VISIBLE else View.GONE
+    }
+
+    /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
+    fun updateCaptureHud(frames: Int, coverage: Float) {
+        if (fullscreen) captureHud.update(frames, coverage)
     }
 
     fun render(v: ViewState) {
@@ -437,7 +453,7 @@ internal class MainUI(
                 }
                 addView(TextView(context).apply {
                     text = p.first
-                    setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                    setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(13).toFloat())
                     setTextColor(C.TEXT_SECOND)
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 })
@@ -499,7 +515,7 @@ internal class MainUI(
             }
             addView(TextView(context).apply {
                 text = value.ifEmpty { "—" }
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(18).toFloat())
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(24).toFloat())
                 setTextColor(C.TEXT_PRIMARY)
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
                 maxLines = 1
@@ -553,23 +569,23 @@ internal class MainUI(
     )
 
     private fun pillBackground() = android.graphics.drawable.GradientDrawable().apply {
-        setColor(Color.rgb(0xF3, 0xF4, 0xF6))
+        setColor(Color.rgb(0xF1, 0xF3, 0xF5))
         cornerRadius = dp(999).toFloat()
     }
     private fun cardBackground() = android.graphics.drawable.GradientDrawable().apply {
-        setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(8).toFloat()
+        setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(12).toFloat()
     }
     private fun tileBackground() = android.graphics.drawable.GradientDrawable().apply {
         setColor(Color.rgb(0xFA, 0xFB, 0xFC)); setStroke(dp(1), C.BORDER); cornerRadius = dp(8).toFloat()
     }
     private fun hintBackground() = android.graphics.drawable.GradientDrawable().apply {
-        setColor(C.ACCENT_SOFT); setStroke(dp(1), Color.rgb(0xDB, 0xEA, 0xFE)); cornerRadius = dp(8).toFloat()
+        setColor(C.ACCENT_SOFT); setStroke(dp(1), Color.rgb(0xDB, 0xEA, 0xFE)); cornerRadius = dp(12).toFloat()
     }
     private fun primaryButtonBackground() = android.graphics.drawable.GradientDrawable().apply {
-        setColor(C.ACCENT); cornerRadius = dp(8).toFloat()
+        setColor(C.ACCENT); cornerRadius = dp(12).toFloat()
     }
     private fun secondaryButtonBackground() = android.graphics.drawable.GradientDrawable().apply {
-        setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(8).toFloat()
+        setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(12).toFloat()
     }
 
     // ---- 自绘：品牌 Logo（石墨细线立方体）----
@@ -679,23 +695,109 @@ internal class MainUI(
         }
     }
 
+    /** 按 4:3 测高的取景容器：预览态无黑边，全屏态由 weight 撑满。 */
+    private class AspectFrame(context: Context, private val dp: (Int) -> Int) : FrameLayout(context) {
+        var fullscreen = false
+            set(value) { field = value; requestLayout() }
+        override fun onMeasure(w: Int, h: Int) {
+            if (fullscreen) { super.onMeasure(w, h); return }
+            val width = MeasureSpec.getSize(w)
+            val height = (width * 3f / 4f).roundToInt()
+            super.onMeasure(w, MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY))
+        }
+    }
+
     private class Card(context: Context, dp: (Int) -> Int, title: String) : LinearLayout(context) {
         val body = LinearLayout(context)
         init {
             orientation = VERTICAL
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(8).toFloat() }
+                setColor(C.SURFACE); setStroke(dp(1), C.BORDER); cornerRadius = dp(12).toFloat() }
             if (android.os.Build.VERSION.SDK_INT >= 21) elevation = dp(1).toFloat()
             setPadding(dp(14), dp(12), dp(14), dp(13))
-            addView(TextView(context).apply {
+            val head = LinearLayout(context).apply { orientation = HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            head.addView(View(context).apply {
+                setBackgroundColor(C.ACCENT)
+                layoutParams = LinearLayout.LayoutParams(dp(3), dp(14)).apply { setMargins(0, 0, dp(8), 0) }
+            })
+            head.addView(TextView(context).apply {
                 text = title
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(13).toFloat())
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(15).toFloat())
                 setTextColor(C.TEXT_PRIMARY)
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
             })
+            addView(head)
             body.orientation = VERTICAL
             body.setPadding(0, dp(10), 0, 0)
             addView(body)
         }
     }
+    /**
+     * 采集实时引导 HUD：取景四角框 + 环绕方向动画 + 实时帧数/覆盖度。
+     * 参照专业扫描 App 的"屏幕实时指引"：用户一眼知道怎么移动、覆盖多少。
+     */
+    private class CaptureHudView(context: Context, private val dp: (Int) -> Int) : View(context) {
+        private var frames = 0
+        private var coverage = 0f
+        private var tick = 0f
+        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dp(2).toFloat()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(13).toFloat()
+            setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
+        }
+        private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(28).toFloat()
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setShadowLayer(dp(4).toFloat(), 0f, 0f, Color.argb(0x99, 0, 0, 0))
+        }
+        private val pill = android.graphics.drawable.GradientDrawable().apply {
+            setColor(Color.argb(0xB3, 0x11, 0x18, 0x27)); cornerRadius = dp(999).toFloat() }
+
+        fun update(f: Int, cov: Float) { frames = f; coverage = cov; invalidate() }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            tick += 1f
+            val w = width.toFloat(); val h = height.toFloat()
+            val topBarH = dp(56).toFloat()
+
+            // 顶部提示胶囊
+            val tip = "缓慢环绕物体一周 · 覆盖所有角度"
+            val tw = text.measureText(tip) + dp(32)
+            val left = (w - tw) / 2f
+            pill.setBounds(left.toInt(), dp(16), (left + tw).toInt(), (dp(16) + dp(36)).toInt())
+            pill.draw(canvas)
+            canvas.drawText(tip, w / 2f, (dp(16) + dp(24)).toFloat(), text)
+
+            // 中央取景四角框（提示用户把物体放这里）
+            val boxW = w * 0.62f; val boxH = h * 0.42f
+            val bx = (w - boxW) / 2f; val by = h * 0.24f
+            val seg = boxW * 0.14f
+            canvas.drawLine(bx, by, bx + seg, by, line); canvas.drawLine(bx, by, bx, by + seg, line)
+            canvas.drawLine(bx + boxW, by, bx + boxW - seg, by, line); canvas.drawLine(bx + boxW, by, bx + boxW, by + seg, line)
+            canvas.drawLine(bx, by + boxH, bx + seg, by + boxH, line); canvas.drawLine(bx, by + boxH, bx, by + boxH - seg, line)
+            canvas.drawLine(bx + boxW, by + boxH, bx + boxW - seg, by + boxH, line); canvas.drawLine(bx + boxW, by + boxH, bx + boxW, by + boxH - seg, line)
+
+            // 环绕方向箭头（沿取景框顶部流动，直观提示"绕着走"）
+            val phase = (tick % 120f) / 120f
+            val ax = bx + phase * boxW
+            val ay = by - dp(10)
+            canvas.drawLine(ax - dp(8), ay, ax, ay - dp(6), line)
+            canvas.drawLine(ax, ay - dp(6), ax + dp(8), ay, line)
+
+            // 底部实时统计：帧数 + 覆盖度
+            val statY = h - dp(96)
+            canvas.drawText(frames.toString(), w * 0.32f, statY, big)
+            canvas.drawText("已采集帧", w * 0.32f, statY + dp(20), text)
+            val covPct = "${(coverage * 100).toInt()}%"
+            canvas.drawText(covPct, w * 0.68f, statY, big)
+            canvas.drawText("方位覆盖", w * 0.68f, statY + dp(20), text)
+
+            postInvalidateDelayed(50)
+        }
+    }
+
 }

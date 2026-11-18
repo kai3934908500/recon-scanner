@@ -81,6 +81,8 @@ internal class AppShell(
     private var devToggle: Button? = null
     private var devModeOn = false
     private var resultText: TextView? = null
+    private var meshPreview: MeshPreviewView? = null
+    private var previewHint: TextView? = null
 
     private lateinit var bottomNav: LinearLayout
     private val dp = { v: Int -> (v * context.resources.displayMetrics.density).roundToInt() }
@@ -210,14 +212,15 @@ internal class AppShell(
 
     // ---- 项目页 ----
     private fun buildProjectsPage(): View {
+        val scroll = ScrollView(context).apply { setBackgroundColor(C.BG) }
         val page = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(C.BG)
-            setPadding(dp(16), dp(20), dp(16), dp(16))
+            setPadding(dp(16), dp(20), dp(16), dp(24))
         }
         page.addView(TextView(context).apply {
             text = context.getString(R.string.projects_title)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(20).toFloat())
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(22).toFloat())
             setTextColor(C.PRIMARY)
             typeface = Typeface.DEFAULT_BOLD
         })
@@ -229,31 +232,63 @@ internal class AppShell(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(16)
             }
+            if (android.os.Build.VERSION.SDK_INT >= 21) elevation = dp(1).toFloat()
         }
         card.addView(TextView(context).apply {
             text = context.getString(R.string.projects_current)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(14).toFloat())
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(15).toFloat())
             setTextColor(C.PRIMARY)
             typeface = Typeface.DEFAULT_BOLD
         })
         resultText = TextView(context).apply {
             text = context.getString(R.string.projects_empty_body)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(13).toFloat())
             setTextColor(C.SECOND)
             setPadding(0, dp(10), 0, dp(12))
         }
         card.addView(resultText)
+        // 3D 线框预览（GLES2）；无模型时上层提示可见，预览区留浅色占位
+        meshPreview = MeshPreviewView(context).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(240)).apply { topMargin = dp(6) }
+            setBackgroundColor(Color.rgb(0xF2, 0xF5, 0xF9))
+        }
+        card.addView(meshPreview)
+        previewHint = TextView(context).apply {
+            text = context.getString(R.string.projects_preview_hint)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
+            setTextColor(C.MUTED)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        card.addView(previewHint)
         val goBtn = makeSecondaryButton(R.string.projects_go_scan).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(10)
+            }
             setOnClickListener { selectTab(Tab.SCAN) }
         }
         card.addView(goBtn)
         page.addView(card)
-        return page
+        scroll.addView(page)
+        return scroll
     }
 
     /** 由 Activity 在重建完成后更新项目页的结果摘要。 */
     fun setResultSummary(summary: String) {
         resultText?.text = summary
+    }
+
+    /** 设置 3D 预览网格几何；positions=XYZ交错，indices=三角面。 */
+    fun setPreviewMesh(positions: FloatArray?, indices: IntArray?) {
+        if (positions == null || indices == null) {
+            meshPreview?.clear()
+            previewHint?.visibility = View.VISIBLE
+        } else {
+            meshPreview?.setMesh(positions, indices)
+            previewHint?.visibility = View.GONE
+        }
     }
 
     // ---- 参数页 ----

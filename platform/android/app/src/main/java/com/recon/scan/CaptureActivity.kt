@@ -185,8 +185,17 @@ class CaptureActivity : ComponentActivity() {
             MainUI.Action.FINISH -> onEvent(CaptureEventBridge.FINISH_SCAN)
             MainUI.Action.RECONSTRUCT -> onEvent(CaptureEventBridge.USER_CONFIRM_RECONSTRUCT)
             MainUI.Action.CONTINUE -> onEvent(CaptureEventBridge.USER_CONTINUE_SCAN)
-            MainUI.Action.RECAPTURE -> onEvent(CaptureEventBridge.RECAPTURE)
-            MainUI.Action.RETRY -> onEvent(CaptureEventBridge.RETRY)
+            MainUI.Action.RECAPTURE -> {
+                resetSessionForNewCapture()   // 丢弃旧会话帧，避免重采混入旧数据
+                onEvent(CaptureEventBridge.RECAPTURE)
+            }
+            MainUI.Action.RETRY -> {
+                // 相机类失败重试需全新会话；重建失败重试保留已采帧（T-24）。
+                if (CaptureEventBridge.failureStage() == CaptureEventBridge.FAILURE_CAMERA) {
+                    resetSessionForNewCapture()
+                }
+                onEvent(CaptureEventBridge.RETRY)
+            }
             MainUI.Action.HOME -> onEvent(CaptureEventBridge.BACK_TO_HOME)
             MainUI.Action.EXPORT_GLB -> export(0)
             MainUI.Action.EXPORT_STL -> export(3)
@@ -366,6 +375,13 @@ class CaptureActivity : ComponentActivity() {
                 shell.setResultSummary(lastMesh?.let {
                     "${it.vertexCount} 顶点 · ${it.triangleCount} 三角面 · 非流形边 ${it.nonManifoldEdges}"
                 } ?: getString(R.string.projects_empty_body))
+                // 取预览网格几何（C ABI recon_get_preview_mesh），供 3D 线框预览
+                val preview = withContext(Dispatchers.IO) {
+                    NativeBridge.getPreviewMesh(captureContext, 200000)
+                }
+                val pos = preview?.get(0) as? FloatArray
+                val idx = (preview?.get(1) as? IntArray)
+                shell.setPreviewMesh(pos, idx)
                 ui.clearStageDetail()
                 onEvent(CaptureEventBridge.RECONSTRUCTION_SUCCEEDED)
             } else {
@@ -375,6 +391,28 @@ class CaptureActivity : ComponentActivity() {
                 onEvent(CaptureEventBridge.RECONSTRUCTION_FAILED)
             }
         }
+    }
+
+    /**
+     * 重新采集前彻底重置会话：销毁旧 context（内含上一轮所有帧与重建结果），
+     * 下一轮 onPreviewing → startCapture 时新建。否则旧帧会混进新采集，结果错乱。
+     */
+    private fun resetSessionForNewCapture() {
+        stopStatsPolling()
+        reconJob?.cancel()
+        if (captureContext != 0L) {
+            NativeBridge.destroy(captureContext)
+            captureContext = 0L
+        }
+        lastStats = null
+        lastMesh = null
+        lastProgress = ""
+        lastProgressFraction = -1f
+        nextFrameId = 1L
+        arrivedFrames = 0; ingestedFrames = 0; rejectedFrames = 0
+        ui.clearStageDetail()
+        shell.setResultSummary(getString(R.string.projects_empty_body))
+        shell.setPreviewMesh(null, null)
     }
 
     private fun onCompleted() {
@@ -413,6 +451,8 @@ class CaptureActivity : ComponentActivity() {
                 }
                 if (s != null) {
                     lastStats = s
+                    // 采集全屏 HUD 实时反馈：帧数 + 方位覆盖
+                    ui.updateCaptureHud(s.framesCaptured.toInt(), s.azimuthCoverage.toFloat())
                     renderNow()
                 }
                 delay(500)

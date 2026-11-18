@@ -115,6 +115,7 @@
     <string name="projects_empty_body">完成一次扫描后，模型会出现在这里</string>
     <string name="projects_current">当前会话模型</string>
     <string name="projects_go_scan">去扫描</string>
+    <string name="projects_preview_hint">重建完成后，可在此拖动查看 3D 模型</string>
 
     <!-- 参数页 -->
     <string name="params_title">采集与重建参数</string>
