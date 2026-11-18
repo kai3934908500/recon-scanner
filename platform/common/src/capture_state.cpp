@@ -256,9 +256,18 @@ TransitionResult CaptureStateMachine::Apply(CaptureEvent ev) {
       break;
 
     // -------------------------------------------------------------- //
-    // Cancelled（终态）：无出边                                          //
+    // Cancelled（取消完成后的收尾态）                                     //
     // -------------------------------------------------------------- //
     case CaptureState::kCancelled:
+      // T-31（规格 §4.2 补登记）：用户点「回到首页」→ Idle。
+      // 此前本态被写成"终态、无出边"，导致 UI 唯一可见的 HOME 按钮永不生效 ——
+      // 这是用户实测反馈的"回退逻辑无效"之一。Cancel 完成后必须能回到入口。
+      if (ev == CaptureEvent::kBackToHome) {  // T-31
+        failure_stage_ = FailureStage::kNone;
+        paused_ = false;
+        next = CaptureState::kIdle;
+        RECON_ACCEPT_RULE("T-31");
+      }
       break;
   }
 
