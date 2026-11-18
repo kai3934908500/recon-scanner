@@ -49,6 +49,7 @@ internal class AppShell(
     private val onGuideDone: () -> Unit,
     private val onResetSettings: () -> Unit,
     private val onQualityTier: (Int) -> Unit,
+    private val onGuideConfig: (Int, Boolean, Boolean) -> Unit,
     private val guideSummary: String = "",
 ) {
     private object C {
@@ -131,7 +132,9 @@ internal class AppShell(
         column.addView(bottomNav)
 
         // 引导层（覆盖全屏，首次显示）
-        guide = GuideOverlay(context, dp, guideSummary) {
+        guide = GuideOverlay(context, dp, guideSummary,
+            onConfig = { preset, hud, imu -> onGuideConfig(preset, hud, imu) }
+        ) {
             guide.visibility = View.GONE
             prefs().edit().putBoolean("guide_seen", true).apply()
             onGuideDone()   // 引导遮挡期相机被后台拒绝，结束后主动重开
@@ -413,6 +416,12 @@ internal class AppShell(
         "cap_frame_rate" to 30.0,
         "cap_exposure_time_us" to 10000.0,
         "cap_iso" to 100.0,
+        "sfm_ransac_max_iterations" to 10000.0,
+        "sfm_ba_max_iterations" to 100.0,
+        "mvs_patch_size" to 7.0,
+        "mvs_num_views" to 5.0,
+        "mvs_subpixel_iterations" to 3.0,
+        "mesh_poisson_samples_per_node" to 1.0,
     )
     private val paramDefaults = defaultParamValues.toMutableMap()
     private val paramSteps = mutableMapOf(
@@ -424,6 +433,12 @@ internal class AppShell(
         "cap_frame_rate" to 5.0,
         "cap_exposure_time_us" to 1000.0,
         "cap_iso" to 50.0,
+        "sfm_ransac_max_iterations" to 5000.0,
+        "sfm_ba_max_iterations" to 25.0,
+        "mvs_patch_size" to 2.0,
+        "mvs_num_views" to 1.0,
+        "mvs_subpixel_iterations" to 1.0,
+        "mesh_poisson_samples_per_node" to 1.0,
     )
 
     private fun adjustParam(key: String, dir: Int) {
@@ -611,6 +626,25 @@ internal class AppShell(
         qualityCard.addView(imuHint)
         page.addView(qualityCard)
 
+        // 重建精度：全部是内核真实 key（默认/范围来自 params.cpp 注册）
+        page.addView(sectionLabel(R.string.settings_section_recon))
+        val reconCard = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(C.SURFACE, C.BORDER)
+            setPadding(dp(12), dp(8), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, dp(10))
+            }
+        }
+        reconCard.addView(paramRow("sfm_ransac_max_iterations", R.string.settings_ransac_iter))
+        reconCard.addView(paramRow("sfm_ba_max_iterations", R.string.settings_ba_iter))
+        reconCard.addView(paramRow("mvs_patch_size", R.string.settings_mvs_patch))
+        reconCard.addView(paramRow("mvs_num_views", R.string.settings_mvs_views))
+        reconCard.addView(paramRow("mvs_subpixel_iterations", R.string.settings_mvs_subpixel))
+        reconCard.addView(paramRow("mesh_poisson_samples_per_node", R.string.settings_poisson_samples))
+        page.addView(reconCard)
+
         page.addView(sectionLabel(R.string.settings_section_guide))
         page.addView(makeSecondaryButton(R.string.settings_replay_guide).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -769,12 +803,14 @@ internal class AppShell(
         context: Context,
         dp: (Int) -> Int,
         private val summary: String,
+        private val onConfig: (Int, Boolean, Boolean) -> Unit,
         onDone: () -> Unit,
     ) : FrameLayout(context) {
         private val pages = listOf(
             R.string.guide_1_title to R.string.guide_1_body,
             R.string.guide_2_title to R.string.guide_2_body,
             R.string.guide_tips_title to R.string.guide_tips_body,
+            R.string.guide_cfg_title to R.string.guide_cfg_body,
             R.string.guide_3_title to R.string.guide_3_body,
             R.string.guide_4_title to R.string.guide_4_body,
         )
@@ -782,7 +818,11 @@ internal class AppShell(
             R.string.guide_tip_1, R.string.guide_tip_2,
             R.string.guide_tip_3, R.string.guide_tip_4)
         private val tipsBox: LinearLayout
+        private val configBox: LinearLayout
         private val summaryCard: TextView
+        private var cfgPreset = 1
+        private var cfgHud = true
+        private var cfgImu = true
         private var index = 0
         private val title: TextView
         private val body: TextView
@@ -852,6 +892,96 @@ internal class AppShell(
                     })
                 })
             }
+            configBox = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                visibility = View.GONE
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
+            }
+            // 精度档 3 选 1
+            configBox.addView(TextView(context).apply {
+                text = context.getString(R.string.guide_cfg_precision)
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                setTextColor(Color.rgb(0x25, 0x63, 0xEB)); typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, dp(8), 0, dp(4))
+            })
+            val presetRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+            val presetLabels = listOf(R.string.params_preset_fast,
+                R.string.params_preset_balanced, R.string.params_preset_quality)
+            presetLabels.forEachIndexed { idx, label ->
+                val b = Button(context).apply {
+                    text = context.getString(label); isAllCaps = false
+                    setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(11).toFloat())
+                    layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { setMargins(dp(2),0,dp(2),0) }
+                    stateListAnimator = null
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(if (idx == cfgPreset) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(8).toFloat() }
+                    setTextColor(if (idx == cfgPreset) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
+                    setOnClickListener {
+                        cfgPreset = idx
+                        for (i in 0 until presetRow.childCount) {
+                            val cb = presetRow.getChildAt(i) as Button
+                            cb.setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+                                setColor(if (i == cfgPreset) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
+                                setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(8).toFloat() })
+                            cb.setTextColor(if (i == cfgPreset) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
+                        }
+                    }
+                }
+                presetRow.addView(b)
+            }
+            configBox.addView(presetRow)
+            // 两个开关：HUD / IMU
+            fun addSwitch(labelRes: Int, hintRes: Int, initial: Boolean, onToggle: (Boolean) -> Unit) {
+                val row = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(8), dp(9), dp(8), dp(9))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(Color.rgb(0xF2,0xF5,0xF9)); cornerRadius = dp(8).toFloat() }
+                }
+                val labels = LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                labels.addView(TextView(context).apply {
+                    text = context.getString(labelRes); setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                    setTextColor(Color.rgb(0x11,0x18,0x27)); typeface = Typeface.DEFAULT_BOLD })
+                labels.addView(TextView(context).apply {
+                    text = context.getString(hintRes); setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
+                    setTextColor(Color.rgb(0x9C,0xA3,0xAF)) })
+                row.addView(labels)
+                val sw = Button(context).apply {
+                    text = context.getString(if (initial) R.string.settings_on else R.string.settings_off)
+                    isAllCaps = false; setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(12).toFloat())
+                    minWidth = dp(56); stateListAnimator = null
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(if (initial) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(999).toFloat() }
+                    setTextColor(if (initial) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
+                }
+                var on = initial
+                sw.setOnClickListener {
+                    on = !on
+                    sw.text = context.getString(if (on) R.string.settings_on else R.string.settings_off)
+                    sw.setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+                        setColor(if (on) Color.rgb(0x25,0x63,0xEB) else Color.WHITE)
+                        setStroke(1, Color.rgb(0xDB,0xEA,0xFE)); cornerRadius = dp(999).toFloat() })
+                    sw.setTextColor(if (on) Color.WHITE else Color.rgb(0x6B,0x72,0x80))
+                    onToggle(on)
+                }
+                row.addView(sw)
+                configBox.addView(row)
+            }
+            addSwitch(R.string.guide_cfg_hud, R.string.guide_cfg_hud_hint, true) { cfgHud = it }
+            addSwitch(R.string.guide_cfg_imu, R.string.guide_cfg_imu_hint, true) { cfgImu = it }
             nextBtn = Button(context).apply {
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(15).toFloat())
@@ -862,7 +992,7 @@ internal class AppShell(
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply { topMargin = dp(40) }
                 setOnClickListener {
                     index++
-                    if (index >= pages.size) onDone() else render()
+                    if (index >= pages.size) { onConfig(cfgPreset, cfgHud, cfgImu); onDone() } else render()
                 }
             }
             skipBtn = TextView(context).apply {
@@ -871,7 +1001,7 @@ internal class AppShell(
                 setTextColor(Color.rgb(0x9C, 0xA3, 0xAF))
                 gravity = Gravity.CENTER
                 setPadding(0, dp(16), 0, 0)
-                setOnClickListener { onDone() }
+                setOnClickListener { onConfig(cfgPreset, cfgHud, cfgImu); onDone() }
             }
             // 装饰立方体
             box.addView(CubeArt(context, dp).apply {
@@ -880,6 +1010,7 @@ internal class AppShell(
             box.addView(title)
             box.addView(body)
             box.addView(tipsBox)
+            box.addView(configBox)
             box.addView(summaryCard)
             box.addView(nextBtn)
             box.addView(skipBtn)
@@ -891,6 +1022,7 @@ internal class AppShell(
             title.text = context.getString(pages[index].first)
             body.text = context.getString(pages[index].second)
             tipsBox.visibility = if (pages[index].first == R.string.guide_tips_title) View.VISIBLE else View.GONE
+            configBox.visibility = if (pages[index].first == R.string.guide_cfg_title) View.VISIBLE else View.GONE
             val showSummary = index == pages.size - 1 && summary.isNotEmpty()
             summaryCard.visibility = if (showSummary) View.VISIBLE else View.GONE
             if (showSummary) summaryCard.text = summary

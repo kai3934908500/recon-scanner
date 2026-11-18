@@ -41,7 +41,8 @@ internal class MainUI(
 ) {
     enum class Action {
         START, FINISH, RECONSTRUCT, CONTINUE,
-        EXPORT_GLB, EXPORT_STL, RECAPTURE, RETRY, HOME,
+        EXPORT_GLB, EXPORT_OBJ, EXPORT_PLY, EXPORT_STL, EXPORT_3MF,
+        RECAPTURE, RETRY, HOME,
     }
 
     // ---- Linear 风格配色：黑白灰结构 + 单一冷蓝强调 ------------------------
@@ -293,8 +294,11 @@ internal class MainUI(
             Action.RECONSTRUCT to makeButton(R.string.ui_btn_reconstruct, primary = true),
             Action.CONTINUE to makeButton(R.string.ui_btn_continue, primary = false),
             Action.RECAPTURE to makeButton(R.string.ui_btn_recapture, primary = true),
-            Action.EXPORT_GLB to makeButton(R.string.ui_btn_export_glb, primary = false),
-            Action.EXPORT_STL to makeButton(R.string.ui_btn_export_stl, primary = false),
+            Action.EXPORT_GLB to makeButton(R.string.ui_btn_export_glb, primary = false, compact = true),
+            Action.EXPORT_OBJ to makeButton(R.string.ui_btn_export_obj, primary = false, compact = true),
+            Action.EXPORT_PLY to makeButton(R.string.ui_btn_export_ply, primary = false, compact = true),
+            Action.EXPORT_STL to makeButton(R.string.ui_btn_export_stl, primary = false, compact = true),
+            Action.EXPORT_3MF to makeButton(R.string.ui_btn_export_3mf, primary = false, compact = true),
             Action.RETRY to makeButton(R.string.ui_btn_retry, primary = true),
             Action.HOME to makeButton(R.string.ui_btn_home, primary = false),
         )
@@ -538,7 +542,7 @@ internal class MainUI(
         else -> C.TEXT_SECOND
     }
 
-    private fun makeButton(labelRes: Int, primary: Boolean): Button =
+    private fun makeButton(labelRes: Int, primary: Boolean, compact: Boolean = false): Button =
         Button(context).apply {
             text = context.getString(labelRes)
             isAllCaps = false
@@ -550,7 +554,7 @@ internal class MainUI(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(dp(4), 0, dp(4), 0)
             }
-            setPadding(dp(18), dp(9), dp(18), dp(9))
+            setPadding(if (compact) dp(11) else dp(18), dp(9), if (compact) dp(11) else dp(18), dp(9))
             stateListAnimator = null
         }
 

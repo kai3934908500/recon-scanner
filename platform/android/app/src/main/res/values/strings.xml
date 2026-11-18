@@ -62,8 +62,11 @@
     <string name="ui_btn_finish">结束采集</string>
     <string name="ui_btn_reconstruct">确认重建</string>
     <string name="ui_btn_continue">继续采集</string>
-    <string name="ui_btn_export_glb">导出 GLB</string>
-    <string name="ui_btn_export_stl">导出 STL</string>
+    <string name="ui_btn_export_glb">GLB</string>
+    <string name="ui_btn_export_obj">OBJ</string>
+    <string name="ui_btn_export_ply">PLY</string>
+    <string name="ui_btn_export_stl">STL</string>
+    <string name="ui_btn_export_3mf">3MF</string>
     <string name="ui_btn_recapture">重新采集</string>
     <string name="ui_btn_retry">重试</string>
     <string name="ui_btn_home">返回首页</string>
@@ -192,4 +195,22 @@
     <string name="stage_scale">尺度标定</string>
     <string name="stage_export">导出</string>
     <string name="stage_done">完成</string>
+
+    <!-- 引导：交互式配置向导 -->
+    <string name="guide_cfg_title">定好你的采集偏好</string>
+    <string name="guide_cfg_body">这些设置稍后都能在「设置」里改。选好就直接开始。</string>
+    <string name="guide_cfg_precision">重建精度</string>
+    <string name="guide_cfg_hud">采集时显示实时引导</string>
+    <string name="guide_cfg_hud_hint">框线、环绕箭头与覆盖提示</string>
+    <string name="guide_cfg_imu">启用惯性传感器</string>
+    <string name="guide_cfg_imu_hint">辅助位姿估计，设备支持时建议开</string>
+
+    <!-- 设置：重建精度参数 -->
+    <string name="settings_section_recon">重建精度</string>
+    <string name="settings_ransac_iter">RANSAC 迭代上限</string>
+    <string name="settings_ba_iter">光束平差迭代</string>
+    <string name="settings_mvs_patch">MVS 匹配窗口</string>
+    <string name="settings_mvs_views">MVS 参考视图数</string>
+    <string name="settings_mvs_subpixel">MVS 亚像素迭代</string>
+    <string name="settings_poisson_samples">泊松每节点采样</string>
 </resources>

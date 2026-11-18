@@ -91,6 +91,7 @@ class CaptureActivity : ComponentActivity() {
             onGuideDone = { restartCameraIfNeeded() },
             onResetSettings = { resetAllSettings() },
             onQualityTier = { tier -> setQualityTier(tier) },
+            onGuideConfig = { preset, hud, imu -> applyGuideConfig(preset, hud, imu) },
             guideSummary = guideSummary,
         )
         setContentView(shell.root)
@@ -137,6 +138,23 @@ class CaptureActivity : ComponentActivity() {
         getSharedPreferences("recon_prefs", MODE_PRIVATE).edit()
             .putBoolean("guide_seen", false).apply()
         shell.showGuide()
+    }
+
+    /** 引导配置向导的结果：一次写入内核预设 + HUD/IMU 偏好。 */
+    private fun applyGuideConfig(preset: Int, hud: Boolean, imu: Boolean) {
+        getSharedPreferences("recon_prefs", MODE_PRIVATE).edit()
+            .putBoolean("guide_hud", hud)
+            .putBoolean("guide_imu", imu)
+            .apply()
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                if (captureContext != 0L) {
+                    NativeBridge.applyPreset(captureContext, preset)
+                    NativeBridge.setParam(captureContext, "cap_imu_enabled",
+                        if (imu) 1 else 0, 0.0)
+                }
+            }
+        }
     }
 
     private fun setQualityTier(tier: Int) {
@@ -198,13 +216,17 @@ class CaptureActivity : ComponentActivity() {
             }
             MainUI.Action.HOME -> onEvent(CaptureEventBridge.BACK_TO_HOME)
             MainUI.Action.EXPORT_GLB -> export(0)
+            MainUI.Action.EXPORT_OBJ -> export(1)
+            MainUI.Action.EXPORT_PLY -> export(2)
             MainUI.Action.EXPORT_STL -> export(3)
+            MainUI.Action.EXPORT_3MF -> export(4)
         }
     }
 
     private fun export(format: Int) {
         lifecycleScope.launch {
-            val path = filesDir.resolve("model.${if (format == 0) "glb" else "stl"}").absolutePath
+            val ext = when (format) { 0 -> "glb"; 1 -> "obj"; 2 -> "ply"; 3 -> "stl"; 4 -> "3mf"; else -> "bin" }
+            val path = filesDir.resolve("model.$ext").absolutePath
             val status = withContext(Dispatchers.IO) {
                 if (captureContext == 0L) ReconStatus.ERR_INVALID_ARGUMENT
                 else NativeBridge.export(captureContext, format, path, true, true)
@@ -504,7 +526,8 @@ class CaptureActivity : ComponentActivity() {
             CaptureEventBridge.STATE_REVIEWING -> setOf(
                 MainUI.Action.CONTINUE, MainUI.Action.RECONSTRUCT)
             CaptureEventBridge.STATE_COMPLETED -> setOf(
-                MainUI.Action.EXPORT_GLB, MainUI.Action.EXPORT_STL, MainUI.Action.RECAPTURE)
+                MainUI.Action.EXPORT_GLB, MainUI.Action.EXPORT_OBJ, MainUI.Action.EXPORT_PLY,
+                MainUI.Action.EXPORT_STL, MainUI.Action.EXPORT_3MF, MainUI.Action.RECAPTURE)
             CaptureEventBridge.STATE_FAILED -> setOf(MainUI.Action.RETRY, MainUI.Action.HOME)
             CaptureEventBridge.STATE_CANCELLED -> setOf(MainUI.Action.HOME)
             else -> emptySet()
