@@ -412,6 +412,7 @@ class CaptureActivity : ComponentActivity() {
 
     /** 重建在 Activity 内闭环：完成/失败显式回推状态机（修 Processing 死态）。 */
     private fun runReconstruction() {
+        ui.setProcessingMode(true)   // 切到独立重建进度页（隐藏取景器/信息卡）
         reconJob?.cancel()
         reconJob = lifecycleScope.launch {
             val status = withContext(Dispatchers.IO) {
@@ -443,10 +444,12 @@ class CaptureActivity : ComponentActivity() {
                 val idx = (preview?.get(1) as? IntArray)
                 shell.setPreviewMesh(pos, idx)
                 ui.clearStageDetail()
+                ui.setProcessingMode(false)
                 onEvent(CaptureEventBridge.RECONSTRUCTION_SUCCEEDED)
             } else {
                 Log.e(TAG, "重建失败 status=$status")
                 ui.clearStageDetail()
+                ui.setProcessingMode(false)
                 CaptureEventBridge.setFailureStage(CaptureEventBridge.FAILURE_RECONSTRUCTION)
                 onEvent(CaptureEventBridge.RECONSTRUCTION_FAILED)
             }
@@ -465,6 +468,7 @@ class CaptureActivity : ComponentActivity() {
                 reconJob?.cancel()
             }
             withContext(Dispatchers.Main.immediate) {
+                ui.setProcessingMode(false)
                 resetSessionForNewCapture()
                 onEvent(CaptureEventBridge.RECAPTURE)
             }

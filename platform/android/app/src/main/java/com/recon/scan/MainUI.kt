@@ -84,6 +84,7 @@ internal class MainUI(
     private lateinit var infoScroll: ScrollView
     private lateinit var bottomBar: LinearLayout
     private var fullscreen = false
+    private var processingMode = false
     private lateinit var captureHud: CaptureHudView
     private val buttonBar: LinearLayout
     private val buttons: Map<Action, Button>
@@ -344,6 +345,23 @@ internal class MainUI(
         }
         previewHost.invalidate()
         captureHud.visibility = if (on) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * 重建时切到独立进度页：隐藏相机取景器与信息卡，只留阶段进度。
+     * 用户反馈：点确认重建后还留着取景画面占空间、不美观。
+     */
+    fun setProcessingMode(on: Boolean) {
+        if (processingMode == on) return
+        processingMode = on
+        previewHost.visibility = if (on) View.GONE else View.VISIBLE
+        stepper.visibility = if (on) View.GONE else View.VISIBLE
+        infoScroll.visibility = if (on) View.GONE else View.VISIBLE
+        progressWrap.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+            setMargins(dp(16), dp(20), dp(16), dp(8))
+        }
+        progressWrap.setPadding(dp(18), dp(20), dp(18), dp(20))
     }
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
@@ -831,7 +849,7 @@ internal class MainUI(
             val speedTip = when {
                 speed > 1.2 -> "绕太快了 · 慢一点"
                 speed > 0.0 && speed < 0.15 -> "再快一点 · 保持匀速"
-                else -> "已识别物体 · 保持匀速环绕"
+                else -> "已识别物体轮廓 · 保持匀速环绕"
             }
             val tip = if (mask != null) speedTip else "将物体置于画面中央"
             val tw = textPaint.measureText(tip) + dp(28)
@@ -854,7 +872,7 @@ internal class MainUI(
             }
 
             // 底部状态条：小而稳，不晃眼
-            val label = "已采 $frames 帧  ·  覆盖 ${(coverage * 100).toInt()}%"
+            val label = "已采 $frames 帧  ·  环绕方位 ${(coverage * 100).toInt()}%"
             val sp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 textSize = dp(12).toFloat(); color = Color.WHITE; textAlign = Paint.Align.CENTER }
             val sw = sp.measureText(label) + dp(28)
@@ -874,7 +892,6 @@ internal class MainUI(
         private fun drawObjectCoating(canvas: Canvas, mask: BooleanArray, w: Int, h: Int) {
             val gw = 64; val gh = 64
             val cw = w / gw.toFloat(); val ch = h / gh.toFloat()
-            val bs = buckets
             val painted = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
             val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.rgb(0x3D, 0xD6, 0x84)
@@ -886,17 +903,11 @@ internal class MainUI(
                 if (!mask[idx]) continue
                 val x = gx * cw; val y = gy * ch
                 // 覆盖判定：该 cell 归到哪个方位桶（按 x 位置映射）
-                val bucket = if (bs != null && bs.isNotEmpty()) (gx * bs.size / gw) else -1
-                if (bucket >= 0 && bs!![bucket]) {
-                    // 已包裹：涂绿（随方位覆盖逐渐铺满）
-                    painted.color = Color.argb((0x55 * pulse).toInt().coerceIn(0, 255),
-                        0x3D, 0xD6, 0x84)
-                    canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
-                } else {
-                    // 未包裹：极淡绿底，标出物体范围
-                    painted.color = Color.argb(0x18, 0x3D, 0xD6, 0x84)
-                    canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
-                }
+                // 统一半透明绿罩：只表示"这里识别到了物体"，不谎报包裹进度。
+                // 旧的按方位桶涂满会随乱晃到100%，与是否真扫到物体无关，是误导。
+                painted.color = Color.argb((0x30 * pulse).toInt().coerceIn(0, 255),
+                    0x3D, 0xD6, 0x84)
+                canvas.drawRect(x, y, x + cw + 1, y + ch + 1, painted)
                 // 轮廓边：四邻有背景 → 画绿色边线（贴合物体真实形状）
                 val isEdge =
                     (gx == 0 || !mask[idx - 1]) ||

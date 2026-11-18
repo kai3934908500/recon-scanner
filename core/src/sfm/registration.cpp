@@ -26,6 +26,8 @@
 //      去畸变；投影侧只做 x/z —— 若两侧畸变处理不一致会引入系统性偏差。
 
 #include "recon/sfm.h"
+#include <unordered_map>
+#include <cstring>
 
 #include <algorithm>
 #include <cmath>
@@ -755,19 +757,34 @@ SfmResult RunIncrementalSfm(const std::vector<SfmView>& views,
       feat_to_track[static_cast<size_t>(i)].assign(
           sets[static_cast<size_t>(i)].features.size(), -1);
     }
+    // 【性能优化】用 uv 坐标 hash 反查特征下标，替代对每帧全部特征线性扫描。
+    // 旧实现：每轮 × 每 track × 每观测 × 2000 特征做浮点比较 = 数亿次，
+    // 真机上 106% CPU 跑 5 分钟仍卡在 25%。观测的 uv 直接来自特征，
+    // 浮点位模式完全相同，故用位模式做 key 精确匹配，结果与原实现逐位一致。
+    struct UvKey {
+      uint64_t operator()(const Vec2d& uv) const {
+        uint64_t xb; uint64_t yb;
+        std::memcpy(&xb, &uv(0), sizeof(uint64_t));
+        std::memcpy(&yb, &uv(1), sizeof(uint64_t));
+        return xb * 0x9E3779B97F4A7C15ull ^ (yb + 0x517CC1B727220A95ull);
+      }
+    };
+    std::vector<std::unordered_map<uint64_t, int, UvKey>> feat_index(
+        static_cast<size_t>(nv));
+    for (int i = 0; i < nv; ++i) {
+      const auto& feats = sets[static_cast<size_t>(i)].features;
+      for (size_t f = 0; f < feats.size(); ++f)
+        feat_index[static_cast<size_t>(i)].emplace(UvKey{}(feats[f].uv), static_cast<int>(f));
+    }
     for (size_t t = 0; t < map.tracks.size(); ++t) {
       if (!map.tracks[t].valid) continue;
       for (const SfmObservation& o : map.tracks[t].observations) {
         if (o.image_id < 0 || o.image_id >= nv) continue;
-        // 反查该观测的像素对应的特征下标（用 uv 精确匹配 —— 观测就是从特征
-        // 的 uv 构造的，故浮点完全相等）。
-        const auto& feats = sets[static_cast<size_t>(o.image_id)].features;
-        for (size_t fidx = 0; fidx < feats.size(); ++fidx) {
-          if (feats[fidx].uv(0) == o.uv(0) && feats[fidx].uv(1) == o.uv(1)) {
-            feat_to_track[static_cast<size_t>(o.image_id)][fidx] =
-                static_cast<int>(t);
-            break;
-          }
+        const auto& idx = feat_index[static_cast<size_t>(o.image_id)];
+        auto it = idx.find(UvKey{}(o.uv));
+        if (it != idx.end()) {
+          feat_to_track[static_cast<size_t>(o.image_id)][static_cast<size_t>(it->second)] =
+              static_cast<int>(t);
         }
       }
     }
