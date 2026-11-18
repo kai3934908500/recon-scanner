@@ -55,6 +55,7 @@ internal class MainUI(
         val TEXT_SECOND = Color.rgb(0x6B, 0x72, 0x80)
         val TEXT_MUTED = Color.rgb(0x9C, 0xA3, 0xAF)
         val ACCENT = Color.rgb(0x25, 0x63, 0xEB)
+        val ACCENT_DARK = Color.rgb(0x1D, 0x4E, 0xBA)
         val ACCENT_SOFT = Color.rgb(0xEF, 0xF6, 0xFF)
         val OK = Color.rgb(0x05, 0x96, 0x69)
         val WARN = Color.rgb(0xB4, 0x53, 0x09)
@@ -365,7 +366,17 @@ internal class MainUI(
         renderTiles(statGrid, v.stats)
         renderPairs(capBody, v.capability)
         renderPairs(resultBody, v.result)
-        resultCard.visibility = if (v.result.isEmpty() || v.result == "—") View.GONE else View.VISIBLE
+        val hasResult = v.result.isNotEmpty() && v.result != "—"
+        if (hasResult && resultCard.visibility != View.VISIBLE) {
+            // 重建完成：结果卡弹入（M3 emphasized motion，一次性的成功反馈）
+            resultCard.alpha = 0f
+            resultCard.translationY = dp(18).toFloat()
+            resultCard.visibility = View.VISIBLE
+            resultCard.animate().alpha(1f).translationY(0f).setDuration(280)
+                .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+        } else {
+            resultCard.visibility = if (hasResult) View.VISIBLE else View.GONE
+        }
         diagText.text = v.diag
         buttons.forEach { (action, btn) ->
             btn.visibility = if (action in v.visibleActions) View.VISIBLE else View.GONE
@@ -548,7 +559,8 @@ internal class MainUI(
             isAllCaps = false
             setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(14).toFloat())
             setTextColor(if (primary) Color.WHITE else C.TEXT_PRIMARY)
-            background = if (primary) primaryButtonBackground() else secondaryButtonBackground()
+            // M3 state layer：按压态颜色加深，松手回弹（对标大厂按钮反馈）
+            background = buttonStateList(primary)
             minHeight = dp(42)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -556,6 +568,37 @@ internal class MainUI(
             }
             setPadding(if (compact) dp(11) else dp(18), dp(9), if (compact) dp(11) else dp(18), dp(9))
             stateListAnimator = null
+            isHapticFeedbackEnabled = true
+            setOnTouchListener { v, ev ->
+                when (ev.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        v.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                        v.animate().scaleX(0.96f).scaleY(0.96f).setDuration(90).start()
+                    }
+                    android.view.MotionEvent.ACTION_UP,
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                    }
+                }
+                false // 不消费，保证 onClick 仍触发
+            }
+        }
+
+    /** M3 state list：normal / pressed 两态，颜色分层而非仅靠阴影。 */
+    private fun buttonStateList(primary: Boolean): android.graphics.drawable.StateListDrawable =
+        android.graphics.drawable.StateListDrawable().apply {
+            val base = if (primary) C.ACCENT else Color.WHITE
+            val pressed = if (primary) C.ACCENT_DARK else Color.rgb(0xE3, 0xE8, 0xF0)
+            addState(intArrayOf(android.R.attr.state_pressed),
+                android.graphics.drawable.GradientDrawable().apply {
+                    setColor(pressed); cornerRadius = dp(12).toFloat()
+                    if (!primary) setStroke(dp(1), C.BORDER)
+                })
+            addState(intArrayOf(),
+                android.graphics.drawable.GradientDrawable().apply {
+                    setColor(base); cornerRadius = dp(12).toFloat()
+                    if (!primary) setStroke(dp(1), C.BORDER)
+                })
         }
 
     data class ViewState(
@@ -686,9 +729,20 @@ internal class MainUI(
 
     private class ProgressBarView(context: Context, private val dp: (Int) -> Int) : View(context) {
         private var fraction = 0f
+        private var animator: android.animation.ValueAnimator? = null
         private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = C.TRACK }
         private val fg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = C.ACCENT }
-        fun setFraction(f: Float) { fraction = f.coerceIn(0f, 1f); invalidate() }
+        fun setFraction(f: Float) {
+            val target = f.coerceIn(0f, 1f)
+            // M3 motion：进度平滑过渡而非跳变（250ms）
+            animator?.cancel()
+            animator = android.animation.ValueAnimator.ofFloat(fraction, target).apply {
+                duration = 250
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { fraction = it.animatedValue as Float; invalidate() }
+                start()
+            }
+        }
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val r = height / 2f
@@ -835,7 +889,11 @@ internal class MainUI(
                 color = Color.argb(0xCC, 0xFF, 0xFF, 0xFF); style = Paint.Style.STROKE
                 strokeWidth = 1.5f * context.resources.displayMetrics.density }
             val filled = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(0x3D, 0xD6, 0x84); style = Paint.Style.FILL }
+                shader = android.graphics.LinearGradient(
+                    cx, cy - r, cx, cy + r,
+                    intArrayOf(Color.rgb(0x6E, 0xF0, 0xA8), Color.rgb(0x1F, 0xA8, 0x62)),
+                    null, android.graphics.Shader.TileMode.CLAMP)
+                style = Paint.Style.FILL }
             val empty = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.argb(0x33, 0xFF, 0xFF, 0xFF); style = Paint.Style.FILL }
             // 球体底
@@ -861,6 +919,10 @@ internal class MainUI(
             canvas.drawCircle(cx, cy, r, outline)
             canvas.drawOval(cx - r * 0.32f, cy - r, cx + r * 0.32f, cy + r, outline)
             canvas.drawLine(cx - r, cy, cx + r, cy, outline)
+            // 高光：左上方小椭圆，增加玻璃/球体质感
+            canvas.drawOval(cx - r * 0.62f, cy - r * 0.72f, cx - r * 0.22f, cy - r * 0.34f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.argb(0x4D, 0xFF, 0xFF, 0xFF); style = Paint.Style.FILL })
         }
     }
 

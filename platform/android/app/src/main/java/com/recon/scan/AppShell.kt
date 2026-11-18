@@ -197,9 +197,18 @@ internal class AppShell(
     }
 
     fun selectTab(tab: Tab) {
+        if (tab == currentTab) return
         currentTab = tab
         scanUI.root.visibility = if (tab == Tab.SCAN) View.VISIBLE else View.GONE
         tabViews.forEach { (t, v) -> v.visibility = if (t == tab) View.VISIBLE else View.GONE }
+        // M3 motion：页面淡入 + 轻微上移，150ms（对标大厂页面切换）
+        val shown = if (tab == Tab.SCAN) scanUI.root else tabViews[tab]
+        shown?.apply {
+            alpha = 0f
+            translationY = dp(8).toFloat()
+            animate().alpha(1f).translationY(0f).setDuration(150)
+                .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+        }
         refreshNavTint()
     }
 
@@ -209,7 +218,11 @@ internal class AppShell(
         for (i in 0 until nav.childCount) {
             val child = nav.getChildAt(i)
             val tab = Tab.values().getOrNull(i)
-            child.background = if (tab == currentTab) roundedBg(C.ACCENT_SOFT) else null
+            val selected = tab == currentTab
+            child.background = if (selected) roundedBg(C.ACCENT_SOFT) else null
+            // 图标 + 文字同步着色（M3 选中态）
+            (child as? ViewGroup)?.getChildAt(0)?.let { (it as? NavIcon)?.setActive(selected) }
+            (child as? ViewGroup)?.getChildAt(1)?.let { (it as? TextView)?.setTextColor(if (selected) C.ACCENT else C.SECOND) }
         }
     }
 
@@ -727,6 +740,19 @@ internal class AppShell(
         minHeight = dp(40)
         stateListAnimator = null
         setPadding(dp(12), dp(8), dp(12), dp(8))
+        isHapticFeedbackEnabled = true
+        setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    v.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                    v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(90).start()
+                }
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL ->
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+            }
+            false
+        }
     }
 
     private fun setButtonActive(b: Button?, active: Boolean) {
@@ -756,6 +782,7 @@ internal class AppShell(
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = C.SECOND; style = Paint.Style.STROKE; strokeWidth = 1.6f * context.resources.displayMetrics.density
         }
+        fun setActive(on: Boolean) { paint.color = if (on) C.ACCENT else C.SECOND; invalidate() }
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat(); val h = height.toFloat()
