@@ -18,6 +18,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import java.nio.FloatBuffer
+import android.util.Log
 
 internal class U2NetDetector(context: Context) {
     private val env = OrtEnvironment.getEnvironment()
@@ -44,9 +45,11 @@ internal class U2NetDetector(context: Context) {
             // 取真实输入名（官方是 input.1，但以模型为准）
             name = s.inputNames.iterator().next()
         } catch (e: Exception) {
+            Log.e("U2NetDetector", "模型加载失败: ${e.message}", e)
             s?.close()
             s = null
         }
+        Log.i("U2NetDetector", "初始化: session=${s != null}, input=$name")
         session = s
         inputName = name
     }
@@ -60,6 +63,7 @@ internal class U2NetDetector(context: Context) {
      */
     data class Result(val mask: BooleanArray?, val ratio: Float)
 
+    private var loggedOnce = false
     fun detect(bgra: ByteArray, w: Int, h: Int): Result {
         val sess = session ?: return Result(null, 0f)
         if (closed || w <= 0 || h <= 0 || bgra.size < w * h * 4) return Result(null, 0f)
@@ -84,12 +88,19 @@ internal class U2NetDetector(context: Context) {
                 longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong()))
             val outputs = sess.run(mapOf(inputName to tensor))
             tensor.close()
-            val d0 = (outputs.get(0).value as? Array<*>)?.let { outer ->
-                (outer[0] as? Array<*>)?.let { mid ->
-                    (mid[0] as? Array<FloatArray>)?.get(0)
-                }
-            } ?: run { outputs.close(); return Result(null, 0f) }
+            // ORT Java 对 float[1][1][320][320] 返回 float[][][][]（原始多维数组），
+            // Kotlin 里强转 Array<Array<Array<FloatArray>>>。旧的三层 Array<*> 解包
+            // 类型不匹配，静默返回 null → 永远"未识别"。
+            val raw = outputs.get(0).value
+            // ORT 返回的 float[][][][] 各层可能是原始数组或 Object[]，
+            // 用反射递归下钻到基本类型 float[]，类型完全无关，最稳。
+            val d0: FloatArray? = flattenToFloatArray(raw)
             outputs.close()
+            if (d0 == null || d0.size < SIZE * SIZE) {
+                if (!loggedOnce) { Log.e("U2NetDetector", "输出张量解析失败 raw=${raw?.javaClass?.name}"); loggedOnce = true }
+                return Result(null, 0f)
+            }
+            if (!loggedOnce) { Log.i("U2NetDetector", "推理OK size=${d0.size} outputType=${raw?.javaClass?.name}"); loggedOnce = true }
 
             // 3. 320×320 显著性 → 64×64 前景 mask（阈值 0.5）
             val mask = BooleanArray(64 * 64)
@@ -108,6 +119,27 @@ internal class U2NetDetector(context: Context) {
         } catch (e: Exception) {
             return Result(null, 0f)
         }
+    }
+
+
+    /** 递归展平任意维数组到一整条 float[]（ORT 返回类型多变，反射最稳）。 */
+    private fun flattenToFloatArray(v: Any?): FloatArray? {
+        if (v == null) return null
+        if (v is FloatArray) return v
+        if (v.javaClass.isArray) {
+            val len = java.lang.reflect.Array.getLength(v)
+            val parts = ArrayList<FloatArray>()
+            for (i in 0 until len) {
+                val part = flattenToFloatArray(java.lang.reflect.Array.get(v, i)) ?: return null
+                parts.add(part)
+            }
+            val total = parts.sumOf { it.size }
+            val out = FloatArray(total)
+            var off = 0
+            for (part in parts) { System.arraycopy(part, 0, out, off, part.size); off += part.size }
+            return out
+        }
+        return null
     }
 
     fun close() {

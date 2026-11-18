@@ -63,6 +63,15 @@ class CaptureActivity : ComponentActivity() {
     @Volatile private var detecting = false
     private var lastDetectMs = 0L
 
+    /** 后台懒加载 U2-Netp（首次检测时触发，不阻塞 onCreate/探测）。 */
+    private fun ensureU2Net() {
+        if (u2netDetector != null) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            try { u2netDetector = U2NetDetector(applicationContext) }
+            catch (e: Exception) { Log.w(TAG, "U2-Netp 初始化失败，降级为无目标识别: ${e.message}") }
+        }
+    }
+
     /** 采集统计轮询与重建任务，onDestroy 统一取消。 */
     private var statsJob: Job? = null
     private var reconJob: Job? = null
@@ -81,7 +90,8 @@ class CaptureActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         ui = MainUI(this) { action -> onAction(action) }
         coverageTracker = CoverageTracker(this)
-        u2netDetector = U2NetDetector(this)   // 模型加载失败时 available=false，自动降级
+        // U2-Netp 模型改后台懒加载：4.4MB + ONNX session 建在主线程会阻塞启动，
+        // 导致能力探测状态机被拖垮（用户实测"点开始采集就失败/卡探测中"）。
         val probe = DeviceProbe.probe(this)
         val branch = if (probe.hasTof) "支持硬件深度" else "单目视觉"
         val imu = if (probe.hasImu) "惯性传感器可用" else "无惯性传感器"
@@ -375,6 +385,7 @@ class CaptureActivity : ComponentActivity() {
     }
 
     private fun startCapture() {
+        ensureU2Net()   // 后台预热模型，不阻塞状态机
         lifecycleScope.launch {
             val st = withContext(Dispatchers.IO) {
                 if (captureContext == 0L) ReconStatus.ERR_INVALID_ARGUMENT
