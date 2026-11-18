@@ -764,6 +764,8 @@ SfmResult RunIncrementalSfm(const std::vector<SfmView>& views,
 
   const int max_rounds = nv;  // 每轮至少注册一帧，故 ≤ nv 轮。
   for (int round = 0; round < max_rounds; ++round) {
+    // 真实进度：让用户看到"位姿估计"在推进，而不是一直"进行中"。
+    if (config.progress != nullptr) config.progress(config.progress_user, round, max_rounds);
     rebuild_index();
 
     int newly = -1;

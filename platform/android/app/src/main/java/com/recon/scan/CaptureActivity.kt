@@ -356,7 +356,8 @@ class CaptureActivity : ComponentActivity() {
                     detectedObjectMask = result.mask
                     mainHandler.post { ui.updateCaptureHud(ingestedFrames,
                         coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates(), detectedObjectMask) }
+                        coverageTracker?.bucketStates(), detectedObjectMask,
+                        coverageTracker?.speed() ?: 0.0) }
                 }
             }
         } else rejectedFrames++
@@ -533,7 +534,8 @@ class CaptureActivity : ComponentActivity() {
                     lastStats = s
                     // 采集全屏 HUD 实时反馈：帧数 + 方位覆盖
                     ui.updateCaptureHud(ingestedFrames, coverageTracker?.coverage() ?: 0f,
-                        coverageTracker?.bucketStates(), detectedObjectMask)
+                        coverageTracker?.bucketStates(), detectedObjectMask,
+                        coverageTracker?.speed() ?: 0.0)
                     renderNow()
                 }
                 delay(500)

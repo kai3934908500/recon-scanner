@@ -772,6 +772,17 @@ recon_status Orchestrator::StageVio(const ReconOptions& opt, StageResult* out) {
 // 输入：frames_ 里所有灰度可用的帧（不限于关键帧 —— SfM 自己做选帧）。
 // 输出：key_poses_ / key_intrinsics_ / keyframe_indices_ / key_timestamps_ns_。
 // ---------------------------------------------------------------------------
+// SfM 进度回调桥：静态函数转发到成员 EmitProgress（函数指针无成员访问权限）。
+// static 成员可访问私有方法，通过 progress_user 传 this。
+void Orchestrator::SfmProgressBridge(void* user, int done, int total) {
+  auto* self = static_cast<Orchestrator*>(user);
+  if (self != nullptr && total > 0) {
+    self->EmitProgress(RECON_STAGE_SFM,
+                       static_cast<double>(done) / static_cast<double>(total),
+                       "SfM 增量注册");
+  }
+}
+
 recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
                                          StageResult* out) {
   (void)opt;
@@ -798,7 +809,10 @@ recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
   // 600 帧会让真机卡死在"位姿估计"且进度 0%（用户实测）。SfM 建位姿只需
   // 足够的视角覆盖，均匀抽稀到上限不损失几何精度（COLMAP 同样对视频抽帧）。
   // 抽稀后仍用全部帧做后续的 MVS 稠密融合，精度不受影响。
-  constexpr size_t kSfmMaxViews = 80;
+  // 低端机实测：80 视图的增量注册 rebuild_index() 是 O(轮×track×特征)，
+  // 在手机上要几分钟 → 用户看到"进行中"长期不动。24 个均匀视角对环绕扫描
+  // 建位姿足够（MVS 仍用全部帧，最终几何精度不受影响）。
+  constexpr size_t kSfmMaxViews = 24;
   if (usable.size() > kSfmMaxViews) {
     const size_t total = usable.size();
     std::vector<int> sampled;
@@ -837,6 +851,11 @@ recon_status Orchestrator::StageSfmMonol(const ReconOptions& opt,
       static_cast<int>(ParamOr(keys::kSfmBaMinNumImages, scfg.ba_min_num_images));
   scfg.min_track_length =
       static_cast<int>(ParamOr(keys::kSfmMinTrackLength, scfg.min_track_length));
+
+  // SfM 增量注册真实进度：映射到 STAGE_SFM 的 0~1，
+  // 让用户看到"稀疏建图"在推进（此前整段无回调，一直"进行中"）。
+  scfg.progress = &Orchestrator::SfmProgressBridge;
+  scfg.progress_user = this;
 
   std::vector<SfmView> views;
   views.reserve(usable.size());

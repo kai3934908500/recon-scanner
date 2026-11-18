@@ -27,6 +27,9 @@ internal class CoverageTracker(context: Context) : SensorEventListener {
     private var yaw = 0.0
     private var covered = 0
     private var lastMarkedYaw = Double.NaN   // 上次计桶的 yaw；避免静止漂移乱涨
+    private var lastYaw = Double.NaN
+    private var lastYawTs = 0L
+    @Volatile private var angularSpeed = 0.0   // rad/s，用于快慢提示
     var active = false
         private set
 
@@ -47,6 +50,9 @@ internal class CoverageTracker(context: Context) : SensorEventListener {
         yaw = 0.0
         covered = 0
         lastMarkedYaw = Double.NaN
+        lastYaw = Double.NaN
+        lastYawTs = 0L
+        angularSpeed = 0.0
     }
 
     /** 帧到达时按当前 yaw 标记方位桶，返回覆盖率 [0,1]。 */
@@ -69,6 +75,8 @@ internal class CoverageTracker(context: Context) : SensorEventListener {
     fun coverage(): Float = if (active) covered.toFloat() / BUCKETS else 0f
     fun bucketStates(): BooleanArray = buckets.copyOf()
     fun currentYaw(): Double = yaw
+    /** 环绕角速度 rad/s，供"快一点/慢一点"提示。 */
+    fun speed(): Double = angularSpeed
 
     override fun onSensorChanged(e: SensorEvent) {
         if (e.sensor.type != Sensor.TYPE_ROTATION_VECTOR || e.values.size < 4) return
@@ -79,6 +87,17 @@ internal class CoverageTracker(context: Context) : SensorEventListener {
         val siny = 2.0 * (w * z + x * y)
         val cosy = 1.0 - 2.0 * (y * y + z * z)
         yaw = atan2(siny, cosy)
+        // 环绕角速度：给 HUD 做"快一点/慢一点"提示
+        val now = System.nanoTime()
+        if (!lastYaw.isNaN()) {
+            var d = yaw - lastYaw
+            if (d > PI) d -= TWO_PI
+            if (d < -PI) d += TWO_PI
+            val dt = (now - lastYawTs) / 1e9
+            if (dt > 0.0 && dt < 1.0) angularSpeed = kotlin.math.abs(d) / dt
+        }
+        lastYaw = yaw
+        lastYawTs = now
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit

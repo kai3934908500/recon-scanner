@@ -93,6 +93,11 @@ struct SfmConfig {
 
   // 数值保护
   double cond_threshold = 1e9;       // DLT 条件数上限
+
+  // 进度回调（POD 兼容的函数指针，不动 C ABI）。
+  // progress(user, done, total)：增量注册每轮回报，让 UI 看到真实推进。
+  void (*progress)(void* user, int done, int total) = nullptr;
+  void* progress_user = nullptr;
 };
 
 // ---------------------------------------------------------------------------

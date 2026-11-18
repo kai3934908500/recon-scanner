@@ -348,8 +348,8 @@ internal class MainUI(
 
     /** 采集期更新引导 HUD 的实时帧数与方位覆盖度。 */
     fun updateCaptureHud(frames: Int, coverage: Float, buckets: BooleanArray? = null,
-                         objectMask: BooleanArray? = null) {
-        if (fullscreen) captureHud.update(frames, coverage, buckets, objectMask)
+                         objectMask: BooleanArray? = null, speed: Double = 0.0) {
+        if (fullscreen) captureHud.update(frames, coverage, buckets, objectMask, speed)
     }
 
     fun render(v: ViewState) {
@@ -402,10 +402,13 @@ internal class MainUI(
         // 0.04 算出负数→钳成 0，用户看到"位姿一直 0%"。改为**stage 主导**：
         // 已完成的阶段满格，当前阶段显示"Ing/进行中"并给一个非零的基准进度，
         // 避免任何阶段显示 0% 或倒退。
+        // 当前阶段百分比：SfM 已有真实逐轮进度回调，用它显示推进；
+        // 其他阶段口径可能不统一，钳制到 1..99 避免显示 0% 或 100% 误导。
+        val curPct = (progress * 100).toInt().coerceIn(1, 99)
         for (i in stages.indices) {
             val frac = when {
                 i < activeIndex -> 1f
-                i == activeIndex -> 0.5f   // 进行中：明确非零，不谎报具体百分比
+                i == activeIndex -> 0.5f   // 用于配色；百分比文本单独显示 curPct
                 else -> 0f
             }
             val row = LinearLayout(context).apply {
@@ -429,7 +432,7 @@ internal class MainUI(
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             val pct = TextView(context).apply {
-                text = if (i == activeIndex) "进行中" else "${(frac * 100).toInt()}%"
+                text = if (i == activeIndex) "${curPct}%" else "${(frac * 100).toInt()}%"
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
                 setTextColor(if (i == activeIndex) C.ACCENT else C.TEXT_MUTED)
                 layoutParams = LinearLayout.LayoutParams(dp(38), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -807,14 +810,15 @@ internal class MainUI(
         private var coverage = 0f
         private var buckets: BooleanArray? = null
         private var objectMask: BooleanArray? = null
+        private var speed = 0.0
         private var tick = 0f
 
         private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = dp(12).toFloat()
             setShadowLayer(dp(3).toFloat(), 0f, 0f, Color.argb(0xAA, 0, 0, 0)) }
 
-        fun update(f: Int, cov: Float, bs: BooleanArray?, mask: BooleanArray?) {
-            frames = f; coverage = cov; buckets = bs; objectMask = mask; invalidate()
+        fun update(f: Int, cov: Float, bs: BooleanArray?, mask: BooleanArray?, sp: Double) {
+            frames = f; coverage = cov; buckets = bs; objectMask = mask; speed = sp; invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -824,7 +828,12 @@ internal class MainUI(
             val mask = objectMask
 
             // 顶部提示胶囊
-            val tip = if (mask != null) "已识别物体 · 缓慢环绕包裹" else "将物体置于画面中央"
+            val speedTip = when {
+                speed > 1.2 -> "绕太快了 · 慢一点"
+                speed > 0.0 && speed < 0.15 -> "再快一点 · 保持匀速"
+                else -> "已识别物体 · 保持匀速环绕"
+            }
+            val tip = if (mask != null) speedTip else "将物体置于画面中央"
             val tw = textPaint.measureText(tip) + dp(28)
             val left = (w - tw) / 2f
             canvas.drawRoundRect(left, dp(14).toFloat(), left + tw, dp(48).toFloat(),
@@ -903,6 +912,19 @@ internal class MainUI(
                 }
             }
             edge.alpha = 255
+
+            // 环绕方向箭头：在物体上方画一段流动弧线 + 箭头，提示"绕着走"
+            val arrowY = h * 0.12f
+            val cx = w / 2f
+            val flow = (tick % 100f) / 100f
+            val ax = cx - w * 0.18f + flow * w * 0.36f
+            val arrow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(0xDD, 0x3D, 0xD6, 0x84)
+                style = Paint.Style.STROKE; strokeWidth = dp(2).toFloat()
+                strokeCap = Paint.Cap.ROUND }
+            canvas.drawLine(ax - dp(14), arrowY, ax + dp(14), arrowY, arrow)
+            canvas.drawLine(ax + dp(14), arrowY, ax + dp(6), arrowY - dp(6), arrow)
+            canvas.drawLine(ax + dp(14), arrowY, ax + dp(6), arrowY + dp(6), arrow)
         }
     }
 

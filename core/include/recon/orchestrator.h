@@ -326,6 +326,8 @@ class Orchestrator {
   recon_status StageVio(const ReconOptions& opt, StageResult* out);
   // MONO 无 IMU 分支的位姿来源：SfM（docs/05 §2.4 C1）。
   recon_status StageSfmMonol(const ReconOptions& opt, StageResult* out);
+  /** SfM 进度回调静态桥（函数指针 → 成员 EmitProgress）。 */
+  static void SfmProgressBridge(void* user, int done, int total);
   recon_status StageMvs(const ReconOptions& opt, StageResult* out);
   recon_status StageTsdf(const ReconOptions& opt, StageResult* out);
   recon_status StagePoisson(const ReconOptions& opt, StageResult* out);
