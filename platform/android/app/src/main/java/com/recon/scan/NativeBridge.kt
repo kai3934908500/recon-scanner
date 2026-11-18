@@ -237,5 +237,7 @@ object NativeBridge {
     interface ProgressCallback {
         /** @param progress [0,1]。 */
         fun onProgress(stage: Int, progress: Double, message: String)
+        /** 内核实时日志（一行一条），level: 1 信息 / 2 警告 / 3 错误。 */
+        fun onLog(level: Int, message: String) {}
     }
 }

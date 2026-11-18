@@ -427,6 +427,11 @@ class CaptureActivity : ComponentActivity() {
                                 renderNow()
                             }
                         }
+
+                        override fun onLog(level: Int, message: String) {
+                            // 内核日志一行行实时滚动显示在重建页
+                            mainHandler.post { ui.appendLog(level, message) }
+                        }
                     })
             }
             if (status == ReconStatus.OK) {

@@ -73,6 +73,8 @@ internal class MainUI(
     private val progressBar: ProgressBarView
     private val progressText: TextView
     private val stageList: LinearLayout
+    private lateinit var logScroll: ScrollView
+    private lateinit var logText: TextView
     private val statCard: Card
     private val statGrid: LinearLayout
     private val capCard: Card
@@ -242,6 +244,21 @@ internal class MainUI(
             }
         }
         progressWrap.addView(stageList)
+        // 内核实时日志流：一行一行滚动输出，像编译日志那样看到每步在干什么
+        logText = TextView(context).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(10).toFloat())
+            setTextColor(C.TEXT_SECOND)
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setBackgroundColor(Color.rgb(0xF7, 0xF8, 0xFA))
+        }
+        logScroll = ScrollView(context).apply {
+            addView(logText)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(120)).apply { topMargin = dp(12) }
+            visibility = View.GONE
+        }
+        progressWrap.addView(logScroll)
         content.addView(progressWrap)
 
         statCard = Card(context, dp, context.getString(R.string.ui_section_overview))
@@ -354,6 +371,7 @@ internal class MainUI(
     fun setProcessingMode(on: Boolean) {
         if (processingMode == on) return
         processingMode = on
+        if (on) clearLog()
         previewHost.visibility = if (on) View.GONE else View.VISIBLE
         stepper.visibility = if (on) View.GONE else View.VISIBLE
         infoScroll.visibility = if (on) View.GONE else View.VISIBLE
@@ -472,6 +490,19 @@ internal class MainUI(
 
     /** 重建结束后清空阶段明细。 */
     fun clearStageDetail() { stageList.removeAllViews() }
+
+    /** 追加一行内核实时日志（重建进度页滚动输出）。 */
+    fun appendLog(level: Int, message: String) {
+        logScroll.visibility = View.VISIBLE
+        val prefix = when (level) { 2 -> "! "; 3 -> "× "; else -> "· " }
+        val cur = logText.text.toString()
+        val next = if (cur.length > 4000) cur.takeLast(3000) + "\n" else cur
+        logText.text = next + prefix + message + "\n"
+        logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** 重建开始时清空日志。 */
+    fun clearLog() { logText.text = ""; logScroll.visibility = View.GONE }
 
     private fun renderPairs(host: LinearLayout, contentText: String) {
         host.removeAllViews()

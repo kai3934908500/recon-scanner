@@ -106,6 +106,7 @@ struct ProgressTrampoline {
   JNIEnv* env;
   jobject callback;
   jmethodID method;
+  jmethodID log_method = nullptr;  // onLog(I;Ljava/lang/String;)V
 };
 
 void OnProgress(void* user_data, int32_t stage, double progress, const char* message) {
@@ -124,11 +125,23 @@ void OnProgress(void* user_data, int32_t stage, double progress, const char* mes
 
 // 内核日志桥：接到 Android logcat（此前 log_cb 传 nullptr，所有 EmitLog 被丢弃，
 // 用户卡住时看不到任何内核诊断）。
-void OnLog(void*, int32_t level, const char* message) {
+void OnLog(void* user_data, int32_t level, const char* message) {
   if (message == nullptr) return;
   const int prio = level >= 3 ? ANDROID_LOG_ERROR
                    : level == 2 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO;
   __android_log_print(prio, "recon-core", "%s", message);
+  // 同时回调到 Kotlin，在重建页实时滚动显示（像编译输出那样一行行）。
+  auto* ctx = static_cast<ProgressTrampoline*>(user_data);
+  if (ctx != nullptr && ctx->callback != nullptr && ctx->log_method != nullptr &&
+      ctx->env != nullptr) {
+    jstring jmsg = ctx->env->NewStringUTF(message);
+    if (jmsg != nullptr) {
+      ctx->env->CallVoidMethod(ctx->callback, ctx->log_method,
+                               static_cast<jint>(level), jmsg);
+      ctx->env->DeleteLocalRef(jmsg);
+      if (ctx->env->ExceptionCheck()) ctx->env->ExceptionClear();
+    }
+  }
 }
 
 }  // namespace
@@ -424,6 +437,8 @@ Java_com_recon_scan_NativeBridge_runReconstruction(JNIEnv* env, jobject, jlong c
       tramp.env = env;
       tramp.callback = progress_callback;
       tramp.method = mid;
+      tramp.log_method = env->GetMethodID(cls, "onLog", "(ILjava/lang/String;)V");
+      if (env->ExceptionCheck()) env->ExceptionClear();  // 默认方法可能未覆写
       cb = &OnProgress;
       user = &tramp;
     }
