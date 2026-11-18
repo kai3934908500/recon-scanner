@@ -859,7 +859,24 @@ internal class MainUI(
             canvas.drawLine(bx, by + boxH, bx + seg, by + boxH, green); canvas.drawLine(bx, by + boxH, bx, by + boxH - seg, green)
             canvas.drawLine(bx + boxW, by + boxH, bx + boxW - seg, by + boxH, green); canvas.drawLine(bx + boxW, by + boxH, bx + boxW, by + boxH - seg, green)
             if (detected) {
-                // 四角实心锚点 + 中心十字：专业锁定反馈
+                // 物体表面"绿色涂层"：在锁定框内画网格，随环绕覆盖逐个染绿。
+                // 视觉上就是给物体裹上一层逐渐铺满的绿衣（对标全景扫描 App）。
+                val gridCols = 6; val gridRows = 4
+                val cellW = boxW / gridCols; val cellH = boxH / gridRows
+                val nb = buckets
+                if (nb != null) for (row in 0 until gridRows) for (col in 0 until gridCols) {
+                    // 每个网格单元映射到一个方位桶；覆盖到的涂绿，未覆盖保持透明网格
+                    val bucket = ((col * nb.size / gridCols) + row) % nb.size
+                    val painted = nb.getOrNull(bucket) == true
+                    val cellPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        style = Paint.Style.FILL
+                        color = if (painted) Color.argb(0x42, 0x3D, 0xD6, 0x84)
+                                else Color.argb(0x14, 0xFF, 0xFF, 0xFF)
+                    }
+                    canvas.drawRect(bx + col * cellW + dp(2), by + row * cellH + dp(2),
+                        bx + (col+1) * cellW - dp(2), by + (row+1) * cellH - dp(2), cellPaint)
+                }
+                // 四角实心锚点：专业锁定反馈
                 val r = dp(3).toFloat()
                 val anchor = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0x3D,0xD6,0x84); style = Paint.Style.FILL }
                 canvas.drawCircle(bx, by, r, anchor); canvas.drawCircle(bx+boxW, by, r, anchor)
@@ -880,12 +897,18 @@ internal class MainUI(
             val scy = h - dp(30) - sr
             drawCoverageSphere(canvas, scx, scy, sr, buckets, coverage)
 
-            // ---- 右下角统计 ----
-            val statY = h - dp(70)
-            canvas.drawText(frames.toString(), w - dp(96), statY, big)
-            canvas.drawText("帧", w - dp(96), statY + dp(18), text)
-            canvas.drawText("${(coverage * 100).toInt()}%", w - dp(24), statY, big)
-            canvas.drawText("覆盖", w - dp(24), statY + dp(18), text)
+            // ---- 底部状态条：小而稳，不晃眼（旧版两个 26sp 大数字一直跳）----
+            val statLabel = "已采 $frames 帧  ·  覆盖 ${(coverage * 100).toInt()}%"
+            val statPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = dp(12).toFloat(); color = Color.WHITE
+                textAlign = Paint.Align.CENTER }
+            val sw = statPaint.measureText(statLabel) + dp(28)
+            val sLeft = (w - sw) / 2f
+            val sTop = h - dp(46)
+            canvas.drawRoundRect(sLeft, sTop, sLeft + sw, sTop + dp(30),
+                dp(4).toFloat(), dp(4).toFloat(),
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(0x99, 0x11, 0x18, 0x27) })
+            canvas.drawText(statLabel, w / 2f, sTop + dp(20), statPaint)
 
             postInvalidateDelayed(50)
         }

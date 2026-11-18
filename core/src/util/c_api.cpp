@@ -19,6 +19,7 @@
 #include "recon/orchestrator.h"
 #include "recon/params.h"
 #include "recon/png_encoder.h"
+#include "recon/quality_gate.h"
 #include "recon/preview_mesh.h"
 #include "recon/recon_c_api.h"
 #include "recon/scale_calibration.h"
@@ -244,12 +245,36 @@ RECON_API recon_status recon_push_frame(void* context, const recon_frame_packet*
     const recon_status st = ctx->orchestrator().onFramePushed(*packet);
     if (st != RECON_OK) return st;
 
-    // 帧计数。质量门限与关键帧判定在 capture 模块内完成，
-    // 此处仅做边界校验与计数推进。
+    // 帧计数 + 采集期质量门判定（真实数据，不是等到重建时才回填）。
+    // 用户实测"有效帧一直是 0"的根因：此前 frames_accepted 只在重建预处理
+    // 阶段写一次，采集期永远读不到。这里对每帧跑质量门，通过才计入有效帧，
+    // 异常按类型如实计数，UI 实时可见采集质量。
     recon_scan_stats& s = ctx->scan_stats();
     s.frames_captured++;
     if (packet->imu != nullptr) {
       s.imu_samples += packet->imu_count;
+    }
+    if (packet->rgb_data != nullptr && packet->rgb_width > 2 &&
+        packet->rgb_height > 2 &&
+        packet->rgb_stride >= packet->rgb_width * 4) {
+      recon::QualityGateConfig qcfg;  // 默认阈值来自 docs/02 §4.8
+      recon::FrameSignals sig;
+      sig.angular_speed_rad_s = 0.0;  // 平台未上报角速度，不伪造
+      sig.linear_speed_m_s = 0.0;
+      sig.overlap_ratio = 1.0;        // 无跟踪重叠度，保守取 1（不误判拒帧）
+      const recon::QualityGateResult q = recon::EvaluateQualityGate(
+          packet->rgb_data, packet->rgb_width, packet->rgb_height,
+          packet->rgb_stride, qcfg, sig);
+      if (q.accepted) {
+        s.frames_accepted++;
+      } else {
+        // 拒帧：按严重类型如实计数
+        if (q.blur_severe) ++s.anomaly_blur;
+        if (q.specular_severe) ++s.anomaly_specular;
+        if (q.low_texture_severe) ++s.anomaly_low_texture;
+        if (q.too_fast_severe) ++s.anomaly_fast_motion;
+        if (q.low_overlap_severe) ++s.anomaly_low_overlap;
+      }
     }
     return RECON_OK;
   });

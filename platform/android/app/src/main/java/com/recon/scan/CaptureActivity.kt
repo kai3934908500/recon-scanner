@@ -221,7 +221,7 @@ class CaptureActivity : ComponentActivity() {
                 }
                 onEvent(CaptureEventBridge.RETRY)
             }
-            MainUI.Action.HOME -> onEvent(CaptureEventBridge.BACK_TO_HOME)
+            MainUI.Action.HOME -> exitToPreview()
             MainUI.Action.EXPORT_GLB -> export(0)
             MainUI.Action.EXPORT_OBJ -> export(1)
             MainUI.Action.EXPORT_PLY -> export(2)
@@ -453,6 +453,24 @@ class CaptureActivity : ComponentActivity() {
     }
 
     /**
+     * 退出当前任务回到预览态：重建中先通知内核取消（否则后台线程还在跑），
+     * 再销毁会话、丢弃帧，让用户能立刻重新开始。任何时候都有出口。
+     */
+    private fun exitToPreview() {
+        lifecycleScope.launch {
+            val st = CaptureEventBridge.currentState()
+            if (st == CaptureEventBridge.STATE_PROCESSING && captureContext != 0L) {
+                withContext(Dispatchers.IO) { NativeBridge.cancel(captureContext) }
+                reconJob?.cancel()
+            }
+            withContext(Dispatchers.Main.immediate) {
+                resetSessionForNewCapture()
+                onEvent(CaptureEventBridge.RECAPTURE)
+            }
+        }
+    }
+
+    /**
      * 重新采集前彻底重置会话：销毁旧 context（内含上一轮所有帧与重建结果），
      * 下一轮 onPreviewing → startCapture 时新建。否则旧帧会混进新采集，结果错乱。
      */
@@ -565,12 +583,15 @@ class CaptureActivity : ComponentActivity() {
         }
         val actions = when (CaptureEventBridge.currentState()) {
             CaptureEventBridge.STATE_PREVIEWING -> setOf(MainUI.Action.START)
-            CaptureEventBridge.STATE_CAPTURING -> setOf(MainUI.Action.FINISH)
+            CaptureEventBridge.STATE_CAPTURING -> setOf(
+                MainUI.Action.FINISH, MainUI.Action.HOME)
             CaptureEventBridge.STATE_REVIEWING -> setOf(
-                MainUI.Action.CONTINUE, MainUI.Action.RECONSTRUCT)
+                MainUI.Action.CONTINUE, MainUI.Action.RECONSTRUCT, MainUI.Action.HOME)
+            CaptureEventBridge.STATE_PROCESSING -> setOf(MainUI.Action.HOME)
             CaptureEventBridge.STATE_COMPLETED -> setOf(
                 MainUI.Action.EXPORT_GLB, MainUI.Action.EXPORT_OBJ, MainUI.Action.EXPORT_PLY,
-                MainUI.Action.EXPORT_STL, MainUI.Action.EXPORT_3MF, MainUI.Action.RECAPTURE)
+                MainUI.Action.EXPORT_STL, MainUI.Action.EXPORT_3MF, MainUI.Action.RECAPTURE,
+                MainUI.Action.HOME)
             CaptureEventBridge.STATE_FAILED -> setOf(MainUI.Action.RETRY, MainUI.Action.HOME)
             CaptureEventBridge.STATE_CANCELLED -> setOf(MainUI.Action.HOME)
             else -> emptySet()
