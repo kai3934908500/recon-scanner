@@ -83,7 +83,8 @@ internal class U2NetDetector(context: Context) {
                     input[2 * plane + dst] = (bgra[i].toFloat() / 255f - MEAN[2]) / STD[2]
                 }
             }
-            // 2. 推理
+            // 2. 推理（计时：判断是否能承受多尺度 TTA）
+            val tInfer = System.nanoTime()
             val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(input),
                 longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong()))
             val outputs = sess.run(mapOf(inputName to tensor))
@@ -100,7 +101,10 @@ internal class U2NetDetector(context: Context) {
                 if (!loggedOnce) { Log.e("U2NetDetector", "输出张量解析失败 raw=${raw?.javaClass?.name}"); loggedOnce = true }
                 return Result(null, 0f)
             }
-            if (!loggedOnce) { Log.i("U2NetDetector", "推理OK size=${d0.size} outputType=${raw?.javaClass?.name}"); loggedOnce = true }
+            if (!loggedOnce) {
+                Log.i("U2NetDetector", "推理OK size=${d0.size} 耗时=${(System.nanoTime()-tInfer)/1000000}ms ratio待测")
+                loggedOnce = true
+            }
 
             // 3. 320×320 软显著性 → 128×128 软概率图（2×2 均值下采样，保留平滑边缘）。
             // U²-Net 的 d0 输出本就是软值，做羽化边缘/平滑轮廓的关键数据，
