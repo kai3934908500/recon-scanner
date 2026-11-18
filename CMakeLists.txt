@@ -629,7 +629,7 @@ if(RECON_PLATFORM_ANDROID)
       # 的规则本体到 Kotlin `object ImuRingBuffer`。本文件只做类型搬运与
       # 交错布局重排，**不含任何切窗规则**（见 imu-bridge.cpp 文件头）。
       ${RECON_REPO_ROOT}/platform/android/app/src/main/cpp/imu-bridge.cpp)
-  target_link_libraries(recon_platform_android PUBLIC recon_core recon_platform_common)
+  target_link_libraries(recon_platform_android PUBLIC recon_core recon_platform_common log)
   # ── 着色器依赖进 CMake 图（第四十三轮实测的**致命缺口 B**）──────────────
   # 此前 `recon_shaders_vulkan` 从未被任何 target 链接，于是
   # `add_custom_target(recon_spirv)` **永远不会被任何构建触发** —— 与 iOS 侧

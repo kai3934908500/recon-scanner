@@ -596,6 +596,8 @@ SfmResult RunIncrementalSfm(const std::vector<SfmView>& views,
   // 1. 特征提取。
   std::vector<SfmFeatureSet> sets(static_cast<size_t>(nv));
   for (int i = 0; i < nv; ++i) {
+    if (config.progress != nullptr)
+      config.progress(config.progress_user, i / 4, nv / 4);  // 特征提取占前 25%
     const SfmView& v = views[static_cast<size_t>(i)];
     if (v.gray == nullptr || v.width <= 0 || v.height <= 0) continue;
     sets[static_cast<size_t>(i)] =
@@ -618,7 +620,16 @@ SfmResult RunIncrementalSfm(const std::vector<SfmView>& views,
   std::vector<Vec3d> best_points;
   std::vector<int> best_f0, best_f1;  // 每条轨迹在两帧的特征下标
 
-  for (size_t idx = 0; idx < pairs.size(); ++idx) {
+  // 初始对评估上限：每个 pair 要跑 RANSAC(10000)+三角化，低端机上
+  // 评估全部 276 个 pair 要几分钟。初始对只需找到一个足够好的，
+  // 评估前 16 个序列邻接 pair 即可（用户环绕时相邻帧重叠最高、最容易配对）。
+  // 这不是降精度参数（ransac_max_iterations 不动），是搜索范围优化。
+  const size_t kMaxInitPairs = 16;
+  const size_t initPairCount = std::min(pairs.size(), kMaxInitPairs);
+  for (size_t idx = 0; idx < initPairCount; ++idx) {
+    if (config.progress != nullptr)
+      config.progress(config.progress_user,
+                      nv / 4 + static_cast<int>(idx * (nv / 4) / initPairCount), nv);
     const int i0 = pairs[idx].index0;
     const int i1 = pairs[idx].index1;
     if (sets[static_cast<size_t>(i0)].features.empty() ||

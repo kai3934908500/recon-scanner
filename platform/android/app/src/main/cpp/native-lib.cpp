@@ -11,6 +11,7 @@
 // 不包含任何算法逻辑（算法全部在 core/ 内，铁律：逻辑单一来源）。
 
 #include <jni.h>
+#include <android/log.h>
 
 #include <cstdint>
 #include <cstring>
@@ -119,6 +120,15 @@ void OnProgress(void* user_data, int32_t stage, double progress, const char* mes
   if (jmsg != nullptr) ctx->env->DeleteLocalRef(jmsg);
   // 若回调抛异常，清掉以免影响 native 重建循环（异常在边界内吞掉）。
   if (ctx->env->ExceptionCheck()) ctx->env->ExceptionClear();
+}
+
+// 内核日志桥：接到 Android logcat（此前 log_cb 传 nullptr，所有 EmitLog 被丢弃，
+// 用户卡住时看不到任何内核诊断）。
+void OnLog(void*, int32_t level, const char* message) {
+  if (message == nullptr) return;
+  const int prio = level >= 3 ? ANDROID_LOG_ERROR
+                   : level == 2 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO;
+  __android_log_print(prio, "recon-core", "%s", message);
 }
 
 }  // namespace
@@ -421,7 +431,7 @@ Java_com_recon_scan_NativeBridge_runReconstruction(JNIEnv* env, jobject, jlong c
   }
 
   return static_cast<jint>(
-      recon_run_reconstruction(reinterpret_cast<void*>(context), cb, nullptr, nullptr, user));
+      recon_run_reconstruction(reinterpret_cast<void*>(context), cb, nullptr, &OnLog, user));
 }
 
 JNIEXPORT jdoubleArray JNICALL
