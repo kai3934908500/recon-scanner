@@ -1273,7 +1273,8 @@ recon_status Orchestrator::StageTsdf(const ReconOptions& opt, StageResult* out) 
   const size_t before = cloud_.size();
   MergeDedupe(tsdf_cloud, merge_voxel, &cloud_);
 
-  out->degraded = coarsened;
+  // 修复：不能抹掉前面 inconsistent 设的降级标志（用 || 累积，不覆盖）。
+  out->degraded = out->degraded || coarsened;
   out->metrics.push_back({"integrated_pixels", static_cast<double>(integrated)});
   out->metrics.push_back({"tsdf_points", static_cast<double>(tsdf_cloud.size())});
   out->metrics.push_back({"merged_new", static_cast<double>(cloud_.size() - before)});

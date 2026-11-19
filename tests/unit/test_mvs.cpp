@@ -343,6 +343,16 @@ void TestMvsDepthAccuracy() {
               scene.width * scene.height);
   Check(filled > static_cast<uint32_t>(scene.width * scene.height * 0.5),
         "PatchMatch 应填充过半像素");
+  // 【回归防线】support_count 必须是真实的多视图支撑数，不能恒为 1。
+  // 旧 bug：恒写 1，而融合要求 >=2 → 所有 MVS 点被剔除、点云恒空。
+  // 负向注入：把 support_count 改回恒 1，下面断言会变红。
+  int multi_view = 0;
+  for (size_t i = 0; i < depth.support_count.size(); ++i) {
+    if (depth.depth[i] == depth.depth[i] && depth.support_count[i] >= 2) ++multi_view;
+  }
+  std::printf("    多视图支撑像素(support>=2): %d / %u\n", multi_view, filled);
+  Check(multi_view > static_cast<int>(filled * 0.5),
+        "多数有效像素应有 >=2 个视图支撑（support_count 不得恒为1）");
 
   const uint32_t refined = recon::RefineSubpixel(
       scene.images[0].data(), scene.width, scene.height, src_ptrs, src_w, src_h,

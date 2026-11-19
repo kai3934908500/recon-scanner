@@ -487,6 +487,10 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
   // ---- 初始化 ----
   std::vector<double> inv_depth(static_cast<size_t>(ref_w) * ref_h, 0.0);
   std::vector<double> cost(static_cast<size_t>(ref_w) * ref_h, 1e30);
+  // 【致命bug修复】记录每个最佳假设真正通过 NCC 验证的视图数。
+  // 旧代码 support_count 恒写 1，而融合要求 >=2 → 所有 MVS 点被剔除，
+  // MVS 点云恒为空，是"建模精度差"的根因。
+  std::vector<int> support(static_cast<size_t>(ref_w) * ref_h, 0);
   std::vector<uint8_t> initialized(static_cast<size_t>(ref_w) * ref_h, 0);
 
   Random rng(0x5DEECE66Dull);
@@ -557,6 +561,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
               src_w, src_h, ref_pose, src_poses, ref_intr, src_intrinsics,
               source_indices, config, intrinsics_are_global);
           cost[idx] = c.cost;
+          support[idx] = c.valid_views;
         }
       }
     };
@@ -632,6 +637,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
         const std::vector<double> snap_cost = cost;
         std::vector<double> out_inv = inv_depth;
         std::vector<double> out_cost = cost;
+        std::vector<int> out_support = support;
 
         auto run_block2 = [&](int block_id) {
           const int y_block_start = block_id * rows_per_block;
@@ -673,6 +679,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
                   if (c.cost < out_cost[idx]) {
                     out_cost[idx] = c.cost;
                     out_inv[idx] = snap_inv[nidx];
+                    out_support[idx] = c.valid_views;
                   }
                 }
               }
@@ -692,6 +699,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
                 if (c.cost < out_cost[idx]) {
                   out_cost[idx] = c.cost;
                   out_inv[idx] = candidate;
+                  out_support[idx] = c.valid_views;
                 }
                 radius *= 0.5;
               }
@@ -707,6 +715,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
                 if (c.cost < out_cost[idx]) {
                   out_cost[idx] = c.cost;
                   out_inv[idx] = candidate;
+                  out_support[idx] = c.valid_views;
                 }
               }
             }
@@ -728,6 +737,7 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
 
         inv_depth = std::move(out_inv);
         cost = std::move(out_cost);
+        support = std::move(out_support);
       }
     }
   }
@@ -742,7 +752,8 @@ uint32_t PatchMatchStereo(const uint8_t* ref_gray, int ref_w, int ref_h,
       if (depth < config.min_depth_m || depth > config.max_depth_m) continue;
 
       out_depth->depth[idx] = static_cast<float>(depth);
-      out_depth->support_count[idx] = 1;
+      out_depth->support_count[idx] = static_cast<uint8_t>(
+          std::min<int>(support[idx], 255));  // 真·多视图支撑数（修复恒为1的致命bug）
       // 置信度：由光度代价映射。C_photo = 1 − NCC，NCC=1 → 代价 0 → 置信度 1。
       const double photo_cost = std::clamp(cost[idx], 0.0, 1.0);
       out_depth->confidence[idx] = static_cast<float>(1.0 - photo_cost);
@@ -1013,8 +1024,10 @@ PointCloud FuseDepthMaps(const std::vector<const DepthMap*>& depth_maps,
         const Vec3d p_cam = ray * depth;
         const Vec3d p_world = pose.CameraToWorld(p_cam);
 
-        // 法向：沿视线方向（相机指向点）。
-        const Vec3d normal_world = (pose.R.transpose() * ray).normalized();
+        // 【修复】法向必须朝外（表面指向相机），与 TSDF 法向一致、满足
+        // OrientedPointCloud 契约(poisson_mesh.h: 法向朝外)。旧代码 Rᵀ·ray
+        // 是相机→表面(朝内)，与 TSDF 朝外法向混合后泊松梯度场自相抵消。
+        const Vec3d normal_world = -(pose.R.transpose() * ray).normalized();
 
         const int64_t vx = static_cast<int64_t>(std::floor(p_world(0) / voxel));
         const int64_t vy = static_cast<int64_t>(std::floor(p_world(1) / voxel));
