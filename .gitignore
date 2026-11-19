@@ -155,3 +155,9 @@ $RECYCLE.BIN/
 #   本目录是项目记忆（非缓存，请勿删除），但不属于对外交付内容。
 # ---------------------------------------------------------------------------
 .workbuddy/
+
+# AI 分割模型（>100MB，超 GitHub 单文件限制，不进 git；下载地址见 README）
+platform/android/app/src/main/assets/*.onnx
+
+# ORB-SLAM3 参考源码（1.5GB 解压目录 + 573MB 压缩包，仅本地研究用，不进 git）
+third_party/ORB_SLAM3-master/

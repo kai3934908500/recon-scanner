@@ -57,18 +57,32 @@ class CaptureActivity : ComponentActivity() {
     private var pendingCameraStart = false
     /** 陀螺仪方位覆盖追踪：驱动全景扫描式"球包裹"引导。 */
     private var coverageTracker: CoverageTracker? = null
-    /** U²-Netp 显著性物体分割：真正识别扫描目标（端侧 ONNX 推理）。 */
+    /** U²-Net 完整版显著性物体分割：真正识别扫描目标（端侧 ONNX 推理）。 */
     private var u2netDetector: U2NetDetector? = null
     @Volatile private var detectedObjectMask: FloatArray? = null
     @Volatile private var detecting = false
+    @Volatile private var modelReady = false
+    @Volatile private var modelLoading = false
     private var lastDetectMs = 0L
 
-    /** 后台懒加载 U2-Netp（首次检测时触发，不阻塞 onCreate/探测）。 */
+    /**
+     * 后台预加载分割模型。onCreate 就启动（利用引导页时间），
+     * 214MB 复制到 filesDir 要几秒 —— 提前加载，避免用户点开始采集后
+     * 前几秒白扫（模型没就绪、绿边不识别）。
+     */
     private fun ensureU2Net() {
-        if (u2netDetector != null) return
+        if (u2netDetector != null || modelLoading) return
+        modelLoading = true
         lifecycleScope.launch(Dispatchers.IO) {
-            try { u2netDetector = U2NetDetector(applicationContext) }
-            catch (e: Exception) { Log.w(TAG, "U2-Netp 初始化失败，降级为无目标识别: ${e.message}") }
+            try {
+                u2netDetector = U2NetDetector(applicationContext)
+                modelReady = true
+                Log.i(TAG, "分割模型加载完成")
+            } catch (e: Exception) {
+                Log.w(TAG, "分割模型初始化失败，降级为无目标识别: ${e.message}")
+            } finally {
+                modelLoading = false
+            }
         }
     }
 
@@ -90,6 +104,7 @@ class CaptureActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         ui = MainUI(this) { action -> onAction(action) }
         coverageTracker = CoverageTracker(this)
+        ensureU2Net()   // 提前预加载：利用引导页时间复制/加载 214MB 模型
         // U2-Netp 模型改后台懒加载：4.4MB + ONNX session 建在主线程会阻塞启动，
         // 导致能力探测状态机被拖垮（用户实测"点开始采集就失败/卡探测中"）。
         val probe = DeviceProbe.probe(this)
@@ -199,7 +214,7 @@ class CaptureActivity : ComponentActivity() {
     private fun resetAllSettings() {
         lifecycleScope.launch {
             withContext(Dispatchers.IO) {
-                if (captureContext != 0L) NativeBridge.applyPreset(captureContext, 1)
+                if (captureContext != 0L) NativeBridge.applyPreset(captureContext, 2)
             }
             focusMode = 0
             lastFocusDistance = 0f
@@ -287,7 +302,7 @@ class CaptureActivity : ComponentActivity() {
                 if (captureContext == 0L) {
                     captureContext = NativeBridge.create(
                         sessionDir = filesDir.resolve("sessions/current").absolutePath,
-                        preset = 1, maxThreads = 0)
+                        preset = 2, maxThreads = 0)  // 高精度档：MVS patch 11/iter 6（精度优先铁律）
                 }
                 if (captureContext == 0L) null else NativeBridge.probeCapability(captureContext)
             }
@@ -329,11 +344,7 @@ class CaptureActivity : ComponentActivity() {
     }
 
     /** 相机线程：YUV→BGRA 已完成，这里只做内核投递与诊断计数。 */
-    /**
-     * 单会话最多送内核的帧数。SfM 是 O(n²)，但 240 帧会明显牺牲环绕采集精度。
-     * 提到 600：core 侧预览/重建还有抽稀保护，600 帧在真机是可控的；
-     * 超出部分如实计入 rejectedFrames 并在诊断里可见，不静默丢弃。
-     */
+    /** 软提示阈值：超过后可提示用户结束采集，但不阻止继续采集（精度优先）。 */
     private val maxFramesToCore = 600
 
     private fun ingest(frame: CapturedFrame) {
@@ -344,9 +355,12 @@ class CaptureActivity : ComponentActivity() {
             rejectedFrames++
             return
         }
-        if (ingestedFrames >= maxFramesToCore) {
-            rejectedFrames++
-            return   // 帧上限：预览继续，但不再送内核（避免 SfM O(n²) 卡死）
+        // 【去掉硬帧上限】旧版 600 帧上限不分有效/无效帧，质量门判定的
+        // 有效帧被无效帧挤掉名额 → 用户"抓到有效帧很少"。现在 SfM 已抽稀
+        // 48 视图 + MVS 有内存预算保护，内核不会被 O(n²) 卡死；
+        // 采多少由用户通过"结束采集"决定，精度优先，不再武断截断。
+        if (ingestedFrames >= maxFramesToCore && ingestedFrames % 100 == 0) {
+            Log.i(TAG, "已采 $ingestedFrames 帧（软提示：可结束采集）")
         }
         val status = NativeBridge.pushFrame(
             ctx, nextFrameId++, frame.timestampNs,
@@ -361,12 +375,11 @@ class CaptureActivity : ComponentActivity() {
         if (status == ReconStatus.OK) {
             ingestedFrames++
             coverageTracker?.markFrame()
-            // U²-Netp 目标识别：节流 150ms，单线程池推理，不阻塞采集。
-            // 关键：识别结果（含"未识别"）立即刷新 UI —— 旧版只在成功时刷新，
-            // 导致物体移出画面后绿边卡住不消失 = 刷新慢的直接原因。
-            val now = System.currentTimeMillis()
-            if (!detecting && now - lastDetectMs >= 150) {
-                lastDetectMs = now
+            // 目标识别：以 detecting 标志为唯一节流 —— 推理一结束立刻处理
+            // 下一帧，不再叠加固定 400ms 下限（那是"刷新慢"的人为延迟）。
+            // 模型多快就多快；渲染层已有 60fps EMA 插值保证涂颜料顺滑。
+            if (!detecting && modelReady && u2netDetector != null) {
+                lastDetectMs = System.currentTimeMillis()
                 detecting = true
                 // 拷贝当前帧：detector 在后台线程跑，frame.bgra 会被复用
                 val frameCopy = frame.bgra.copyOf()

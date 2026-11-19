@@ -863,7 +863,8 @@ internal class MainUI(
         private var frames = 0
         private var coverage = 0f
         private var buckets: BooleanArray? = null
-        private var objectMask: FloatArray? = null
+        private var objectMask: FloatArray? = null       // 识别目标 mask
+        private val displayMask = FloatArray(128 * 128)  // 当前显示 mask（平滑插值 → 涂颜料感）
         private var speed = 0.0
         // 离屏涂层 bitmap（128×128 软 mask 渲染，避免每帧几千个 drawRect）
         private val coatingBitmap = android.graphics.Bitmap.createBitmap(128, 128, android.graphics.Bitmap.Config.ARGB_8888)
@@ -876,14 +877,28 @@ internal class MainUI(
             setShadowLayer(dp(3).toFloat(), 0f, 0f, Color.argb(0xAA, 0, 0, 0)) }
 
         fun update(f: Int, cov: Float, bs: BooleanArray?, mask: FloatArray?, sp: Double) {
-            frames = f; coverage = cov; buckets = bs; objectMask = mask; speed = sp; invalidate()
+            frames = f; coverage = cov; buckets = bs; objectMask = mask; speed = sp
+            // 不主动 invalidate：onDraw 自己按 60fps 连续插值渲染（涂颜料动画）
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             tick += 1f
             val w = width.toFloat(); val h = height.toFloat()
-            val mask = objectMask
+
+            // 涂颜料动画：displayMask 每帧向识别目标插值逼近（EMA）。
+            // 识别本身几百 ms 一次没关系，渲染层用 60fps 平滑铺开/淡出，
+            // 视觉上就是"快速利落地一层层涂上"，而不是每 400ms 跳变闪一下。
+            val target = objectMask
+            val alpha = 0.28f
+            for (i in displayMask.indices) {
+                val t = if (target != null) target[i] else 0f
+                displayMask[i] += (t - displayMask[i]) * alpha
+            }
+            // 只要有残留显示值就继续渲染（淡出动画）
+            var anyVisible = false
+            for (v in displayMask) if (v > 0.02f) { anyVisible = true; break }
+            val mask: FloatArray? = if (anyVisible) displayMask else null
 
             // 顶部提示胶囊
             val speedTip = when {
@@ -922,7 +937,7 @@ internal class MainUI(
                 Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(0x99, 0x11, 0x18, 0x27) })
             canvas.drawText(label, w / 2f, st + dp(20), sp)
 
-            postInvalidateDelayed(50)
+            postInvalidateDelayed(16)
         }
 
         /**
