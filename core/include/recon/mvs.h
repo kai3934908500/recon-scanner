@@ -49,7 +49,7 @@ struct MvsConfig {
   // 代价
   double photo_threshold = 1.0;         // 1 − NCC 阈值（接受条件 NCC ≥ 0）
   double depth_regularization = 0.02;   // 平滑正则权重
-  double geo_consistency_threshold = 1.2;  // 相对深度偏差百分数（%）
+  double geo_consistency_threshold = 0.02;  // 相对深度偏差比值（0.02=2%，与参数表单位一致）
   double weak_texture_variance = 12.0;  // 参考窗口方差下限，低于判为弱纹理
 
   // 亚像素细化

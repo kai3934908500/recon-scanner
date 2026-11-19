@@ -39,8 +39,13 @@ internal class U2NetDetector(context: Context) {
         var name = "input.1"
         try {
             // 优先加载更高精度的 BiRefNet，缺失时回退 u2net
-            val modelName = if (context.assets.list("")?.contains("BiRefNet-tiny.onnx") == true)
-                "BiRefNet-tiny.onnx" else "u2net.onnx"
+            // 加载优先级：BiRefNet-general(927MB,SOTA) > BiRefNet-tiny(214MB) > u2net(168MB)
+            val assets = context.assets.list("") ?: emptyArray()
+            val modelName = when {
+                assets.contains("BiRefNet-general-epoch_244.onnx") -> "BiRefNet-general-epoch_244.onnx"
+                assets.contains("BiRefNet-tiny.onnx") -> "BiRefNet-tiny.onnx"
+                else -> "u2net.onnx"
+            }
             // 【OOM 修复】绝不能用 assets.readBytes() 把 214MB 模型一次性读进
             // Java heap（heap 上限 384MB，直接 OOM 闪退）。改为流式复制到
             // filesDir，再用文件路径让 ORT native 直接 mmap 加载，heap 峰值几 MB。
@@ -73,6 +78,7 @@ internal class U2NetDetector(context: Context) {
             } else {
                 inputH = 320; inputW = 320; needSigmoid = false
             }
+            Log.i("U2NetDetector", "选用模型: $modelName (${inputW}x${inputH})")
         } catch (e: Exception) {
             Log.e("U2NetDetector", "模型加载失败: ${e.message}", e)
             s?.close()

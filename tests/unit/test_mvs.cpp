@@ -450,6 +450,20 @@ void TestMvsDepthAccuracy() {
               median);
   Check(median <= int_median * 1.05,
         "亚像素细化不应劣于整数视差（允许 5% 波动）");
+
+  // 【回归闸门】多视图融合必须真的产出点云。
+  // 历史致命 bug：support_count 恒为 1，而融合要求 >=2 → 所有点被剔除，
+  // FuseDepthMaps 返回空点云 → MVS 对重建零贡献、泊松只剩十几帧稀疏点。
+  // 负向注入：把 patchmatch_stereo.cpp 的 support_count 改回 1，本断言变红。
+  {
+    std::vector<const recon::DepthMap*> dms = {&depth};
+    std::vector<recon::CameraPose> poses = {scene.ref_pose};
+    std::vector<recon::CameraIntrinsics> intrs = {scene.intrinsics};
+    const recon::PointCloud fused = recon::FuseDepthMaps(dms, poses, intrs, config);
+    std::printf("    FuseDepthMaps 产出点数: %zu\n", fused.size());
+    Check(fused.size() > 1000,
+          "融合必须产出非空点云（support_count 不得恒为1导致零贡献）");
+  }
 }
 
 void TestViewSelection() {

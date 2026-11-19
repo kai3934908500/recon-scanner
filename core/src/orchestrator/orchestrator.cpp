@@ -951,6 +951,13 @@ recon_status Orchestrator::StageMvs(const ReconOptions& opt, StageResult* out) {
 
   MvsConfig mcfg;
   mcfg.num_views = static_cast<int>(ParamOr(keys::kMvsNumViews, mcfg.num_views));
+  // 【修复】接上一直空转的光度/几何阈值参数。旧版 photo_threshold 用默认 1.0，
+  // 硬拒绝 cost>3.0 但 cost∈[0,2] 永不触发；用户调这个精度旋钮完全无效。
+  mcfg.photo_threshold = ParamOr(keys::kMvsPhotoThreshold, mcfg.photo_threshold);
+  mcfg.geo_consistency_threshold =
+      ParamOr(keys::kMvsGeoConsistencyThreshold, mcfg.geo_consistency_threshold);
+  mcfg.random_search_radius_ratio =
+      ParamOr(keys::kMvsPatchRandomSearchRadius, mcfg.random_search_radius_ratio);
   mcfg.patch_size = static_cast<int>(ParamOr(keys::kMvsPatchSize, mcfg.patch_size));
   mcfg.iterations =
       static_cast<int>(ParamOr(keys::kMvsPatchIterations, mcfg.iterations));

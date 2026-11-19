@@ -1018,6 +1018,14 @@ PointCloud FuseDepthMaps(const std::vector<const DepthMap*>& depth_maps,
 
         // 支撑视图数不足 → 剔除（docs/05 §5.2.3）。
         if (dm->support_count[idx] < config.min_view_consistency) continue;
+        // 【修复】光度一致性过滤：photo_threshold 此前是死参数（默认1.0时
+        // cost>3 永不触发）。这里用 confidence=1-photo_cost 直接在融合阶段
+        // 剔除低质量深度。mvs.h 默认1.0→不过滤(兼容旧行为)，参数表接入后
+        // 标准档0.2/高精度0.1→真正剔除 NCC<0.8/0.9 的误匹配。
+        if (config.photo_threshold < 1.0) {
+          const float photo_cost = 1.0f - dm->confidence[idx];
+          if (photo_cost > config.photo_threshold) continue;
+        }
 
         Vec3d ray;
         intr.PixelToRay(x + 0.5, y + 0.5, &ray);
