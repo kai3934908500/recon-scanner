@@ -243,3 +243,18 @@ S7 的其余子步骤（顶点重分布 / 度数规整 / 特征保护）。
 | `12_构建与打包.md`    | CMake / NDK / Xcode、CI、发布流程 |
 | `13_内存与降级.md`    | 内存预算、降级白/黑名单                |
 | `14_验收测试.md`     | 黄金数据集、精度验收指标、测试矩阵           |
+
+
+## 端侧识别模型（不随 git 分发，需自行下载）
+
+目标识别用 BiRefNet-tiny 显著性分割模型（214MB）。因超过 GitHub 单文件 100MB 限制，
+模型不进 git。构建 App 前请下载放到 `platform/android/app/src/main/assets/BiRefNet-tiny.onnx`：
+
+```
+https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx
+```
+
+下载后改名为 `BiRefNet-tiny.onnx`。校验：文件大小应为 224,005,088 字节。
+App 首次启动会把模型从 assets 流式复制到 filesDir（约几秒），用文件路径加载以避免 OOM。
+许可：BiRefNet MIT，模型权重经 rembg 分发。
+
